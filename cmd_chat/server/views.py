@@ -15,6 +15,18 @@ def generate_ws_token(user_id: str, secret: bytes) -> str:
     return hmac.new(secret, user_id.encode(), hashlib.sha256).hexdigest()
 
 
+def _roster_frame(app: Sanic) -> str:
+    """Authoritative presence snapshot — all coven members converge on this."""
+    users = app.ctx.session_store.get_all()
+    return json.dumps(
+        {
+            "type": "roster",
+            "users": [{"user_id": u.user_id, "username": u.username} for u in users],
+            "capacity": app.ctx.max_users,
+        }
+    )
+
+
 async def srp_init(request: Request, app: Sanic) -> HTTPResponse:
     try:
         client_ip = get_client_ip(request)
@@ -32,6 +44,9 @@ async def srp_init(request: Request, app: Sanic) -> HTTPResponse:
 
         if app.ctx.session_store.username_exists(username):
             return response.json({"error": "Username taken"}, status=409)
+
+        if app.ctx.session_store.count() >= app.ctx.max_users:
+            return response.json({"error": "Coven full"}, status=409)
 
         user_id, B, salt = app.ctx.srp_manager.init_auth(username, client_public)
 
@@ -63,6 +78,11 @@ async def srp_verify(request: Request, app: Sanic) -> HTTPResponse:
             return response.json({"error": "Missing user_id or M"}, status=400)
 
         client_proof = base64.b64decode(client_proof_b64)
+
+        # Authoritative capacity gate — the slot is only consumed once a session
+        # is actually added here (init is best-effort / racy).
+        if app.ctx.session_store.count() >= app.ctx.max_users:
+            return response.json({"error": "Coven full"}, status=409)
 
         H_AMK, session_key = app.ctx.srp_manager.verify_auth(user_id, client_proof)
 
@@ -115,6 +135,19 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
     try:
         await send_state(ws, app)
 
+        # Announce arrival to everyone already present, then a fresh roster.
+        await manager.broadcast(
+            json.dumps(
+                {
+                    "type": "user_joined",
+                    "user_id": user_id,
+                    "username": session.username,
+                }
+            ),
+            exclude_user=user_id,
+        )
+        await manager.broadcast(_roster_frame(app))
+
         async for data in ws:
             if data is None:
                 break
@@ -140,6 +173,9 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
         pass
     finally:
         await manager.disconnect(user_id)
+        # Free the slot + username so the coven can be rejoined (was previously
+        # held until the 1h stale sweep, which also blocked the name).
+        app.ctx.session_store.remove(user_id)
         await manager.broadcast(
             json.dumps(
                 {
@@ -148,6 +184,7 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
                 }
             )
         )
+        await manager.broadcast(_roster_frame(app))
 
 
 async def health(request: Request, app: Sanic) -> HTTPResponse:
