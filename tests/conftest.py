@@ -32,6 +32,7 @@ def app():
     app.ctx.admin_token = "test-admin-token"
     from cmd_chat.server.helpers import RateLimiter
     app.ctx.rate_limiter = RateLimiter(max_requests=100, window_seconds=60)
+    app.ctx.max_users = 4
     app.ctx.cleanup_task = None
 
     register_routes(app)

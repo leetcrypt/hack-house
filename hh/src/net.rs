@@ -17,7 +17,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct Session {
-    pub user_id: String,
     pub username: String,
     pub room: Arc<fernet::Fernet>,
     pub ws_url: String,
@@ -79,7 +78,6 @@ pub fn authenticate(
         format!("{ws_scheme}://{ip}:{port}/ws/chat?user_id={user_id}&ws_token={ws_token}");
 
     Ok(Session {
-        user_id,
         username: user.to_string(),
         room: Arc::new(fernet),
         ws_url,
