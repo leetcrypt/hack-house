@@ -17,11 +17,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use serde_json::json;
 use std::time::Duration;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-pub const SBX_ROWS: u16 = 24;
-pub const SBX_COLS: u16 = 80;
+const SBX_NAME: &str = "hack-house";
 
 /// One rendered chat row.
 #[derive(Clone)]
@@ -45,10 +44,24 @@ pub enum Net {
     Roster { users: Vec<User>, capacity: usize },
     Joined(String),
     Left(String),
-    SbxStatus { backend: String, ready: bool },
+    SbxStatus { backend: String, ready: bool, rows: u16, cols: u16 },
+    SbxResize { rows: u16, cols: u16 },
     SbxData(Vec<u8>),
     SbxInput(Vec<u8>),
+    Sys(String),
     Closed,
+}
+
+/// Sandbox handoff from the async launch task to the run loop.
+enum BrokerMsg {
+    Ready {
+        sb: sbx::Sandbox,
+        backend: sbx::Backend,
+        name: String,
+        rows: u16,
+        cols: u16,
+    },
+    Failed,
 }
 
 /// Local view of the shared sandbox terminal (everyone renders from `data`).
@@ -112,10 +125,10 @@ impl App {
                     self.sys(format!("{name} left"));
                 }
             }
-            Net::SbxStatus { backend, ready } => {
+            Net::SbxStatus { backend, ready, rows, cols } => {
                 if ready {
                     self.sandbox = Some(SbxView {
-                        parser: vt100::Parser::new(SBX_ROWS, SBX_COLS, 0),
+                        parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
                         backend: backend.clone(),
                     });
                     self.sys(format!("⛧ sandbox summoned ({backend}) — F2 to drive"));
@@ -125,19 +138,32 @@ impl App {
                     self.sys("⛧ sandbox dismissed");
                 }
             }
+            Net::SbxResize { rows, cols } => {
+                if let Some(v) = &mut self.sandbox {
+                    v.parser.set_size(rows.max(1), cols.max(1));
+                }
+            }
             Net::SbxData(bytes) => {
                 if let Some(v) = &mut self.sandbox {
                     v.parser.process(&bytes);
                 }
             }
-            // Broker writes input to the PTY in the run loop; non-brokers ignore.
-            Net::SbxInput(_) => {}
+            Net::SbxInput(_) => {} // broker writes to PTY in the run loop
+            Net::Sys(t) => self.sys(t),
             Net::Closed => {
                 self.connected = false;
                 self.sys("connection closed");
             }
         }
     }
+}
+
+/// Approximate inner dimensions of the sandbox pane for a terminal of this size
+/// (mirrors ui.rs layout: top bar 1, input 3, sandbox = 55% of the body).
+fn sbx_dims(term_w: u16, term_h: u16) -> (u16, u16) {
+    let body_h = term_h.saturating_sub(4);
+    let sbx_h = (body_h as u32 * 55 / 100) as u16;
+    (sbx_h.saturating_sub(2).max(1), term_w.saturating_sub(2).max(1))
 }
 
 /// Translate a key event into the bytes a PTY expects (drive mode).
@@ -162,7 +188,6 @@ fn key_to_pty(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     }
 }
 
-/// Encrypt and send a JSON application frame over the chat channel.
 async fn send_frame<S>(write: &mut S, room: &fernet::Fernet, value: serde_json::Value)
 where
     S: SinkExt<WsMsg> + Unpin,
@@ -175,11 +200,17 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
     let ws = net::connect(&session).await?;
     let (mut write, read) = ws.split();
     let (tx, mut rx) = unbounded_channel::<Net>();
+    let app_tx = tx.clone();
     tokio::spawn(net::reader(read, session.room.clone(), tx));
 
-    // PTY output from a broker-owned sandbox (set on /sbx launch).
-    let (pty_tx, mut pty_rx): (_, UnboundedReceiver<Vec<u8>>) = unbounded_channel();
+    // Broker-owned sandbox PTY output, and async-launch handoff.
+    let (pty_tx, mut pty_rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) =
+        unbounded_channel();
+    let (broker_tx, mut broker_rx) = unbounded_channel::<BrokerMsg>();
     let mut broker: Option<sbx::Sandbox> = None;
+    let mut broker_meta: Option<(sbx::Backend, String)> = None;
+    let mut launching = false;
+    let mut announced_dims: Option<(u16, u16)> = None;
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -195,22 +226,34 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
             break Err(e.into());
         }
 
+        // Broker: keep the PTY sized to our pane; broadcast size changes.
+        if broker.is_some() {
+            if let Ok(sz) = term.size() {
+                let dims = sbx_dims(sz.width, sz.height);
+                if announced_dims != Some(dims) {
+                    announced_dims = Some(dims);
+                    if let Some(sb) = &broker {
+                        let _ = sb.resize(dims.0, dims.1);
+                    }
+                    send_frame(&mut write, &session.room,
+                        json!({"_sbx":"resize","rows":dims.0,"cols":dims.1})).await;
+                }
+            }
+        }
+
         tokio::select! {
             maybe = events.next() => {
                 match maybe {
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
-                        // Global quit.
                         if k.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(k.code, KeyCode::Char('q')) {
                             break Ok(());
                         }
-                        // F2 toggles drive (only meaningful with a live sandbox).
                         if k.code == KeyCode::F(2) {
                             if app.sandbox.is_some() {
                                 app.driving = !app.driving;
                             }
                         } else if app.driving {
-                            // Drive mode: keystrokes go to the sandbox PTY.
                             if k.code == KeyCode::Esc {
                                 app.driving = false;
                             } else if let Some(bytes) = key_to_pty(k.code, k.modifiers) {
@@ -218,15 +261,49 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                                     json!({"_sbx":"input","b64": STANDARD.encode(&bytes)})).await;
                             }
                         } else {
-                            // Chat / command mode.
                             match k.code {
                                 KeyCode::Esc => break Ok(()),
                                 KeyCode::Enter => {
                                     let line = app.input.trim().to_string();
                                     app.input.clear();
-                                    if line.starts_with("/sbx") {
-                                        handle_sbx_cmd(&line, &mut app, &mut broker,
-                                            &pty_tx, &mut write, &session.room).await;
+                                    if let Some(rest) = line.strip_prefix("/sbx") {
+                                        let mut p = rest.split_whitespace();
+                                        match p.next() {
+                                            Some("launch") => {
+                                                if app.sandbox.is_some() || broker.is_some() || launching {
+                                                    app.sys("a sandbox is already running");
+                                                } else {
+                                                    let backend = p.next()
+                                                        .and_then(sbx::Backend::parse)
+                                                        .unwrap_or(sbx::Backend::Local);
+                                                    let image = p.next()
+                                                        .map(str::to_string)
+                                                        .unwrap_or_else(|| backend.default_image().to_string());
+                                                    let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
+                                                    let (rows, cols) = sbx_dims(sz.0, sz.1);
+                                                    launching = true;
+                                                    app.sys(format!(
+                                                        "summoning {} sandbox… (multipass boot can take ~30s)",
+                                                        backend.label()));
+                                                    spawn_launch(backend, image, rows, cols,
+                                                        pty_tx.clone(), broker_tx.clone(), app_tx.clone());
+                                                }
+                                            }
+                                            Some("stop") => {
+                                                if let Some(mut sb) = broker.take() {
+                                                    sb.stop();
+                                                    if let Some((be, name)) = broker_meta.take() {
+                                                        tokio::task::spawn_blocking(move || sbx::teardown(be, &name));
+                                                    }
+                                                    announced_dims = None;
+                                                    send_frame(&mut write, &session.room,
+                                                        json!({"_sbx":"status","state":"stopped"})).await;
+                                                } else {
+                                                    app.sys("you are not hosting a sandbox");
+                                                }
+                                            }
+                                            _ => app.sys("usage: /sbx launch [local|docker|multipass] [image] | /sbx stop"),
+                                        }
                                     } else if !line.is_empty() && app.connected {
                                         let ct = session.room.encrypt(line.as_bytes());
                                         if write.send(WsMsg::Text(ct)).await.is_err() {
@@ -253,9 +330,24 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                     None => break Ok(()),
                 }
             }
+            msg = broker_rx.recv() => {
+                match msg {
+                    Some(BrokerMsg::Ready { sb, backend, name, rows, cols }) => {
+                        broker = Some(sb);
+                        broker_meta = Some((backend, name));
+                        announced_dims = Some((rows, cols));
+                        launching = false;
+                        send_frame(&mut write, &session.room, json!({
+                            "_sbx":"status","state":"ready",
+                            "backend": backend.label(), "rows": rows, "cols": cols
+                        })).await;
+                    }
+                    Some(BrokerMsg::Failed) => { launching = false; }
+                    None => {}
+                }
+            }
             pty = pty_rx.recv() => {
                 if let Some(bytes) = pty {
-                    // Broker relays sandbox output to the whole coven (encrypted).
                     send_frame(&mut write, &session.room,
                         json!({"_sbx":"data","b64": STANDARD.encode(&bytes)})).await;
                 }
@@ -266,6 +358,9 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
 
     if let Some(mut sb) = broker.take() {
         sb.stop();
+        if let Some((be, name)) = broker_meta.take() {
+            sbx::teardown(be, &name);
+        }
     }
     disable_raw_mode()?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
@@ -273,60 +368,43 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
     result
 }
 
-async fn handle_sbx_cmd<S>(
-    line: &str,
-    app: &mut App,
-    broker: &mut Option<sbx::Sandbox>,
-    pty_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    write: &mut S,
-    room: &fernet::Fernet,
-) where
-    S: SinkExt<WsMsg> + Unpin,
-{
-    let mut parts = line.split_whitespace();
-    let _ = parts.next(); // "/sbx"
-    match parts.next() {
-        Some("launch") => {
-            if app.sandbox.is_some() || broker.is_some() {
-                app.sys("a sandbox is already running");
-                return;
-            }
-            let backend = parts
-                .next()
-                .and_then(sbx::Backend::parse)
-                .unwrap_or(sbx::Backend::Local);
-            let image = parts.next().unwrap_or("ubuntu:24.04");
-            let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-            match sbx::Sandbox::launch(backend, "house", image, SBX_ROWS, SBX_COLS, std_tx) {
-                Ok(sb) => {
-                    *broker = Some(sb);
-                    let ptx = pty_tx.clone();
-                    std::thread::spawn(move || {
-                        while let Ok(b) = std_rx.recv() {
-                            if ptx.send(b).is_err() {
-                                break;
-                            }
+/// Boot a sandbox off the UI thread (prepare → spawn PTY → hand back the handle).
+fn spawn_launch(
+    backend: sbx::Backend,
+    image: String,
+    rows: u16,
+    cols: u16,
+    pty_tx: UnboundedSender<Vec<u8>>,
+    broker_tx: UnboundedSender<BrokerMsg>,
+    app_tx: UnboundedSender<Net>,
+) {
+    tokio::spawn(async move {
+        let name = SBX_NAME.to_string();
+        let prep = {
+            let (n, img) = (name.clone(), image.clone());
+            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img)).await
+        };
+        if let Err(e) = prep.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))) {
+            let _ = app_tx.send(Net::Sys(format!("sandbox prepare failed: {e}")));
+            let _ = broker_tx.send(BrokerMsg::Failed);
+            return;
+        }
+        let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        match sbx::Sandbox::launch(backend, &name, &image, rows, cols, std_tx) {
+            Ok(sb) => {
+                std::thread::spawn(move || {
+                    while let Ok(b) = std_rx.recv() {
+                        if pty_tx.send(b).is_err() {
+                            break;
                         }
-                    });
-                    send_frame(
-                        write,
-                        room,
-                        json!({"_sbx":"status","state":"ready","backend": backend.label()}),
-                    )
-                    .await;
-                    app.sys(format!("summoning {} sandbox…", backend.label()));
-                }
-                Err(e) => app.sys(format!("sandbox launch failed: {e}")),
+                    }
+                });
+                let _ = broker_tx.send(BrokerMsg::Ready { sb, backend, name, rows, cols });
+            }
+            Err(e) => {
+                let _ = app_tx.send(Net::Sys(format!("sandbox launch failed: {e}")));
+                let _ = broker_tx.send(BrokerMsg::Failed);
             }
         }
-        Some("stop") => {
-            if let Some(mut sb) = broker.take() {
-                sb.stop();
-                send_frame(write, room, json!({"_sbx":"status","state":"stopped"})).await;
-            } else {
-                app.sys("you are not hosting a sandbox");
-            }
-        }
-        _ => app.sys("usage: /sbx launch [local|docker|multipass] [image] | /sbx stop"),
-    }
+    });
 }

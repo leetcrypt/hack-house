@@ -160,6 +160,12 @@ fn parse_sbx(text: &str) -> Option<Net> {
         "status" => Some(Net::SbxStatus {
             backend: v["backend"].as_str().unwrap_or("?").to_string(),
             ready: v["state"].as_str() == Some("ready"),
+            rows: v["rows"].as_u64().unwrap_or(24) as u16,
+            cols: v["cols"].as_u64().unwrap_or(80) as u16,
+        }),
+        "resize" => Some(Net::SbxResize {
+            rows: v["rows"].as_u64().unwrap_or(24) as u16,
+            cols: v["cols"].as_u64().unwrap_or(80) as u16,
         }),
         "data" => Some(Net::SbxData(STANDARD.decode(v["b64"].as_str()?).ok()?)),
         "input" => Some(Net::SbxInput(STANDARD.decode(v["b64"].as_str()?).ok()?)),

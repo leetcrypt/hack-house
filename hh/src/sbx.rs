@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
+use std::process::Command;
 use std::sync::mpsc;
 
 /// Which sandbox to summon. Multipass = strong isolation (default for real use),
@@ -35,6 +36,50 @@ impl Backend {
             Backend::Docker => "docker",
             Backend::Multipass => "multipass",
         }
+    }
+    /// Default image/release when the user doesn't specify one.
+    pub fn default_image(self) -> &'static str {
+        match self {
+            Backend::Multipass => "24.04",
+            Backend::Docker => "ubuntu:24.04",
+            Backend::Local => "",
+        }
+    }
+}
+
+/// One-time setup before the PTY shell is spawned. Blocking — run off the UI
+/// thread (Multipass boots a real VM, ~20-30s). Idempotent: reuses an instance
+/// that already exists.
+pub fn prepare(backend: Backend, name: &str, image: &str) -> Result<()> {
+    if backend != Backend::Multipass {
+        return Ok(());
+    }
+    let exists = Command::new("multipass")
+        .args(["info", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !exists {
+        let st = Command::new("multipass")
+            .args([
+                "launch", "--name", name, "--cpus", "1", "--memory", "1G", "--disk", "5G", image,
+            ])
+            .status()
+            .context("multipass launch (is multipass installed?)")?;
+        anyhow::ensure!(st.success(), "multipass launch failed");
+    } else {
+        let _ = Command::new("multipass").args(["start", name]).status();
+    }
+    Ok(())
+}
+
+/// Destroy ephemeral resources after stop. Multipass instance is purged;
+/// Docker uses `--rm` so the container is already gone; Local is a no-op.
+pub fn teardown(backend: Backend, name: &str) {
+    if backend == Backend::Multipass {
+        let _ = Command::new("multipass")
+            .args(["delete", name, "--purge"])
+            .status();
     }
 }
 
