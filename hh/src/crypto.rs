@@ -239,13 +239,13 @@ mod tests {
 #[cfg(test)]
 mod fernet_interop {
     // Token produced by Python `cryptography` Fernet with key = urlsafe_b64(0x42*32).
-    const KEY: &str = "PulnLblVVdOu6iB0rjW8rQ2U2pwgsky3eod8I2OhLdE=";
-    const TOK: &str = "gAAAAABqG0ufNzHGkbfMWh4-46KVthUTnXUN9jVvGJ2UxklQFdBMIqBCMXmTmciEnB14kl_H613IOYm5w22bebVUhpu9ULuLf1fjq4jjaIK_ZHZNwCyqjy0=";
+    const KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
+    const TOK: &str = "gAAAAABqG0p-31PhpUCwVaYKIXTq2NIf5N8nNRsIzvaO4BZL9xUEBgBfeiKb2hY-lQdP4nxSpNrhs2RmLpMVNfPozMNrxjomGFSbgrIipevHdOtFelEQNE4=";
 
     #[test]
     fn rust_decrypts_python_fernet() {
         let f = fernet::Fernet::new(KEY).unwrap();
         let pt = f.decrypt(TOK).expect("rust must decrypt python fernet token");
-        assert_eq!(pt, b"room key interop test");
+        assert_eq!(pt, b"hello from python fernet");
     }
 }
