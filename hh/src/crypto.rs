@@ -235,3 +235,17 @@ mod tests {
         assert_eq!(hex::encode(&ch.h_amk), HAMK_HEX, "H_AMK mismatch");
     }
 }
+
+#[cfg(test)]
+mod fernet_interop {
+    // Token produced by Python `cryptography` Fernet with key = urlsafe_b64(0x42*32).
+    const KEY: &str = "PulnLblVVdOu6iB0rjW8rQ2U2pwgsky3eod8I2OhLdE=";
+    const TOK: &str = "gAAAAABqG0ufNzHGkbfMWh4-46KVthUTnXUN9jVvGJ2UxklQFdBMIqBCMXmTmciEnB14kl_H613IOYm5w22bebVUhpu9ULuLf1fjq4jjaIK_ZHZNwCyqjy0=";
+
+    #[test]
+    fn rust_decrypts_python_fernet() {
+        let f = fernet::Fernet::new(KEY).unwrap();
+        let pt = f.decrypt(TOK).expect("rust must decrypt python fernet token");
+        assert_eq!(pt, b"room key interop test");
+    }
+}

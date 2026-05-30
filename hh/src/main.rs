@@ -4,7 +4,11 @@
 //! speaks the same SRP / Fernet dialect as the Python Sanic server, plus the
 //! ratatui UI built on top of that proven foundation.
 
+mod app;
 mod crypto;
+mod net;
+mod theme;
+mod ui;
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -23,6 +27,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Join a house: SRP auth then launch the ratatui UI.
+    Connect {
+        ip: String,
+        port: u16,
+        user: String,
+        #[arg(long)]
+        password: String,
+        #[arg(long, default_value_t = false)]
+        no_tls: bool,
+        #[arg(long, default_value_t = false)]
+        insecure: bool,
+        /// Path to a theme (vestments) TOML file.
+        #[arg(long)]
+        theme: Option<String>,
+    },
+    /// Debug: print the derived room Fernet key for a password + room_salt(hex).
+    Roomkey { password: String, room_salt_hex: String },
     /// Run the offline SRP golden-vector self-test.
     Selftest,
     /// Debug: compute A and M from explicit a/salt/B hex (parity check vs python).
@@ -51,6 +72,34 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Connect {
+            ip,
+            port,
+            user,
+            password,
+            no_tls,
+            insecure,
+            theme,
+        } => {
+            let session = net::authenticate(&ip, port, &user, &password, no_tls, insecure)?;
+            let theme = match theme {
+                Some(p) => theme::Theme::load(&p)?,
+                None => theme::Theme::default(),
+            };
+            tokio::runtime::Runtime::new()?.block_on(app::run(session, theme))
+        }
+        Cmd::Roomkey { password, room_salt_hex } => {
+            let salt = hex::decode(room_salt_hex)?;
+            let f = crypto::room_fernet(password.as_bytes(), &salt)?;
+            // fernet crate doesn't expose the key; re-derive + print the b64 key.
+            use base64::Engine;
+            let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(&salt), password.as_bytes());
+            let mut okm = [0u8; 32];
+            hk.expand(b"cmd-chat-room-key", &mut okm).unwrap();
+            println!("{}", base64::engine::general_purpose::URL_SAFE.encode(okm));
+            let _ = f;
+            Ok(())
+        }
         Cmd::Selftest => selftest(),
         Cmd::Srpm {
             a_hex,

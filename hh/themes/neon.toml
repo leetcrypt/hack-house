@@ -1,0 +1,12 @@
+# neon — cyberpunk accents on black
+name = "neon"
+border = "#3a3a5a"
+title = "#e0e0ff"
+accent = "#ff2fd0"
+dim = "#5a5a7a"
+me = "#39ff14"
+other = "#00e5ff"
+system = "#7a5cff"
+input = "#39ff14"
+roster_me = "#ff2fd0"
+roster_width = 24
