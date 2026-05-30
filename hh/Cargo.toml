@@ -1,0 +1,35 @@
+[package]
+name = "hack-house"
+version = "0.1.0"
+edition = "2021"
+description = "hack-house — encrypted collaborative sessions with a summoned sandbox. ⛧"
+license = "MIT"
+
+[[bin]]
+name = "hack-house"
+path = "src/main.rs"
+
+[dependencies]
+# crypto
+num-bigint = "0.4"
+num-traits = "0.2"
+sha2 = "0.10"
+hkdf = "0.12"
+fernet = "0.2"
+base64 = "0.22"
+rand = "0.8"
+hex = "0.4"
+
+# net
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = "0.23"
+url = "2"
+
+# data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# cli / errors
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
