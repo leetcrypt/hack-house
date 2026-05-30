@@ -116,7 +116,15 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
         .iter()
         .map(|u| {
             let me = u.username == app.me;
-            let mark = if me { "⛧" } else { "•" };
+            // ⛧ owner/superuser · ◆ may drive · • member
+            let owner = app.owner.as_deref() == Some(u.username.as_str());
+            let mark = if owner {
+                "⛧"
+            } else if app.drivers.contains(&u.username) {
+                "◆"
+            } else {
+                "•"
+            };
             let color = if me { theme.roster_me } else { theme.other };
             ListItem::new(Line::from(Span::styled(
                 format!(" {mark} {}", u.username),

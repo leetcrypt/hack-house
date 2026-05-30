@@ -131,10 +131,15 @@ fn decode_msg(room: &fernet::Fernet, m: &Value, allow_sbx: bool) -> Decoded {
             if t.starts_with("{\"_ft\":") {
                 return Decoded::Skip; // file-transfer control frame (P5)
             }
+            // Server-stamped (authenticated) sender of this message.
+            let sender = m["username"].as_str().unwrap_or("?");
+            if t.starts_with("{\"_perm\":") {
+                return parse_perm(&t).map(Decoded::Sbx).unwrap_or(Decoded::Skip);
+            }
             if t.starts_with("{\"_sbx\":") {
                 // Don't replay terminal history from the stored snapshot.
                 return if allow_sbx {
-                    parse_sbx(&t).map(Decoded::Sbx).unwrap_or(Decoded::Skip)
+                    parse_sbx(&t, sender).map(Decoded::Sbx).unwrap_or(Decoded::Skip)
                 } else {
                     Decoded::Skip
                 };
@@ -153,8 +158,9 @@ fn decode_msg(room: &fernet::Fernet, m: &Value, allow_sbx: bool) -> Decoded {
     })
 }
 
-/// Parse a decrypted `{"_sbx":...}` frame into a Net event.
-fn parse_sbx(text: &str) -> Option<Net> {
+/// Parse a decrypted `{"_sbx":...}` frame into a Net event. `sender` is the
+/// server-authenticated username of whoever sent it (used to gate drive input).
+fn parse_sbx(text: &str, sender: &str) -> Option<Net> {
     let v: Value = serde_json::from_str(text).ok()?;
     match v["_sbx"].as_str()? {
         "status" => Some(Net::SbxStatus {
@@ -168,9 +174,30 @@ fn parse_sbx(text: &str) -> Option<Net> {
             cols: v["cols"].as_u64().unwrap_or(80) as u16,
         }),
         "data" => Some(Net::SbxData(STANDARD.decode(v["b64"].as_str()?).ok()?)),
-        "input" => Some(Net::SbxInput(STANDARD.decode(v["b64"].as_str()?).ok()?)),
+        "input" => Some(Net::SbxInput {
+            from: sender.to_string(),
+            bytes: STANDARD.decode(v["b64"].as_str()?).ok()?,
+        }),
         _ => None,
     }
+}
+
+/// Parse a decrypted `{"_perm":"acl",...}` frame.
+fn parse_perm(text: &str) -> Option<Net> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v["_perm"].as_str()? != "acl" {
+        return None;
+    }
+    let drivers = v["drivers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d.as_str().map(str::to_string))
+        .collect();
+    Some(Net::Perm {
+        owner: v["owner"].as_str().unwrap_or("").to_string(),
+        drivers,
+    })
 }
 
 /// Read websocket frames forever, forwarding decoded `Net` events to the UI.

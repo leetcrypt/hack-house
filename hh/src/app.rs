@@ -47,7 +47,8 @@ pub enum Net {
     SbxStatus { backend: String, ready: bool, rows: u16, cols: u16 },
     SbxResize { rows: u16, cols: u16 },
     SbxData(Vec<u8>),
-    SbxInput(Vec<u8>),
+    SbxInput { from: String, bytes: Vec<u8> },
+    Perm { owner: String, drivers: Vec<String> },
     Sys(String),
     Closed,
 }
@@ -79,6 +80,10 @@ pub struct App {
     pub connected: bool,
     pub sandbox: Option<SbxView>,
     pub driving: bool,
+    /// Sandbox owner (the initiator / superuser). Empty until a sandbox launches.
+    pub owner: Option<String>,
+    /// Members allowed to drive the shared shell (always includes the owner).
+    pub drivers: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -92,7 +97,17 @@ impl App {
             connected: false,
             sandbox: None,
             driving: false,
+            owner: None,
+            drivers: std::collections::HashSet::new(),
         }
+    }
+
+    pub fn is_owner(&self) -> bool {
+        self.owner.as_deref() == Some(self.me.as_str())
+    }
+
+    pub fn can_drive(&self) -> bool {
+        self.drivers.contains(&self.me)
     }
 
     fn sys(&mut self, text: impl Into<String>) {
@@ -135,8 +150,25 @@ impl App {
                 } else {
                     self.sandbox = None;
                     self.driving = false;
+                    self.owner = None;
+                    self.drivers.clear();
                     self.sys("⛧ sandbox dismissed");
                 }
+            }
+            Net::Perm { owner, drivers } => {
+                let new: std::collections::HashSet<String> = drivers.into_iter().collect();
+                // Surface changes that affect me.
+                if !owner.is_empty() && self.owner.as_deref() != Some(owner.as_str()) {
+                    self.sys(format!("⛧ {owner} is the superuser (sandbox owner)"));
+                }
+                if new.contains(&self.me) && !self.drivers.contains(&self.me) && self.owner.is_some() {
+                    self.sys("⛧ you were granted drive (you can drive — F2)");
+                } else if !new.contains(&self.me) && self.drivers.contains(&self.me) {
+                    self.driving = false;
+                    self.sys("⛧ your drive permission was revoked");
+                }
+                self.owner = Some(owner).filter(|o| !o.is_empty());
+                self.drivers = new;
             }
             Net::SbxResize { rows, cols } => {
                 if let Some(v) = &mut self.sandbox {
@@ -148,7 +180,7 @@ impl App {
                     v.parser.process(&bytes);
                 }
             }
-            Net::SbxInput(_) => {} // broker writes to PTY in the run loop
+            Net::SbxInput { .. } => {} // broker enforces + writes to PTY in the run loop
             Net::Sys(t) => self.sys(t),
             Net::Closed => {
                 self.connected = false;
@@ -194,6 +226,20 @@ where
 {
     let ct = room.encrypt(value.to_string().as_bytes());
     let _ = write.send(WsMsg::Text(ct)).await;
+}
+
+/// Broadcast the current access-control list (owner + permitted drivers).
+async fn broadcast_acl<S>(write: &mut S, room: &fernet::Fernet, app: &App)
+where
+    S: SinkExt<WsMsg> + Unpin,
+{
+    let drivers: Vec<&String> = app.drivers.iter().collect();
+    send_frame(
+        write,
+        room,
+        json!({"_perm":"acl","owner": app.owner, "drivers": drivers}),
+    )
+    .await;
 }
 
 pub async fn run(session: Session, theme: Theme) -> Result<()> {
@@ -250,8 +296,12 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                             break Ok(());
                         }
                         if k.code == KeyCode::F(2) {
-                            if app.sandbox.is_some() {
+                            if app.sandbox.is_none() {
+                                // nothing to drive
+                            } else if app.can_drive() {
                                 app.driving = !app.driving;
+                            } else {
+                                app.sys("you don't have drive permission — the owner can /grant you");
                             }
                         } else if app.driving {
                             if k.code == KeyCode::Esc {
@@ -304,6 +354,30 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                                             }
                                             _ => app.sys("usage: /sbx launch [local|docker|multipass] [image] | /sbx stop"),
                                         }
+                                    } else if let Some(rest) = line.strip_prefix("/grant") {
+                                        let target = rest.trim();
+                                        if !app.is_owner() {
+                                            app.sys("only the sandbox owner can /grant");
+                                        } else if target.is_empty() {
+                                            app.sys("usage: /grant <user>");
+                                        } else {
+                                            app.drivers.insert(target.to_string());
+                                            broadcast_acl(&mut write, &session.room, &app).await;
+                                            app.sys(format!("granted drive to {target}"));
+                                        }
+                                    } else if let Some(rest) = line.strip_prefix("/revoke") {
+                                        let target = rest.trim();
+                                        if !app.is_owner() {
+                                            app.sys("only the sandbox owner can /revoke");
+                                        } else if target == app.me {
+                                            app.sys("the owner cannot revoke themselves");
+                                        } else if target.is_empty() {
+                                            app.sys("usage: /revoke <user>");
+                                        } else {
+                                            app.drivers.remove(target);
+                                            broadcast_acl(&mut write, &session.room, &app).await;
+                                            app.sys(format!("revoked drive from {target}"));
+                                        }
                                     } else if !line.is_empty() && app.connected {
                                         let ct = session.room.encrypt(line.as_bytes());
                                         if write.send(WsMsg::Text(ct)).await.is_err() {
@@ -323,8 +397,14 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
             }
             net = rx.recv() => {
                 match net {
-                    Some(Net::SbxInput(b)) => {
-                        if let Some(sb) = &mut broker { let _ = sb.write_input(&b); }
+                    Some(Net::SbxInput { from, bytes }) => {
+                        // Broker authority: only honor input from a permitted driver
+                        // (sender is server-authenticated via the message username).
+                        if let Some(sb) = &mut broker {
+                            if app.drivers.contains(&from) {
+                                let _ = sb.write_input(&bytes);
+                            }
+                        }
                     }
                     Some(n) => app.apply(n),
                     None => break Ok(()),
@@ -337,10 +417,15 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                         broker_meta = Some((backend, name));
                         announced_dims = Some((rows, cols));
                         launching = false;
+                        // The launcher is the owner / superuser and the first driver.
+                        app.owner = Some(app.me.clone());
+                        app.drivers.clear();
+                        app.drivers.insert(app.me.clone());
                         send_frame(&mut write, &session.room, json!({
                             "_sbx":"status","state":"ready",
                             "backend": backend.label(), "rows": rows, "cols": cols
                         })).await;
+                        broadcast_acl(&mut write, &session.room, &app).await;
                     }
                     Some(BrokerMsg::Failed) => { launching = false; }
                     None => {}
