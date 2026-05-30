@@ -112,32 +112,59 @@ fn parse_users(v: &Value) -> Vec<User> {
         .collect()
 }
 
-/// Decode one stored/broadcast message object into a ChatLine, or None to skip
-/// (empty text, decrypt failure, or a file-transfer control frame).
-fn decode_msg(room: &fernet::Fernet, m: &Value) -> Option<ChatLine> {
-    let ct = m["text"].as_str()?;
-    if ct.is_empty() {
-        return None;
-    }
+/// Classification of a decrypted message payload.
+enum Decoded {
+    Chat(ChatLine),
+    Sbx(Net),
+    Skip,
+}
+
+/// Decrypt + classify one stored/broadcast message object.
+fn decode_msg(room: &fernet::Fernet, m: &Value, allow_sbx: bool) -> Decoded {
+    let ct = match m["text"].as_str() {
+        Some(c) if !c.is_empty() => c,
+        _ => return Decoded::Skip,
+    };
     let (text, system) = match room.decrypt(ct) {
         Ok(pt) => {
             let t = String::from_utf8_lossy(&pt).to_string();
             if t.starts_with("{\"_ft\":") {
-                return None; // file-transfer control frame — handled elsewhere (P5)
+                return Decoded::Skip; // file-transfer control frame (P5)
+            }
+            if t.starts_with("{\"_sbx\":") {
+                // Don't replay terminal history from the stored snapshot.
+                return if allow_sbx {
+                    parse_sbx(&t).map(Decoded::Sbx).unwrap_or(Decoded::Skip)
+                } else {
+                    Decoded::Skip
+                };
             }
             (t, false)
         }
-        // Wrong room key / corrupt frame — surface, don't crash or hide silently.
         Err(_) => ("[unreadable — wrong room password?]".to_string(), true),
     };
     let stamp = m["timestamp"].as_str().unwrap_or("");
     let ts = if stamp.len() >= 19 { stamp[11..19].to_string() } else { String::new() };
-    Some(ChatLine {
+    Decoded::Chat(ChatLine {
         ts,
         username: m["username"].as_str().unwrap_or("?").to_string(),
         text,
         system,
     })
+}
+
+/// Parse a decrypted `{"_sbx":...}` frame into a Net event.
+fn parse_sbx(text: &str) -> Option<Net> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    match v["_sbx"].as_str()? {
+        "status" => Some(Net::SbxStatus {
+            backend: v["backend"].as_str().unwrap_or("?").to_string(),
+            ready: v["state"].as_str() == Some("ready"),
+        }),
+        "data" => Some(Net::SbxData(STANDARD.decode(v["b64"].as_str()?).ok()?)),
+        "input" => Some(Net::SbxInput(STANDARD.decode(v["b64"].as_str()?).ok()?)),
+        _ => None,
+    }
 }
 
 /// Read websocket frames forever, forwarding decoded `Net` events to the UI.
@@ -158,13 +185,17 @@ pub async fn reader(mut read: impl StreamExt<Item = Result<WsMsg, tokio_tungsten
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|m| decode_msg(&room, m))
+                    .filter_map(|m| match decode_msg(&room, m, false) {
+                        Decoded::Chat(l) => Some(l),
+                        _ => None,
+                    })
                     .collect();
                 tx.send(Net::Init { lines, users: parse_users(&v["users"]) })
             }
-            "message" => match decode_msg(&room, &v["data"]) {
-                Some(l) => tx.send(Net::Message(l)),
-                None => Ok(()),
+            "message" => match decode_msg(&room, &v["data"], true) {
+                Decoded::Chat(l) => tx.send(Net::Message(l)),
+                Decoded::Sbx(ev) => tx.send(ev),
+                Decoded::Skip => Ok(()),
             },
             "roster" => tx.send(Net::Roster {
                 users: parse_users(&v["users"]),

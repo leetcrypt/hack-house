@@ -7,6 +7,7 @@
 mod app;
 mod crypto;
 mod net;
+mod sbx;
 mod theme;
 mod ui;
 

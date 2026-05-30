@@ -18,11 +18,46 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 
     draw_top(f, rows[0], app, theme);
 
+    // When a sandbox is live, split the body: chat+roster on top, PTY below.
+    let (chat_area, sbx_area) = if app.sandbox.is_some() {
+        let split = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(rows[1]);
+        (split[0], Some(split[1]))
+    } else {
+        (rows[1], None)
+    };
+
     let body = Layout::horizontal([Constraint::Min(1), Constraint::Length(theme.roster_width)])
-        .split(rows[1]);
+        .split(chat_area);
     draw_chat(f, body[0], app, theme);
     draw_roster(f, body[1], app, theme);
+    if let Some(area) = sbx_area {
+        draw_sandbox(f, area, app, theme);
+    }
     draw_input(f, rows[2], app, theme);
+}
+
+fn draw_sandbox(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
+    let Some(sv) = &app.sandbox else { return };
+    let screen = sv.parser.screen();
+    let (_rows, cols) = screen.size();
+    let lines: Vec<Line> = screen
+        .rows(0, cols)
+        .map(|r| Line::from(Span::styled(r, Style::default().fg(theme.title))))
+        .collect();
+    let drive = if app.driving {
+        " · DRIVING (esc to release)"
+    } else {
+        " · F2 to drive"
+    };
+    let title = format!(" sandbox · {}{} ", sv.backend, drive);
+    let border = if app.driving { theme.accent } else { theme.border };
+    let pane = Paragraph::new(lines).block(
+        Block::bordered()
+            .border_style(Style::default().fg(border))
+            .title(Span::styled(title, Style::default().fg(theme.title))),
+    );
+    f.render_widget(pane, area);
 }
 
 fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {

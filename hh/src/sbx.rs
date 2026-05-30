@@ -1,0 +1,224 @@
+//! Sandbox backends + a PTY-backed sandbox the broker drives.
+//!
+//! The broker (owner's client) spawns a sandbox shell inside a PTY. Output bytes
+//! are pumped out of a reader thread onto an mpsc channel; the broker encrypts
+//! them with the room key and relays them to the coven as `sbx pty_data` frames.
+//! Input frames (`sbx pty_input`) are written back into the PTY. The server only
+//! ever sees ciphertext — identical trust model to chat/file transfer.
+
+use anyhow::{Context, Result};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::io::{Read, Write};
+use std::sync::mpsc;
+
+/// Which sandbox to summon. Multipass = strong isolation (default for real use),
+/// Docker = fast, Local = no isolation (dev/testing only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Local,
+    Docker,
+    Multipass,
+}
+
+impl Backend {
+    pub fn parse(s: &str) -> Option<Backend> {
+        match s {
+            "local" => Some(Backend::Local),
+            "docker" => Some(Backend::Docker),
+            "multipass" => Some(Backend::Multipass),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Backend::Local => "local-shell",
+            Backend::Docker => "docker",
+            Backend::Multipass => "multipass",
+        }
+    }
+}
+
+/// Build the shell command that launches the sandbox for a backend.
+fn command_for(backend: Backend, name: &str, image: &str) -> CommandBuilder {
+    match backend {
+        Backend::Local => {
+            let mut c = CommandBuilder::new("bash");
+            c.arg("-i");
+            c
+        }
+        Backend::Docker => {
+            let mut c = CommandBuilder::new("docker");
+            c.args([
+                "run", "--rm", "-i", "--hostname", name, "-w", "/root", image, "bash", "-i",
+            ]);
+            c
+        }
+        Backend::Multipass => {
+            // Assumes the instance `name` was launched separately (P3b lifecycle).
+            let mut c = CommandBuilder::new("multipass");
+            c.args(["exec", name, "--", "bash", "-il"]);
+            c
+        }
+    }
+}
+
+pub struct Sandbox {
+    // Held for the PTY's lifetime (dropping it closes the terminal) + resize.
+    #[allow(dead_code)]
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    #[allow(dead_code)]
+    pub backend: Backend,
+}
+
+impl Sandbox {
+    /// Spawn the backend in a PTY. A reader thread pushes raw output bytes onto
+    /// `out`; the caller relays them (encrypted) to the coven.
+    pub fn launch(
+        backend: Backend,
+        name: &str,
+        image: &str,
+        rows: u16,
+        cols: u16,
+        out: mpsc::Sender<Vec<u8>>,
+    ) -> Result<Sandbox> {
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("openpty")?;
+
+        let cmd = command_for(backend, name, image);
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .with_context(|| format!("spawn {} sandbox", backend.label()))?;
+        drop(pair.slave); // close our handle so EOF propagates on exit
+
+        let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
+        let writer = pair.master.take_writer().context("take pty writer")?;
+
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if out.send(buf[..n].to_vec()).is_err() {
+                            break; // broker gone
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Sandbox {
+            master: pair.master,
+            child,
+            writer,
+            backend,
+        })
+    }
+
+    pub fn write_input(&mut self, data: &[u8]) -> Result<()> {
+        self.writer.write_all(data)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // wired up with PTY-resize sync (P3b)
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("pty resize")
+    }
+
+    pub fn stop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Proves the PTY pipeline: spawn a real shell, send a command, read its
+    /// output back off the channel. (Local backend — no container needed.)
+    #[test]
+    fn local_shell_pty_roundtrip() {
+        let (tx, rx) = mpsc::channel();
+        let mut sb = Sandbox::launch(Backend::Local, "test", "ubuntu:24.04", 24, 80, tx)
+            .expect("launch local shell");
+        sb.write_input(b"echo HELLO_PTY_42\n").unwrap();
+
+        let mut acc = String::new();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) {
+                acc.push_str(&String::from_utf8_lossy(&chunk));
+                if acc.contains("HELLO_PTY_42") {
+                    break;
+                }
+            }
+        }
+        sb.stop();
+        assert!(
+            acc.contains("HELLO_PTY_42"),
+            "pty output missing marker; got: {acc:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// End-to-end (headless) sandbox relay: launch a local sandbox, run a
+    /// command, encode the PTY output exactly as the broker sends it over the
+    /// encrypted channel (`{"_sbx":"data","b64":...}`), then decode it back the
+    /// way a remote client does and feed it to a vt100 screen — asserting the
+    /// command's output lands on the rendered terminal.
+    #[test]
+    fn sandbox_output_reaches_a_vt100_screen_via_frames() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let (tx, rx) = mpsc::channel();
+        let mut sb = Sandbox::launch(Backend::Local, "test", "ubuntu:24.04", 24, 80, tx)
+            .expect("launch");
+        sb.write_input(b"echo RELAY_MARKER_7\n").unwrap();
+
+        // Remote client side: a vt100 parser fed from decoded data frames.
+        let mut screen = vt100::Parser::new(24, 80, 0);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut hit = false;
+        while Instant::now() < deadline {
+            if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) {
+                // broker: encode → (server relay) → client: decode
+                let frame = serde_json::json!({"_sbx":"data","b64": STANDARD.encode(&chunk)});
+                let b64 = frame["b64"].as_str().unwrap();
+                let decoded = STANDARD.decode(b64).unwrap();
+                screen.process(&decoded);
+                if screen.screen().contents().contains("RELAY_MARKER_7") {
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        sb.stop();
+        assert!(hit, "command output never reached the rendered terminal");
+    }
+}
