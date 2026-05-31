@@ -135,7 +135,7 @@ impl App {
                 self.users = users;
                 self.connected = true;
                 self.sys(format!("joined as {} ⛧", self.me));
-                self.sys("/send <file> · /sendd <dir> · /sbx launch · F2 drive · ctrl-q quit");
+                self.sys("/sbx launch · /drive (type in shell, Esc to release) · /send <file> · ctrl-q quit");
             }
             Net::Message(l) => self.lines.push(l),
             Net::Roster { users, capacity } => {
@@ -391,7 +391,6 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                             }
                         } else {
                             match k.code {
-                                KeyCode::Esc => break Ok(()),
                                 KeyCode::Enter => {
                                     let line = app.input.trim().to_string();
                                     app.input.clear();
@@ -507,7 +506,17 @@ fn handle_command(
     term: &Terminal<CrosstermBackend<std::io::Stdout>>,
 ) {
     let room = &session.room;
-    if let Some(path) = line.strip_prefix("/sendd ").or_else(|| line.strip_prefix("/send ")) {
+    if line == "/drive" {
+        // Mobile-friendly alternative to F2 (no function key needed).
+        if app.sandbox.is_none() {
+            app.sys("no sandbox running — /sbx launch first");
+        } else if app.can_drive() {
+            app.driving = true;
+            app.sys("⛧ drive mode ON — type into the shell · press Esc to release");
+        } else {
+            app.sys("you don't have drive permission — the owner can /grant you");
+        }
+    } else if let Some(path) = line.strip_prefix("/sendd ").or_else(|| line.strip_prefix("/send ")) {
         let path = path.trim();
         match ft::read_payload(path) {
             Ok((name, bytes, dir)) => {

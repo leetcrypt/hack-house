@@ -46,9 +46,9 @@ fn draw_sandbox(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &T
         .map(|r| Line::from(Span::styled(r, Style::default().fg(theme.title))))
         .collect();
     let drive = if app.driving {
-        " · DRIVING (esc to release)"
+        " · DRIVING — type here · Esc to release"
     } else {
-        " · F2 to drive"
+        " · type /drive (or F2) to take the shell"
     };
     let title = format!(" sandbox · {}{} ", sv.backend, drive);
     let border = if app.driving { theme.accent } else { theme.border };
@@ -157,7 +157,8 @@ fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &The
             .title(Span::styled(
                 match &app.pending_offer {
                     Some(o) => format!(" ⛧ incoming: {} — /accept or /reject ", o.name),
-                    None => " message · enter send · esc quit ".to_string(),
+                    None if app.driving => " ⛧ DRIVING the shell — Esc to release ".to_string(),
+                    None => " message · enter send · /drive for shell · ctrl-q quit ".to_string(),
                 },
                 Style::default().fg(theme.title),
             )),
