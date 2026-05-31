@@ -2,10 +2,10 @@
 
 use crate::app::{App, ChatLine};
 use crate::theme::Theme;
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
@@ -35,6 +35,84 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         draw_sandbox(f, area, app, theme);
     }
     draw_input(f, rows[2], app, theme);
+
+    if app.show_help {
+        draw_help(f, f.area(), theme);
+    }
+}
+
+fn centered(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vy = (100u16.saturating_sub(percent_y)) / 2;
+    let vx = (100u16.saturating_sub(percent_x)) / 2;
+    let col = Layout::vertical([
+        Constraint::Percentage(vy),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage(vy),
+    ])
+    .split(area)[1];
+    Layout::horizontal([
+        Constraint::Percentage(vx),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage(vx),
+    ])
+    .split(col)[1]
+}
+
+fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
+    let acc = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let key = Style::default().fg(theme.title);
+    let dim = Style::default().fg(theme.system);
+    let kv = |k: &str, v: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {k:<26}"), key),
+            Span::styled(v.to_string(), dim),
+        ])
+    };
+    let head = |s: &str| Line::from(Span::styled(s.to_string(), acc));
+    let lines = vec![
+        head("⛧ COMMANDS (type in the input bar)"),
+        kv("/sbx launch [backend]", "summon a sandbox: local | docker | multipass"),
+        kv("/sbx stop", "tear down the sandbox (purges the VM)"),
+        kv("/drive", "type into the shared shell  (Esc releases)"),
+        kv("/grant <user>", "let a member drive the shell        (owner)"),
+        kv("/revoke <user>", "take back drive permission          (owner)"),
+        kv("/sudo <user>", "delegate VM superuser (real sudo)   (owner)"),
+        kv("/unsudo <user>", "revoke VM superuser                 (owner)"),
+        kv("/send <file>", "offer a file to the room"),
+        kv("/sendd <dir>", "offer a directory (sent as a tar)"),
+        kv("/accept  ·  /reject", "respond to an incoming file offer"),
+        kv("/help", "show / hide this menu"),
+        Line::from(""),
+        head("⛧ KEYS"),
+        kv("Enter", "send chat message"),
+        kv("F1  ·  /help", "toggle this help (any key closes it)"),
+        kv("F2  ·  /drive", "take the shell  ·  Esc releases it"),
+        kv("Ctrl-C  (while driving)", "interrupt the running command"),
+        kv("PgUp / PgDn", "scroll chat  ·  Home/End = oldest/live"),
+        kv("Up / Down", "scroll the sandbox terminal (when not driving)"),
+        kv("Ctrl-Q", "quit hack-house"),
+        Line::from(""),
+        head("⛧ ROSTER GLYPHS"),
+        kv("⛧ owner   ⚡ sudoer", "◆ may drive    • member"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  malware bless · press any key to close",
+            Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+        )),
+    ];
+    let w = centered(78, 90, area);
+    f.render_widget(Clear, w);
+    let help = Paragraph::new(lines)
+        .block(
+            Block::bordered()
+                .border_style(Style::default().fg(theme.accent))
+                .title(Span::styled(
+                    " ⛧ hack-house — help ⛧ ",
+                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(help, w);
 }
 
 fn draw_sandbox(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {

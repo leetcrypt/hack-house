@@ -95,6 +95,8 @@ pub struct App {
     pub chat_scroll: usize,
     /// Sandbox terminal scrollback: rows scrolled up from the bottom.
     pub sbx_scroll: usize,
+    /// Whether the help overlay is showing.
+    pub show_help: bool,
 }
 
 impl App {
@@ -115,6 +117,7 @@ impl App {
             transfers: HashMap::new(),
             chat_scroll: 0,
             sbx_scroll: 0,
+            show_help: false,
         }
     }
 
@@ -405,7 +408,11 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                         if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('q')) {
                             break Ok(());
                         }
-                        if k.code == KeyCode::F(2) {
+                        if app.show_help {
+                            app.show_help = false; // any key dismisses the overlay
+                        } else if k.code == KeyCode::F(1) {
+                            app.show_help = true;  // F1 from any mode
+                        } else if k.code == KeyCode::F(2) {
                             if app.sandbox.is_none() {
                             } else if app.can_drive() {
                                 app.driving = !app.driving;
@@ -592,7 +599,9 @@ fn handle_command(
     term: &Terminal<CrosstermBackend<std::io::Stdout>>,
 ) {
     let room = &session.room;
-    if line == "/drive" {
+    if line == "/help" || line == "/?" {
+        app.show_help = true;
+    } else if line == "/drive" {
         // Mobile-friendly alternative to F2 (no function key needed).
         if app.sandbox.is_none() {
             app.sys("no sandbox running — /sbx launch first");
