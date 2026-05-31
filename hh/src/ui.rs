@@ -116,10 +116,12 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
         .iter()
         .map(|u| {
             let me = u.username == app.me;
-            // ⛧ owner/superuser · ◆ may drive · • member
+            // ⛧ owner · ⚡ sudoer (VM superuser) · ◆ may drive · • member
             let owner = app.owner.as_deref() == Some(u.username.as_str());
             let mark = if owner {
                 "⛧"
+            } else if app.sudoers.contains(&u.username) {
+                "⚡"
             } else if app.drivers.contains(&u.username) {
                 "◆"
             } else {

@@ -51,40 +51,55 @@ impl Backend {
 /// thread (Multipass boots a real VM, ~20-30s). Idempotent: reuses an instance
 /// that already exists.
 pub fn prepare(backend: Backend, name: &str, image: &str) -> Result<()> {
-    if backend != Backend::Multipass {
-        return Ok(());
+    match backend {
+        Backend::Local => Ok(()),
+        Backend::Multipass => {
+            let exists = Command::new("multipass")
+                .args(["info", name])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !exists {
+                let st = Command::new("multipass")
+                    .args(["launch", "--name", name, "--cpus", "1", "--memory", "1G", "--disk", "5G", image])
+                    .status()
+                    .context("multipass launch (is multipass installed?)")?;
+                anyhow::ensure!(st.success(), "multipass launch failed");
+            } else {
+                let _ = Command::new("multipass").args(["start", name]).status();
+            }
+            Ok(())
+        }
+        Backend::Docker => {
+            // Persistent container so we can exec in to provision users + shells.
+            let _ = Command::new("docker").args(["rm", "-f", name]).status();
+            let st = Command::new("docker")
+                .args(["run", "-d", "--name", name, "--hostname", name, "-w", "/root", image, "sleep", "infinity"])
+                .status()
+                .context("docker run (is docker installed?)")?;
+            anyhow::ensure!(st.success(), "docker run failed");
+            Ok(())
+        }
     }
-    let exists = Command::new("multipass")
-        .args(["info", name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !exists {
-        let st = Command::new("multipass")
-            .args([
-                "launch", "--name", name, "--cpus", "1", "--memory", "1G", "--disk", "5G", image,
-            ])
-            .status()
-            .context("multipass launch (is multipass installed?)")?;
-        anyhow::ensure!(st.success(), "multipass launch failed");
-    } else {
-        let _ = Command::new("multipass").args(["start", name]).status();
-    }
-    Ok(())
 }
 
 /// Destroy ephemeral resources after stop. Multipass instance is purged;
-/// Docker uses `--rm` so the container is already gone; Local is a no-op.
+/// the Docker container is removed; Local is a no-op.
 pub fn teardown(backend: Backend, name: &str) {
-    if backend == Backend::Multipass {
-        let _ = Command::new("multipass")
-            .args(["delete", name, "--purge"])
-            .status();
+    match backend {
+        Backend::Multipass => {
+            let _ = Command::new("multipass").args(["delete", name, "--purge"]).status();
+        }
+        Backend::Docker => {
+            let _ = Command::new("docker").args(["rm", "-f", name]).status();
+        }
+        Backend::Local => {}
     }
 }
 
-/// Build the shell command that launches the sandbox for a backend.
-fn command_for(backend: Backend, name: &str, image: &str) -> CommandBuilder {
+/// Build the shell command for a backend, running as unix user `run_user`
+/// (empty = backend default). The container/VM is already up (see `prepare`).
+fn command_for(backend: Backend, name: &str, run_user: &str) -> CommandBuilder {
     match backend {
         Backend::Local => {
             let mut c = CommandBuilder::new("bash");
@@ -92,18 +107,103 @@ fn command_for(backend: Backend, name: &str, image: &str) -> CommandBuilder {
             c
         }
         Backend::Docker => {
+            let user = if run_user.is_empty() { "root" } else { run_user };
             let mut c = CommandBuilder::new("docker");
-            c.args([
-                "run", "--rm", "-i", "--hostname", name, "-w", "/root", image, "bash", "-i",
-            ]);
+            c.args(["exec", "-it", "-u", user, name, "bash", "-il"]);
             c
         }
         Backend::Multipass => {
-            // Assumes the instance `name` was launched separately (P3b lifecycle).
             let mut c = CommandBuilder::new("multipass");
-            c.args(["exec", name, "--", "bash", "-il"]);
+            if run_user.is_empty() {
+                c.args(["exec", name, "--", "bash", "-il"]);
+            } else {
+                // Login shell as the provisioned owner account (a real sudoer).
+                c.args(["exec", name, "--", "sudo", "-u", run_user, "-i"]);
+            }
             c
         }
+    }
+}
+
+/// Sanitize a coven display name into a safe unix username.
+pub fn unix_name(name: &str) -> String {
+    let s: String = name
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(31)
+        .collect();
+    s.trim_start_matches(['-', '_']).to_string()
+}
+
+fn mp(name: &str, args: &[&str]) {
+    let mut a = vec!["exec", name, "--"];
+    a.extend_from_slice(args);
+    let _ = Command::new("multipass").args(a).status();
+}
+fn dk(name: &str, args: &[&str]) {
+    let mut a = vec!["exec", name];
+    a.extend_from_slice(args);
+    let _ = Command::new("docker").args(a).status();
+}
+
+/// Grant a Multipass user real *passwordless* sudo (group + sudoers.d drop-in)
+/// so they're a usable superuser non-interactively. `u` is already unix-safe.
+fn mp_grant_sudo(name: &str, u: &str) {
+    let script = format!(
+        "usermod -aG sudo {u}; printf '{u} ALL=(ALL) NOPASSWD:ALL\\n' > /etc/sudoers.d/90-{u}; chmod 440 /etc/sudoers.d/90-{u}"
+    );
+    mp(name, &["sudo", "bash", "-c", &script]);
+}
+fn mp_revoke_sudo(name: &str, u: &str) {
+    let script = format!("gpasswd -d {u} sudo 2>/dev/null; rm -f /etc/sudoers.d/90-{u}");
+    mp(name, &["sudo", "bash", "-c", &script]);
+}
+
+/// Provision a real unix account per coven member inside the VM/container and
+/// make the owner a superuser (sudoer). Returns the unix user the shared shell
+/// should run as. Blocking — call off the UI thread.
+pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) -> String {
+    let run = unix_name(owner);
+    match backend {
+        Backend::Multipass => {
+            for m in members {
+                let u = unix_name(m);
+                if !u.is_empty() {
+                    mp(name, &["sudo", "useradd", "-m", "-s", "/bin/bash", &u]);
+                }
+            }
+            if !run.is_empty() {
+                mp_grant_sudo(name, &run); // owner = passwordless superuser
+            }
+            run
+        }
+        Backend::Docker => {
+            for m in members {
+                let u = unix_name(m);
+                if !u.is_empty() {
+                    dk(name, &["useradd", "-m", "-s", "/bin/bash", &u]);
+                }
+            }
+            // Base images usually lack the sudo package; the shared shell runs as
+            // root (superuser) and drive-grant is the delegation mechanism.
+            "root".to_string()
+        }
+        Backend::Local => String::new(),
+    }
+}
+
+/// Grant/revoke real sudo for a member's unix account (Multipass; sudo is
+/// preinstalled). No-op for Docker (no sudo pkg) / Local.
+pub fn set_sudo(backend: Backend, name: &str, user: &str, enable: bool) {
+    let u = unix_name(user);
+    if u.is_empty() || backend != Backend::Multipass {
+        return;
+    }
+    if enable {
+        mp_grant_sudo(name, &u);
+    } else {
+        mp_revoke_sudo(name, &u);
     }
 }
 
@@ -123,7 +223,7 @@ impl Sandbox {
     pub fn launch(
         backend: Backend,
         name: &str,
-        image: &str,
+        run_user: &str,
         rows: u16,
         cols: u16,
         out: mpsc::Sender<Vec<u8>>,
@@ -138,7 +238,7 @@ impl Sandbox {
             })
             .context("openpty")?;
 
-        let cmd = command_for(backend, name, image);
+        let cmd = command_for(backend, name, run_user);
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -203,7 +303,7 @@ mod tests {
     #[test]
     fn local_shell_pty_roundtrip() {
         let (tx, rx) = mpsc::channel();
-        let mut sb = Sandbox::launch(Backend::Local, "test", "ubuntu:24.04", 24, 80, tx)
+        let mut sb = Sandbox::launch(Backend::Local, "test", "", 24, 80, tx)
             .expect("launch local shell");
         sb.write_input(b"echo HELLO_PTY_42\n").unwrap();
 
@@ -242,7 +342,7 @@ mod relay_tests {
         use base64::Engine;
 
         let (tx, rx) = mpsc::channel();
-        let mut sb = Sandbox::launch(Backend::Local, "test", "ubuntu:24.04", 24, 80, tx)
+        let mut sb = Sandbox::launch(Backend::Local, "test", "", 24, 80, tx)
             .expect("launch");
         sb.write_input(b"echo RELAY_MARKER_7\n").unwrap();
 

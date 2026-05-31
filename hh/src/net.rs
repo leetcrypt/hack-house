@@ -192,15 +192,18 @@ fn parse_perm(text: &str) -> Option<Net> {
     if v["_perm"].as_str()? != "acl" {
         return None;
     }
-    let drivers = v["drivers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|d| d.as_str().map(str::to_string))
-        .collect();
+    let list = |key: &str| {
+        v[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d.as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+    };
     Some(Net::Perm {
         owner: v["owner"].as_str().unwrap_or("").to_string(),
-        drivers,
+        drivers: list("drivers"),
+        sudoers: list("sudoers"),
     })
 }
 

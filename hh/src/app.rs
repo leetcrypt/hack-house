@@ -65,7 +65,7 @@ pub enum Net {
     SbxResize { rows: u16, cols: u16 },
     SbxData(Vec<u8>),
     SbxInput { from: String, bytes: Vec<u8> },
-    Perm { owner: String, drivers: Vec<String> },
+    Perm { owner: String, drivers: Vec<String>, sudoers: Vec<String> },
     Ft(ft::Ft),
     Sys(String),
     Closed,
@@ -87,6 +87,8 @@ pub struct App {
     pub driving: bool,
     pub owner: Option<String>,
     pub drivers: std::collections::HashSet<String>,
+    /// Members whose VM unix account has sudo (superuser). Always includes owner.
+    pub sudoers: std::collections::HashSet<String>,
     pub pending_offer: Option<ft::Offer>,
     transfers: HashMap<String, Transfer>,
 }
@@ -104,6 +106,7 @@ impl App {
             driving: false,
             owner: None,
             drivers: std::collections::HashSet::new(),
+            sudoers: std::collections::HashSet::new(),
             pending_offer: None,
             transfers: HashMap::new(),
         }
@@ -158,6 +161,7 @@ impl App {
                     self.driving = false;
                     self.owner = None;
                     self.drivers.clear();
+                    self.sudoers.clear();
                     self.sys("⛧ sandbox dismissed");
                 }
             }
@@ -172,8 +176,9 @@ impl App {
                 }
             }
             Net::SbxInput { .. } => {} // broker enforces + writes in the run loop
-            Net::Perm { owner, drivers } => {
+            Net::Perm { owner, drivers, sudoers } => {
                 let new: std::collections::HashSet<String> = drivers.into_iter().collect();
+                let sudo: std::collections::HashSet<String> = sudoers.into_iter().collect();
                 if !owner.is_empty() && self.owner.as_deref() != Some(owner.as_str()) {
                     self.sys(format!("⛧ {owner} is the superuser (sandbox owner)"));
                 }
@@ -183,8 +188,12 @@ impl App {
                     self.driving = false;
                     self.sys("⛧ your drive permission was revoked");
                 }
+                if sudo.contains(&self.me) && !self.sudoers.contains(&self.me) && self.owner.is_some() {
+                    self.sys("⛧ you were granted sudo (superuser) in the VM");
+                }
                 self.owner = Some(owner).filter(|o| !o.is_empty());
                 self.drivers = new;
+                self.sudoers = sudo;
             }
             Net::Ft(_) => {} // handled in the run loop (needs out channel + disk)
             Net::Sys(t) => self.sys(t),
@@ -230,7 +239,10 @@ fn send_frame(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, value: serde_
 
 fn broadcast_acl(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, app: &App) {
     let drivers: Vec<&String> = app.drivers.iter().collect();
-    send_frame(out, room, json!({"_perm":"acl","owner": app.owner, "drivers": drivers}));
+    let sudoers: Vec<&String> = app.sudoers.iter().collect();
+    send_frame(out, room, json!({
+        "_perm":"acl","owner": app.owner, "drivers": drivers, "sudoers": sudoers
+    }));
 }
 
 /// Stream a payload to the coven as `_ft` chunks (background, paced).
@@ -421,6 +433,8 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                         app.owner = Some(app.me.clone());
                         app.drivers.clear();
                         app.drivers.insert(app.me.clone());
+                        app.sudoers.clear();
+                        app.sudoers.insert(app.me.clone()); // owner = superuser
                         send_frame(&out_tx, &session.room, json!({
                             "_sbx":"status","state":"ready","backend": backend.label(), "rows": rows, "cols": cols
                         }));
@@ -538,8 +552,10 @@ fn handle_command(
                     let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
                     let (rows, cols) = sbx_dims(sz.0, sz.1);
                     *launching = true;
-                    app.sys(format!("summoning {} sandbox… (multipass boot can take ~30s)", backend.label()));
-                    spawn_launch(backend, image, rows, cols, pty_tx.clone(), broker_tx.clone(), app_tx.clone());
+                    let members: Vec<String> = app.users.iter().map(|u| u.username.clone()).collect();
+                    app.sys(format!("summoning {} sandbox… (provisioning unix users; multipass boot ~30s)", backend.label()));
+                    spawn_launch(backend, image, app.me.clone(), members, rows, cols,
+                        pty_tx.clone(), broker_tx.clone(), app_tx.clone());
                 }
             }
             Some("stop") => {
@@ -555,6 +571,36 @@ fn handle_command(
                 }
             }
             _ => app.sys("usage: /sbx launch [local|docker|multipass] [image] | /sbx stop"),
+        }
+    } else if let Some(rest) = line.strip_prefix("/unsudo") {
+        let target = rest.trim();
+        if !app.is_owner() {
+            app.sys("only the owner can /unsudo");
+        } else if target.is_empty() {
+            app.sys("usage: /unsudo <user>");
+        } else if let Some((be, name)) = broker_meta.clone() {
+            app.sudoers.remove(target);
+            let (t, n) = (target.to_string(), name);
+            tokio::task::spawn_blocking(move || sbx::set_sudo(be, &n, &t, false));
+            broadcast_acl(out_tx, room, app);
+            app.sys(format!("revoked sudo from {target} in the VM"));
+        } else {
+            app.sys("no sandbox running");
+        }
+    } else if let Some(rest) = line.strip_prefix("/sudo") {
+        let target = rest.trim();
+        if !app.is_owner() {
+            app.sys("only the owner can delegate sudo");
+        } else if target.is_empty() {
+            app.sys("usage: /sudo <user>  (delegate VM superuser) | /unsudo <user>");
+        } else if let Some((be, name)) = broker_meta.clone() {
+            app.sudoers.insert(target.to_string());
+            let (t, n) = (target.to_string(), name);
+            tokio::task::spawn_blocking(move || sbx::set_sudo(be, &n, &t, true));
+            broadcast_acl(out_tx, room, app);
+            app.sys(format!("delegated VM superuser (sudo) to {target}"));
+        } else {
+            app.sys("no sandbox running");
         }
     } else if let Some(rest) = line.strip_prefix("/grant") {
         let target = rest.trim();
@@ -585,9 +631,12 @@ fn handle_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_launch(
     backend: sbx::Backend,
     image: String,
+    owner: String,
+    members: Vec<String>,
     rows: u16,
     cols: u16,
     pty_tx: UnboundedSender<Vec<u8>>,
@@ -605,8 +654,15 @@ fn spawn_launch(
             let _ = broker_tx.send(BrokerMsg::Failed);
             return;
         }
+        // Provision real unix accounts (owner = sudoer) → the shell's run-user.
+        let run_user = {
+            let (n, o, ms) = (name.clone(), owner.clone(), members.clone());
+            tokio::task::spawn_blocking(move || sbx::provision(backend, &n, &o, &ms))
+                .await
+                .unwrap_or_default()
+        };
         let (std_tx, std_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        match sbx::Sandbox::launch(backend, &name, &image, rows, cols, std_tx) {
+        match sbx::Sandbox::launch(backend, &name, &run_user, rows, cols, std_tx) {
             Ok(sb) => {
                 std::thread::spawn(move || {
                     while let Ok(b) = std_rx.recv() {
