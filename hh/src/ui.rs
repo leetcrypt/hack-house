@@ -46,9 +46,11 @@ fn draw_sandbox(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &T
         .map(|r| Line::from(Span::styled(r, Style::default().fg(theme.title))))
         .collect();
     let drive = if app.driving {
-        " · DRIVING — type here · Esc to release"
+        " · DRIVING — type here · Esc to release".to_string()
+    } else if app.sbx_scroll > 0 {
+        format!(" · ↑{} scrollback (↓/End=live)", app.sbx_scroll)
     } else {
-        " · type /drive (or F2) to take the shell"
+        " · /drive (or F2) · ↑/↓ scroll".to_string()
     };
     let title = format!(" sandbox · {}{} ", sv.backend, drive);
     let border = if app.driving { theme.accent } else { theme.border };
@@ -98,13 +100,21 @@ fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
 
 fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let visible = area.height.saturating_sub(2) as usize;
-    let start = app.lines.len().saturating_sub(visible);
-    let lines: Vec<Line> = app.lines[start..].iter().map(|l| fmt_line(l, app, theme)).collect();
+    let len = app.lines.len();
+    // Window ends `chat_scroll` lines above the live bottom.
+    let end = len.saturating_sub(app.chat_scroll);
+    let start = end.saturating_sub(visible);
+    let lines: Vec<Line> = app.lines[start..end].iter().map(|l| fmt_line(l, app, theme)).collect();
+    let title = if app.chat_scroll > 0 {
+        format!(" chat ↑{} (End=live) ", app.chat_scroll)
+    } else {
+        " chat ".to_string()
+    };
     let chat = Paragraph::new(lines)
         .block(
             Block::bordered()
                 .border_style(Style::default().fg(theme.border))
-                .title(Span::styled(" chat ", Style::default().fg(theme.title))),
+                .title(Span::styled(title, Style::default().fg(theme.title))),
         )
         .wrap(Wrap { trim: false });
     f.render_widget(chat, area);

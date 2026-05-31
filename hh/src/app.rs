@@ -91,6 +91,10 @@ pub struct App {
     pub sudoers: std::collections::HashSet<String>,
     pub pending_offer: Option<ft::Offer>,
     transfers: HashMap<String, Transfer>,
+    /// Chat scrollback: lines scrolled up from the live bottom (0 = following).
+    pub chat_scroll: usize,
+    /// Sandbox terminal scrollback: rows scrolled up from the bottom.
+    pub sbx_scroll: usize,
 }
 
 impl App {
@@ -109,6 +113,23 @@ impl App {
             sudoers: std::collections::HashSet::new(),
             pending_offer: None,
             transfers: HashMap::new(),
+            chat_scroll: 0,
+            sbx_scroll: 0,
+        }
+    }
+
+    /// Append a chat line. Holds the viewport steady if scrolled up, and caps
+    /// the in-memory backlog.
+    fn push_line(&mut self, l: ChatLine) {
+        self.lines.push(l);
+        if self.chat_scroll > 0 {
+            self.chat_scroll += 1;
+        }
+        const CAP: usize = 4000;
+        if self.lines.len() > CAP {
+            let drop = self.lines.len() - CAP;
+            self.lines.drain(0..drop);
+            self.chat_scroll = self.chat_scroll.min(self.lines.len().saturating_sub(1));
         }
     }
 
@@ -120,7 +141,7 @@ impl App {
     }
 
     fn sys(&mut self, text: impl Into<String>) {
-        self.lines.push(ChatLine {
+        self.push_line(ChatLine {
             ts: String::new(),
             username: String::new(),
             text: text.into(),
@@ -134,10 +155,11 @@ impl App {
                 self.lines = lines;
                 self.users = users;
                 self.connected = true;
+                self.chat_scroll = 0;
                 self.sys(format!("joined as {} ⛧", self.me));
-                self.sys("/sbx launch · /drive (type in shell, Esc to release) · /send <file> · ctrl-q quit");
+                self.sys("/sbx launch · /drive (Esc releases) · /send <file> · PgUp/PgDn scroll chat · ctrl-q quit");
             }
-            Net::Message(l) => self.lines.push(l),
+            Net::Message(l) => self.push_line(l),
             Net::Roster { users, capacity } => {
                 self.users = users;
                 self.capacity = capacity;
@@ -152,13 +174,14 @@ impl App {
             Net::SbxStatus { backend, ready, rows, cols } => {
                 if ready {
                     self.sandbox = Some(SbxView {
-                        parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+                        parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
                         backend: backend.clone(),
                     });
                     self.sys(format!("⛧ sandbox summoned ({backend}) — F2 to drive"));
                 } else {
                     self.sandbox = None;
                     self.driving = false;
+                    self.sbx_scroll = 0;
                     self.owner = None;
                     self.drivers.clear();
                     self.sudoers.clear();
@@ -352,6 +375,11 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
     let result = loop {
+        // Apply the sandbox scrollback offset (0 = follow live).
+        let sbs = app.sbx_scroll;
+        if let Some(v) = &mut app.sandbox {
+            v.parser.set_scrollback(sbs);
+        }
         if let Err(e) = term.draw(|f| ui::draw(f, &app, &theme)) {
             break Err(e.into());
         }
@@ -401,11 +429,41 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                                 KeyCode::Enter => {
                                     let line = app.input.trim().to_string();
                                     app.input.clear();
+                                    app.chat_scroll = 0; // jump back to live on send
                                     handle_command(&line, &mut app, &mut active_send, &mut send_seq,
                                         &mut broker, &mut broker_meta, &mut launching, &mut announced_dims,
                                         &out_tx, &pty_tx, &broker_tx, &app_tx, &session, &term);
                                 }
                                 KeyCode::Backspace => { app.input.pop(); }
+                                // Scroll: ↑/↓ scroll the sandbox terminal if one is up,
+                                // otherwise the chat. PgUp/PgDn always scroll chat.
+                                KeyCode::Up => {
+                                    if app.sandbox.is_some() {
+                                        app.sbx_scroll = (app.sbx_scroll + 1).min(2000);
+                                    } else {
+                                        app.chat_scroll = (app.chat_scroll + 1).min(app.lines.len().saturating_sub(1));
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if app.sandbox.is_some() {
+                                        app.sbx_scroll = app.sbx_scroll.saturating_sub(1);
+                                    } else {
+                                        app.chat_scroll = app.chat_scroll.saturating_sub(1);
+                                    }
+                                }
+                                KeyCode::PageUp => {
+                                    app.chat_scroll = (app.chat_scroll + 10).min(app.lines.len().saturating_sub(1));
+                                }
+                                KeyCode::PageDown => {
+                                    app.chat_scroll = app.chat_scroll.saturating_sub(10);
+                                }
+                                KeyCode::Home => {
+                                    app.chat_scroll = app.lines.len().saturating_sub(1);
+                                }
+                                KeyCode::End => {
+                                    app.chat_scroll = 0;
+                                    app.sbx_scroll = 0;
+                                }
                                 KeyCode::Char(c) => app.input.push(c),
                                 _ => {}
                             }
@@ -446,7 +504,7 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                         launching = false;
                         // Local sandbox view — broker renders straight from the PTY.
                         app.sandbox = Some(SbxView {
-                            parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+                            parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
                             backend: backend.label().to_string(),
                         });
                         app.sys(format!("⛧ sandbox summoned ({}) — /drive to take the shell", backend.label()));
