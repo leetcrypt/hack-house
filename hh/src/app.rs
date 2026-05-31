@@ -349,7 +349,7 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
 
     let mut app = App::new(session.username.clone());
     let mut events = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(120));
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
 
     let result = loop {
         if let Err(e) = term.draw(|f| ui::draw(f, &app, &theme)) {
@@ -370,6 +370,7 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
         }
 
         tokio::select! {
+            biased; // keyboard first, so Ctrl-C / Esc are never starved by output floods
             maybe = events.next() => {
                 match maybe {
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
@@ -387,7 +388,13 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                             if k.code == KeyCode::Esc {
                                 app.driving = false;
                             } else if let Some(bytes) = key_to_pty(k.code, k.modifiers) {
-                                send_frame(&out_tx, &session.room, json!({"_sbx":"input","b64": STANDARD.encode(&bytes)}));
+                                if let Some(sb) = &mut broker {
+                                    // I own the sandbox: write straight to the PTY — instant,
+                                    // and Ctrl-C can't be queued behind outgoing output.
+                                    let _ = sb.write_input(&bytes);
+                                } else {
+                                    send_frame(&out_tx, &session.room, json!({"_sbx":"input","b64": STANDARD.encode(&bytes)}));
+                                }
                             }
                         } else {
                             match k.code {
@@ -418,6 +425,14 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                         }
                     }
                     Some(Net::Ft(f)) => handle_ft(f, &mut app, &mut active_send, &out_tx, &session.room, &downloads),
+                    // The broker renders its sandbox locally from the PTY, so it
+                    // ignores its own echoed status/data; everyone else uses them.
+                    Some(Net::SbxData(b)) => {
+                        if broker.is_none() {
+                            if let Some(v) = &mut app.sandbox { v.parser.process(&b); }
+                        }
+                    }
+                    Some(Net::SbxStatus { .. }) if broker.is_some() => {}
                     Some(n) => app.apply(n),
                     None => break Ok(()),
                 }
@@ -429,6 +444,12 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                         broker_meta = Some((backend, name));
                         announced_dims = Some((rows, cols));
                         launching = false;
+                        // Local sandbox view — broker renders straight from the PTY.
+                        app.sandbox = Some(SbxView {
+                            parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+                            backend: backend.label().to_string(),
+                        });
+                        app.sys(format!("⛧ sandbox summoned ({}) — /drive to take the shell", backend.label()));
                         app.owner = Some(app.me.clone());
                         app.drivers.clear();
                         app.drivers.insert(app.me.clone());
@@ -444,7 +465,14 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                 }
             }
             pty = pty_rx.recv() => {
-                if let Some(bytes) = pty {
+                if let Some(mut bytes) = pty {
+                    // Coalesce a burst (e.g. `tree`) into one frame: fewer round-trips,
+                    // no flood. Render locally now so the owner sees output instantly.
+                    while let Ok(more) = pty_rx.try_recv() {
+                        bytes.extend_from_slice(&more);
+                        if bytes.len() > 256 * 1024 { break; }
+                    }
+                    if let Some(v) = &mut app.sandbox { v.parser.process(&bytes); }
                     send_frame(&out_tx, &session.room, json!({"_sbx":"data","b64": STANDARD.encode(&bytes)}));
                 }
             }
