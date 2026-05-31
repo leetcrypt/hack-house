@@ -147,10 +147,17 @@ fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &The
     ]))
     .block(
         Block::bordered()
-            .border_style(Style::default().fg(theme.border))
+            .border_style(Style::default().fg(if app.pending_offer.is_some() {
+                theme.accent
+            } else {
+                theme.border
+            }))
             .title(Span::styled(
-                " message · enter send · esc quit ",
-                Style::default().fg(theme.dim),
+                match &app.pending_offer {
+                    Some(o) => format!(" ⛧ incoming: {} — /accept or /reject ", o.name),
+                    None => " message · enter send · esc quit ".to_string(),
+                },
+                Style::default().fg(theme.title),
             )),
     );
     f.render_widget(input, area);

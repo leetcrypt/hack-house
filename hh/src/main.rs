@@ -6,6 +6,7 @@
 
 mod app;
 mod crypto;
+mod ft;
 mod net;
 mod sbx;
 mod theme;

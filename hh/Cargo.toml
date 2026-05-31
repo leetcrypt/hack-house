@@ -30,6 +30,9 @@ url = "2"
 portable-pty = "0.8"
 vt100 = "0.15"
 
+# file/dir transfer (P5)
+tar = "0.4"
+
 # async + tui
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

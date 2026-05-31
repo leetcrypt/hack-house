@@ -120,7 +120,7 @@ enum Decoded {
 }
 
 /// Decrypt + classify one stored/broadcast message object.
-fn decode_msg(room: &fernet::Fernet, m: &Value, allow_sbx: bool) -> Decoded {
+fn decode_msg(room: &fernet::Fernet, m: &Value, live: bool) -> Decoded {
     let ct = match m["text"].as_str() {
         Some(c) if !c.is_empty() => c,
         _ => return Decoded::Skip,
@@ -128,18 +128,22 @@ fn decode_msg(room: &fernet::Fernet, m: &Value, allow_sbx: bool) -> Decoded {
     let (text, system) = match room.decrypt(ct) {
         Ok(pt) => {
             let t = String::from_utf8_lossy(&pt).to_string();
-            if t.starts_with("{\"_ft\":") {
-                return Decoded::Skip; // file-transfer control frame (P5)
-            }
             // Server-stamped (authenticated) sender of this message.
             let sender = m["username"].as_str().unwrap_or("?");
             if t.starts_with("{\"_perm\":") {
                 return parse_perm(&t).map(Decoded::Sbx).unwrap_or(Decoded::Skip);
             }
+            // Control frames are live-only — never replayed from the stored snapshot.
             if t.starts_with("{\"_sbx\":") {
-                // Don't replay terminal history from the stored snapshot.
-                return if allow_sbx {
+                return if live {
                     parse_sbx(&t, sender).map(Decoded::Sbx).unwrap_or(Decoded::Skip)
+                } else {
+                    Decoded::Skip
+                };
+            }
+            if t.starts_with("{\"_ft\":") {
+                return if live {
+                    crate::ft::parse(&t, sender).map(|f| Decoded::Sbx(Net::Ft(f))).unwrap_or(Decoded::Skip)
                 } else {
                     Decoded::Skip
                 };
