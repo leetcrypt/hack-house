@@ -49,6 +49,11 @@ is written to disk on the server.
 
 ## Quick start
 
+```bash
+git clone https://github.com/leetcrypt/hack-house.git
+cd hack-house
+```
+
 ### 1. One-shot setup (`bootstrap.sh`)
 
 Checks prerequisites, creates the Python venv, installs the server's

@@ -23,5 +23,5 @@ We welcome contributions of all types, including:
 1. **Fork the repository** on GitHub.
 2. **Clone your fork** locally:
    ```bash
-   git clone https://github.com/diorwave/cmd-chat.git
-   cd cmd-chat
+   git clone https://github.com/leetcrypt/hack-house.git
+   cd hack-house
