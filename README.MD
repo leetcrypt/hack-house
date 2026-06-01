@@ -12,25 +12,14 @@
 
 ---
 
-**hack-house** is a multi-user, end-to-end-encrypted terminal session. A small
-crew shares an encrypted chat room and, when summoned, a disposable sandboxed
-Linux box they drive together — with real Linux users, an owner who delegates
-the keys, and file transfer in between.
+Fork from https://github.com/diorwave/cmd-chat
 
-A privacy- and security-oriented chatroom, with file sharing and shared terminal
-sessions on top. For sharing. For learning. For hacking. For building. For demos.
-For teaching. For mentorship — for the people who don't want to trust
-corporations to manage their data and communications.
+This tool a privacy and security oriented chatroom that we added file sharing as well as shared terminal sessions. 
 
-The server never sees plaintext. Messages, files, and terminal output are all
-relayed as opaque ciphertext. Close the window and the house empties — nothing
-is written to disk on the server.
+For sharing. For learnng. For hacking. For building. For demos. For teaching. For mentorhsip for the people who dont want to trust corporations to manage their data and communications.
 
-> hack-house is the evolution of **cmd-chat**
-> ([diorwave/cmd-chat](https://github.com/diorwave/cmd-chat)). The Python (Sanic)
-> server is the same proven zero-knowledge relay; the flagship client is now a
-> Rust [`ratatui`](https://ratatui.rs) TUI. SRP + HKDF→Fernet are byte-for-byte
-> compatible across both, so the original Python client still interoperates.
+
+Encrypted chat that runs in your terminal. You host the server, you control the room. Close the window — everything's gone. Messages and files are encrypted client-side before the server ever sees them.
 
 
 ## Features
