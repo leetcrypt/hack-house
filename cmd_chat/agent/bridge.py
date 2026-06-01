@@ -56,8 +56,15 @@ class AgentBridge(Client):
             return None
         return rest  # sole-agent form: `/ai <question>`
 
+    async def _send_typing(self, ws, on: bool) -> None:
+        """Tell the room our reply is (not) being generated, so clients can show
+        a spinner. A control frame — never displayed as chat."""
+        frame = json.dumps({"_ai": "typing", "name": self.name, "on": on})
+        await ws.send(self.room_fernet.encrypt(frame.encode()).decode())
+
     async def _answer(self, ws, question: str, asker: str) -> None:
         self.transcript.append(Msg("user", f"{asker}: {question}"))
+        await self._send_typing(ws, True)
         try:
             reply = await asyncio.to_thread(
                 self.provider.complete,
@@ -66,6 +73,8 @@ class AgentBridge(Client):
             )
         except Exception as e:  # noqa: BLE001 — surface any provider failure in-room
             reply = f"[ai error: {e}]"
+        finally:
+            await self._send_typing(ws, False)
         reply = reply.strip() or "[empty reply]"
         self.transcript.append(Msg("assistant", reply))
         await ws.send(self.room_fernet.encrypt(reply.encode()).decode())

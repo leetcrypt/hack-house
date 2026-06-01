@@ -178,6 +178,13 @@ fn decode_msg(room: &fernet::Fernet, m: &Value, live: bool) -> Decoded {
                     Decoded::Skip
                 };
             }
+            if t.starts_with("{\"_ai\":") {
+                return if live {
+                    parse_ai(&t).map(Decoded::Sbx).unwrap_or(Decoded::Skip)
+                } else {
+                    Decoded::Skip
+                };
+            }
             (t, false)
         }
         Err(_) => ("[unreadable — wrong room password?]".to_string(), true),
@@ -218,6 +225,19 @@ fn parse_sbx(text: &str, sender: &str) -> Option<Net> {
         }),
         _ => None,
     }
+}
+
+/// Parse a decrypted `{"_ai":"typing",...}` frame — an AI agent signalling that
+/// it is (or has finished) generating a reply, so the UI can show a spinner.
+fn parse_ai(text: &str) -> Option<Net> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v["_ai"].as_str()? != "typing" {
+        return None;
+    }
+    Some(Net::AiTyping {
+        name: v["name"].as_str().unwrap_or("ai").to_string(),
+        on: v["on"].as_bool().unwrap_or(false),
+    })
 }
 
 /// Parse a decrypted `{"_perm":"acl",...}` frame.

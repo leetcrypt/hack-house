@@ -91,6 +91,11 @@ pub enum Net {
         sudoers: Vec<String>,
     },
     Ft(ft::Ft),
+    /// An AI agent is generating a reply (`on`) or has finished (`!on`).
+    AiTyping {
+        name: String,
+        on: bool,
+    },
     Err(String),
     Closed,
 }
@@ -127,6 +132,10 @@ pub struct App {
     pub error: Option<String>,
     /// The room password this client authenticated with (shown by `/pw`).
     pub password: String,
+    /// AI agents currently generating a reply — drives the "thinking" spinner.
+    pub ai_typing: std::collections::HashSet<String>,
+    /// Monotonic tick counter used to animate the AI spinner.
+    pub spin: usize,
 }
 
 impl App {
@@ -151,6 +160,8 @@ impl App {
             reconnecting: false,
             error: None,
             password: String::new(),
+            ai_typing: std::collections::HashSet::new(),
+            spin: 0,
         }
     }
 
@@ -202,7 +213,7 @@ impl App {
                 self.connected = true;
                 self.chat_scroll = 0;
                 self.sys(format!("joined as {} ⛧", self.me));
-                self.sys("/sbx launch · /drive (Esc releases) · /send <file> · /pw show password · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys("/sbx launch · /drive (Esc releases) · /ai start · /ai <question> · /send <file> · /pw show password · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => self.push_line(l),
             Net::Roster { users, capacity } => {
@@ -213,7 +224,15 @@ impl App {
             Net::Left(uid) => {
                 if let Some(p) = self.users.iter().position(|u| u.user_id == uid) {
                     let name = self.users.remove(p).username;
+                    self.ai_typing.remove(&name); // a departed agent isn't thinking
                     self.sys(format!("{name} left"));
+                }
+            }
+            Net::AiTyping { name, on } => {
+                if on {
+                    self.ai_typing.insert(name);
+                } else {
+                    self.ai_typing.remove(&name);
                 }
             }
             Net::SbxStatus {
@@ -488,6 +507,8 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
     let mut announced_dims: Option<(u16, u16)> = None;
     let mut active_send: Option<ActiveSend> = None;
     let mut send_seq: u64 = 0;
+    // The local AI agent subprocess this client spawned via `/ai start`, if any.
+    let mut agent: Option<std::process::Child> = None;
     let downloads = PathBuf::from("./downloads");
 
     enable_raw_mode()?;
@@ -622,7 +643,8 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     app.chat_scroll = 0; // jump back to live on send
                                     handle_command(&line, &mut app, &mut theme, &mut active_send, &mut send_seq,
                                         &mut broker, &mut broker_meta, &mut launching, &mut announced_dims,
-                                        &out_tx, &pty_tx, &broker_tx, &app_tx, &session, &term);
+                                        &out_tx, &pty_tx, &broker_tx, &app_tx, &session, &term,
+                                        &mut agent, &params);
                                 }
                                 KeyCode::Backspace => { app.input.pop(); }
                                 // Scroll: ↑/↓ scroll the sandbox terminal if one is up,
@@ -793,7 +815,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
             }
             _ = sigterm.recv() => { break Ok(()); }
             _ = sighup.recv() => { break Ok(()); }
-            _ = tick.tick() => {}
+            _ = tick.tick() => { app.spin = app.spin.wrapping_add(1); }
         }
     };
 
@@ -802,6 +824,10 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
         if let Some((be, name)) = broker_meta.take() {
             sbx::teardown(be, &name);
         }
+    }
+    if let Some(mut child) = agent.take() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
     disable_raw_mode()?;
     execute!(
@@ -841,6 +867,8 @@ fn handle_command(
     app_tx: &UnboundedSender<Net>,
     session: &Session,
     term: &Terminal<CrosstermBackend<std::io::Stdout>>,
+    agent: &mut Option<std::process::Child>,
+    params: &net::ConnParams,
 ) {
     let room = &session.room;
     if line == "/help" || line == "/?" {
@@ -1051,6 +1079,48 @@ fn handle_command(
             broadcast_acl(out_tx, room, app);
             app.sys(format!("revoked drive from {target}"));
         }
+    } else if line == "/ai stop" {
+        // Reap a child that already exited (e.g. failed auth) so the message is honest.
+        if agent
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+        {
+            *agent = None;
+        }
+        if let Some(mut child) = agent.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            app.sys("⛧ dismissed the AI agent");
+        } else {
+            app.sys("no AI agent was started from this client");
+        }
+    } else if let Some(rest) = line
+        .strip_prefix("/ai start")
+        .filter(|r| r.is_empty() || r.starts_with(' '))
+    {
+        // Drop a handle to an agent that has already exited so we can restart.
+        if agent
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+        {
+            *agent = None;
+        }
+        if agent.is_some() {
+            app.sys("an AI agent is already running from this client — /ai stop first");
+        } else {
+            let m = rest.trim();
+            let model = if m.is_empty() { "qwen2.5:3b" } else { m };
+            let name = "oracle";
+            match spawn_agent(params, &app.password, name, model) {
+                Ok(child) => {
+                    *agent = Some(child);
+                    app.sys(format!(
+                        "⛧ summoning {name} (ollama/{model})… it will announce when online"
+                    ));
+                }
+                Err(e) => app.err(format!("/ai start failed: {e}")),
+            }
+        }
     } else if !line.is_empty() && app.connected {
         let _ = out_tx.send(WsMsg::Text(room.encrypt(line.as_bytes())));
     }
@@ -1111,4 +1181,80 @@ fn spawn_launch(
             }
         }
     });
+}
+
+/// Locate the repo root (the dir containing `cmd_chat/agent/`) by walking up from
+/// the executable's path and the current directory — so `/ai start` finds the
+/// Python agent whether the client runs from the checkout or its `target/` dir.
+fn find_repo_root() -> Option<std::path::PathBuf> {
+    let mut starts: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        starts.push(exe);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        starts.push(cwd);
+    }
+    for start in starts {
+        let mut dir: Option<&std::path::Path> = Some(start.as_path());
+        while let Some(d) = dir {
+            if d.join("cmd_chat").join("agent").is_dir() {
+                return Some(d.to_path_buf());
+            }
+            dir = d.parent();
+        }
+    }
+    None
+}
+
+/// Spawn the Python AI agent as a child process that joins this room as a normal
+/// encrypted client (same SRP + room password). Returns the child handle so
+/// `/ai stop` (and client quit) can kill it. The agent's stdout/stderr go to a
+/// log file in the temp dir so its prints never corrupt the TUI.
+fn spawn_agent(
+    params: &net::ConnParams,
+    password: &str,
+    name: &str,
+    model: &str,
+) -> std::result::Result<std::process::Child, String> {
+    use std::process::{Command, Stdio};
+    let root = find_repo_root().ok_or_else(|| {
+        "can't locate the repo (cmd_chat/) — run the client from the checkout".to_string()
+    })?;
+    // Prefer the project venv's interpreter; fall back to HH_AI_PYTHON or python3.
+    let venv_py = root.join(".venv/bin/python");
+    let program = if venv_py.is_file() {
+        venv_py
+    } else {
+        std::path::PathBuf::from(std::env::var("HH_AI_PYTHON").unwrap_or_else(|_| "python3".into()))
+    };
+    let log_path = std::env::temp_dir().join(format!("hh-agent-{name}.log"));
+    let log = std::fs::File::create(&log_path)
+        .map_err(|e| format!("agent log {}: {e}", log_path.display()))?;
+    let log_err = log.try_clone().map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(&program);
+    cmd.current_dir(&root)
+        .arg("-m")
+        .arg("cmd_chat.agent")
+        .arg(&params.ip)
+        .arg(params.port.to_string())
+        .arg("--name")
+        .arg(name)
+        .arg("--provider")
+        .arg("ollama")
+        .arg("--model")
+        .arg(model)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    if !password.is_empty() {
+        cmd.arg("--password").arg(password);
+    }
+    if params.no_tls {
+        cmd.arg("--no-tls");
+    }
+    if params.insecure {
+        cmd.arg("--insecure");
+    }
+    cmd.spawn()
+        .map_err(|e| format!("could not start agent ({}): {e}", program.display()))
 }

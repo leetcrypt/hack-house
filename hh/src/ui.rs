@@ -129,6 +129,15 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         kv("/sbx stop", "tear down the sandbox (purges the VM)"),
         kv("/drive", "type into the shared shell  (Esc releases)"),
         kv(
+            "/ai start [model]",
+            "spawn a local AI agent      (default ollama/qwen2.5:3b)",
+        ),
+        kv("/ai stop", "dismiss the agent you started"),
+        kv(
+            "/ai <question>",
+            "ask an AI agent in the room (/ai <name> <q> if many)",
+        ),
+        kv(
             "/grant <user>",
             "let a member drive the shell        (owner)",
         ),
@@ -357,6 +366,17 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
     f.render_widget(roster, area);
 }
 
+/// Animated "⠋ oracle is thinking…" title shown while AI agents generate a reply.
+fn ai_thinking_title(app: &App) -> String {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let glyph = FRAMES[(app.spin / 2) % FRAMES.len()];
+    let mut names: Vec<&str> = app.ai_typing.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    let who = names.join(", ");
+    let verb = if names.len() > 1 { "are" } else { "is" };
+    format!(" {glyph} {who} {verb} thinking… ")
+}
+
 fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let input = Paragraph::new(Line::from(vec![
         Span::styled("> ", Style::default().fg(theme.accent)),
@@ -378,9 +398,14 @@ fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &The
                     None if app.driving => {
                         format!(" {} DRIVING the shell — Esc to release ", theme.sigil)
                     }
+                    None if !app.ai_typing.is_empty() => ai_thinking_title(app),
                     None => " message · enter send · /drive for shell · ctrl-q quit ".to_string(),
                 },
-                Style::default().fg(theme.title),
+                Style::default().fg(if app.ai_typing.is_empty() {
+                    theme.title
+                } else {
+                    theme.accent
+                }),
             )),
     );
     f.render_widget(input, area);
