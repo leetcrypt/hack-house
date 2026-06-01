@@ -67,8 +67,14 @@ EOF
 
 HERE="$(cd "$(dirname "$0")" && pwd)"   # .../hh
 ROOT="$(cd "$HERE/.." && pwd)"          # repo root
-PY="$ROOT/.venv/bin/python"
+PY="$ROOT/.venv/bin/python"             # venv always from the real checkout
 BIN="$HERE/target/debug/hack-house"
+
+# The demo always runs a *stable* branch (default: main), never your in-progress
+# working branch. If you're on another branch (e.g. dev), the client + server are
+# built from a detached git worktree of $DEMO_BRANCH so your checkout is untouched.
+DEMO_BRANCH="${BRANCH:-main}"
+DEMO_WT="${HH_DEMO_WORKTREE:-/tmp/hh-demo-$DEMO_BRANCH}"
 
 SESSION="${SESSION:-hh-test}"
 HOST="${HOST:-127.0.0.1}"
@@ -121,7 +127,30 @@ done
 if [[ $DO_KILL -eq 1 ]]; then
     tmux kill-session -t "$SESSION" 2>/dev/null && echo "killed tmux session $SESSION"
     stop_server
+    if [[ -e "$DEMO_WT/.git" ]]; then
+        git -C "$ROOT" worktree remove --force "$DEMO_WT" 2>/dev/null && echo "removed demo worktree $DEMO_WT"
+    fi
     exit 0
+fi
+
+# Pin the demo to $DEMO_BRANCH (default: main) when we're on another branch, so
+# e.g. running this from `dev` still demos `main`. A *detached* worktree is used
+# so the branch isn't locked and your real checkout is never modified.
+cur_branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+if [[ "$cur_branch" != "$DEMO_BRANCH" ]]; then
+    if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$DEMO_BRANCH"; then
+        if [[ -e "$DEMO_WT/.git" ]]; then
+            git -C "$DEMO_WT" checkout -f --detach "$DEMO_BRANCH" >/dev/null 2>&1
+        else
+            git -C "$ROOT" worktree add --detach --force "$DEMO_WT" "$DEMO_BRANCH" >/dev/null 2>&1 \
+                || { echo "✖ could not create '$DEMO_BRANCH' worktree at $DEMO_WT" >&2; exit 1; }
+        fi
+        echo "demo pinned to '$DEMO_BRANCH' (you're on '$cur_branch') — building from $DEMO_WT"
+        ROOT="$DEMO_WT"; HERE="$DEMO_WT/hh"
+        BIN="$HERE/target/debug/hack-house"; THEMES_DIR="$HERE/themes"
+    else
+        echo "note: no local '$DEMO_BRANCH' branch — demoing current branch '$cur_branch'" >&2
+    fi
 fi
 
 # Resolve a theme name → TOML path, or empty for the client's built-in default.
