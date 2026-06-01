@@ -49,20 +49,35 @@ is written to disk on the server.
 
 ## Quick start
 
-### 1. Build the client + start a server (one command)
+### 1. One-shot setup (`bootstrap.sh`)
 
-The fastest way to see it working is the tmux harness, which builds the client,
-boots a fresh `--no-tls` server on `127.0.0.1:4173`, and opens a pane per user:
+Checks prerequisites, creates the Python venv, installs the server's
+dependencies, and builds the Rust client:
+
+```bash
+./bootstrap.sh              # venv + deps + debug build
+./bootstrap.sh --release    # release build
+./bootstrap.sh --check      # report tooling only, change nothing
+```
+
+> `bootstrap.sh` does **not** touch direnv — the autostart in step 4 is a
+> separate, opt-in convenience.
+
+### 2. Try it in tmux (`lets-hack.sh`)
+
+The fastest way to see it working: builds the client, boots a fresh `--no-tls`
+server on `127.0.0.1:4173`, and opens a pane per user.
 
 ```bash
 cd hh
 ./lets-hack.sh                  # alice + bob, tiled in tmux
 ./lets-hack.sh neo trinity      # custom users
 ./lets-hack.sh --theme neon     # pick vestments
+./lets-hack.sh --reuse          # keep a live server (reconnect tests)
 ./lets-hack.sh --kill           # tear it all down
 ```
 
-### 2. Manual setup
+### 3. Manual setup
 
 **Server** (Python):
 
@@ -87,16 +102,21 @@ cargo build --release
 | `--insecure` | Skip TLS cert verification (self-signed certs) |
 | `--theme <path>` | Load a vestments TOML (see `hh/themes/`) |
 
-### 3. Autostart with direnv (optional)
+### 4. Autostart with direnv (optional, separate)
+
+A convenience for daily use, independent of `bootstrap.sh`. Run the one-time
+setup once:
 
 ```bash
 cd hh/direnv-autostart
-./setup.sh           # installs direnv, hooks your shell, allows this dir
+./setup.sh           # installs direnv, hooks bash/zsh, `direnv allow`s this dir
 ```
 
-After that, `cd` into the directory launches a single session for the logged-in
-user with a freshly minted in-memory room password (revealed in-app with `/pw`).
-Nothing is written to disk.
+After that, simply `cd`-ing into the directory launches a single session for the
+logged-in user with a freshly minted **in-memory** room password (reveal it
+in-app with `/pw`, share it out-of-band to invite others). The password is
+generated at launch and never written to disk — matching the project's RAM-only
+model. If a session is already live, it just points you at it.
 
 ## Using it
 
@@ -120,8 +140,77 @@ Type to chat. Slash commands and keys:
 | `Ctrl+R` | Reconnect after a drop |
 | `↑/↓` · `PgUp/PgDn` · mouse wheel | Scroll chat / sandbox scrollback |
 
-File transfers are chunked (64 KB), encrypted with the room key, relayed as
-ciphertext, and SHA-256 verified on arrival. Files land in `./downloads/`.
+### The shared sandbox
+
+Anyone in the room can summon a disposable Linux box with `/sbx launch`. The
+person who summons it is the **owner/host**: their client runs the real PTY
+locally and relays its output to everyone else as encrypted frames, so the
+server only ever sees ciphertext (same trust model as chat).
+
+| Backend | Isolation | Notes |
+|---|---|---|
+| `local` | none | a `bash` shell on the host — fast, for dev/testing only |
+| `docker` | container | `ubuntu:24.04` by default; `/sbx launch docker --start` boots the daemon (or run `./ensure-docker.sh`) |
+| `multipass` | full VM | `24.04` by default; strongest isolation, ~30 s to boot, the choice for real use |
+
+Tear it down with `/sbx stop` (purges the VM/container).
+
+### Driving the shell
+
+The shared terminal is **watch-by-default**: everyone sees the live output, but
+only granted drivers can type into it.
+
+- `/drive` (or `F2`) takes the keyboard; `Esc` releases it. `/drive` exists so
+  the whole flow works on mobile/SSH clients with no function keys.
+- While driving, your keystrokes go to the PTY; `Ctrl+C` interrupts the running
+  command (it does **not** quit the app).
+- `PgUp`/`PgDn` and the mouse wheel scroll the terminal's scrollback even while
+  driving; `End` jumps back to live.
+
+### Unix permission control
+
+Permissions are enforced at **two layers**:
+
+1. **App-level drive ACL** — who is allowed to type into the shared shell.
+   The owner runs `/grant <user>` / `/revoke <user>`.
+2. **Real VM identities** — on `multipass`/`docker`, each member is provisioned
+   an actual unix account, with the owner as superuser. On `multipass`,
+   `/sudo <user>` / `/unsudo <user>` toggle real `sudo` rights inside the VM, so
+   "may type" and "may run privileged commands" are independent and enforced by
+   the OS itself.
+
+The roster shows each member's status: owner, sudoer (⚡), driver (◆), or
+member (•).
+
+### Sharing files & directories
+
+`/send <path>` proposes a transfer; recipients `/accept` or `/reject`. A whole
+directory works too (it's packed before sending). Files are chunked (64 KB),
+encrypted with the room key, relayed as opaque ciphertext, and **SHA-256
+verified** on arrival before landing in `./downloads/`. Max size is 50 MB.
+
+### Themes (vestments)
+
+Three bundled themes — `crypt` (default, neutral monochrome), `church` (neon),
+and `neon`. Switch live with `/theme <name>`, list them with bare `/theme`, or
+load your own TOML at launch with `--theme <path>` (see `hh/themes/`). Each
+theme defines its own sigil, colours, and roster width.
+
+### Staying connected
+
+If the connection drops (network blip, laptop sleep), press `Ctrl+R` to re-run
+the SRP handshake and re-attach — no restart needed. If you were hosting the
+sandbox, it's re-announced so the room re-syncs the shared shell. Chat keeps up
+to ~4000 lines of scrollback; the sandbox terminal keeps 2000.
+
+## Configuration
+
+| Variable | Where | Effect |
+|---|---|---|
+| `CMD_CHAT_MAX_USERS` | server | Room capacity (default `4`) |
+| `PORT` · `PW` · `HOST` | `lets-hack.sh` | Override the test server's port / password / bind host |
+| `THEME` | `lets-hack.sh` | Vestments for every pane (`church` · `neon` · `crypt`) |
+| `HH_SESSION` · `HH_USER` | direnv autostart | tmux session name / your in-session name |
 
 ## Securing your connection
 
