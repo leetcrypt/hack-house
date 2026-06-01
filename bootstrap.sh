@@ -77,3 +77,4 @@ echo
 echo "ready. next steps:"
 echo "    cd hh && ./lets-hack.sh          # local test session (server + clients in tmux)"
 echo "    # or run the server + client by hand — see README.MD"
+echo "    # want the local AI agent? ./bootstrap-ai.sh  (installs Ollama + a model)"
