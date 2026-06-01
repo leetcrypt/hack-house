@@ -8,6 +8,10 @@
 [![Rust](https://img.shields.io/badge/client-rust-orange.svg)](https://www.rust-lang.org/)
 [![Python 3.10+](https://img.shields.io/badge/server-python%203.10+-blue.svg)](https://www.python.org/downloads/)
 
+![hack-house demo](docs/hack-house-demo.gif)
+
+*Two clients sharing a multipass sandbox — summon, drive the shell, real per-user sudo.*
+
 </div>
 
 ---
