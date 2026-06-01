@@ -30,6 +30,7 @@ Encrypted chat that runs in your terminal. You host the server, you control the 
 - **RAM only** — nothing persisted on the server; close it and history is gone
 - **Shared sandbox** — summon a disposable `local` / `docker` / `multipass` box the whole room can watch and drive
 - **Real permissions** — the sandbox owner grants/revokes *drive* (keyboard) and *sudo* (VM superuser) per user
+- **Local-first AI agent** — `/ai start` summons an in-room AI that runs against *your own* [Ollama](https://ollama.com) (no API key, nothing leaves your machine); model-agnostic, addressed-only, end-to-end encrypted like every other client
 - **Encrypted file transfer** — `/send` → `/accept` with SHA-256 verification
 - **TLS** — self-signed by default, or bring your own cert; `--no-tls` for local/Tailscale use
 - **Themes** — switchable "vestments" (`church` · `neon` · `crypt`)
@@ -40,7 +41,9 @@ Encrypted chat that runs in your terminal. You host the server, you control the 
 |------|------|
 | `hh/` | The Rust `ratatui` client (the flagship) |
 | `cmd_chat/`, `cmd_chat.py` | The Python (Sanic) server + legacy Python client |
+| `cmd_chat/agent/` | The model-agnostic AI agent bridge (joins a room as an encrypted client) |
 | `hh/lets-hack.sh` | Spin up a local test "clergy" in tmux (server + N client panes) |
+| `bootstrap-ai.sh` | Optional: install Ollama + pull a model for the local `/ai` agent |
 | `hh/direnv-autostart/` | `cd` into a directory to auto-launch a session (direnv) |
 
 ## Quick start
@@ -63,6 +66,16 @@ dependencies, and builds the Rust client:
 
 > `bootstrap.sh` does **not** touch direnv — the autostart in step 4 is a
 > separate, opt-in convenience.
+
+**Optional AI layer (`bootstrap-ai.sh`).** Want the local `/ai` agent? This runs
+the baseline setup first, then installs Ollama (if missing) and pulls a default
+model — nothing here changes the AI-free baseline above:
+
+```bash
+./bootstrap-ai.sh                      # baseline + Ollama + qwen2.5:3b
+./bootstrap-ai.sh --check              # report only, change nothing
+HH_AI_MODEL=llama3 ./bootstrap-ai.sh   # pull a different model
+```
 
 ### 2. Try it in tmux (`lets-hack.sh`)
 
@@ -131,6 +144,9 @@ Type to chat. Slash commands and keys:
 | `/theme [name]` | Switch vestments, or list them |
 | `/send <path>` | Offer a file (or directory) to the room |
 | `/accept` · `/reject` | Respond to a pending file offer |
+| `/ai start [model]` | Summon a local AI agent (default `ollama/qwen2.5:3b`) |
+| `/ai stop` | Dismiss the agent you summoned |
+| `/ai <question>` | Ask the agent (`/ai <name> <question>` if several present) |
 | `/sbx launch [local\|docker\|multipass] [image]` | Summon the shared sandbox |
 | `/sbx stop` | Tear down the sandbox you host |
 | `/drive` · `F2` | Take the shared shell (`Esc` releases) |
@@ -189,6 +205,37 @@ member (•).
 directory works too (it's packed before sending). Files are chunked (64 KB),
 encrypted with the room key, relayed as opaque ciphertext, and **SHA-256
 verified** on arrival before landing in `./downloads/`. Max size is 50 MB.
+
+### The AI agent (local-first)
+
+Summon an AI participant with `/ai start` — it joins the room as a normal
+encrypted client (same SRP + room key as everyone else) and answers when you
+address it with `/ai <question>`. `/ai stop` dismisses it (it's also cleaned up
+when you quit). Pick a model at summon time with `/ai start <model>`.
+
+- **Runs on *your* machine.** The default provider is [Ollama](https://ollama.com)
+  — a local model (default `qwen2.5:3b`), no API key, nothing leaves your host.
+  Run `./bootstrap-ai.sh` once to install it and pull the model.
+- **Addressed-only.** The agent reads room traffic like any client but forwards
+  to the model *only* the messages that trigger it (`/ai …`) — no passive
+  surveillance, no cost or noise when idle.
+- **Model-agnostic.** Swap the backend without touching the client: bundled
+  adapters for `ollama` (default), `anthropic`, and any OpenAI-compatible
+  endpoint (OpenAI, Groq, Together, local vLLM…), plus a `module:Class` hook for
+  your own. Cloud providers are opt-in and read their API key from the agent's
+  environment — never the room.
+- **End-to-end like everything else.** Replies are encrypted client-side; the
+  server still only ever relays ciphertext.
+
+Each agent uses one room seat — raise `CMD_CHAT_MAX_USERS` if the room is full.
+To run an agent by hand (a cloud provider, or on another host), drive the bridge
+directly:
+
+```bash
+.venv/bin/python -m cmd_chat.agent <server_ip> <port> \
+    --name oracle --password <room-pw> --provider ollama --model qwen2.5:3b
+# cloud (opt-in): --provider anthropic --model claude-opus-4-6   (needs ANTHROPIC_API_KEY)
+```
 
 ### Themes (vestments)
 
