@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hack-house smoke test ⛧
+# hack-house smoke test
 # Exercises the full use-case path end to end against a live server:
 #   rust unit tests → SRP self-test → boot server → rust client handshake +
 #   round-trip → cross-language (python decrypts what the rust client sent).
@@ -74,4 +74,4 @@ asyncio.run(main())
 PYEOF
 
 echo
-echo "✓ SMOKE PASS — crypto · SRP · fernet · cross-language relay all green ⛧"
+echo "✓ SMOKE PASS — crypto · SRP · fernet · cross-language relay all green"

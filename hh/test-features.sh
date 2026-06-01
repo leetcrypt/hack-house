@@ -30,13 +30,13 @@ is_up() { curl -s --max-time 2 "http://$HOST:$PORT/health" 2>/dev/null | grep -q
 
 stop_server() {
     if [[ -f "$SRV_PIDFILE" ]]; then
-        kill "$(cat "$SRV_PIDFILE")" 2>/dev/null && echo "⛧ stopped server (pid $(cat "$SRV_PIDFILE"))"
+        kill "$(cat "$SRV_PIDFILE")" 2>/dev/null && echo "stopped server (pid $(cat "$SRV_PIDFILE"))"
         rm -f "$SRV_PIDFILE"
     fi
 }
 
 if [[ "${1:-}" == "--kill" || "${1:-}" == "--teardown" ]]; then
-    tmux kill-session -t "$SESSION" 2>/dev/null && echo "⛧ killed tmux $SESSION" || echo "⛧ no tmux session"
+    tmux kill-session -t "$SESSION" 2>/dev/null && echo "killed tmux $SESSION" || echo "no tmux session"
     stop_server
     exit 0
 fi
@@ -73,20 +73,20 @@ key() { tmux send-keys -t "$1" "$2"; sleep "${KEY_PAUSE:-0.7}"; }               
 raw() { tmux send-keys -t "$1" -l "$2"; sleep "${KEY_PAUSE:-0.7}"; }              # literal bytes (mouse SGR)
 
 # ─── 1. build ───────────────────────────────────────────────────────────────
-echo "⛧ building client…"
+echo "building client…"
 ( cd "$HERE" && cargo build --quiet ) || { echo "✖ build failed"; exit 1; }
 [[ -x "$PY" ]] || { echo "✖ no python at $PY"; exit 1; }
 
 # ─── 2. server ───────────────────────────────────────────────────────────────
 if is_up; then
-    echo "⛧ reusing server on $HOST:$PORT"
+    echo "reusing server on $HOST:$PORT"
 else
-    echo "⛧ booting server on $HOST:$PORT…"
+    echo "booting server on $HOST:$PORT…"
     "$PY" "$ROOT/cmd_chat.py" serve "$HOST" "$PORT" --password "$PW" --no-tls >"$SRV_LOG" 2>&1 &
     echo $! > "$SRV_PIDFILE"
     for _ in $(seq 1 20); do is_up && break; sleep 1; done
     is_up || { echo "✖ server did not come up — see $SRV_LOG"; exit 1; }
-    echo "⛧ server up (pid $(cat "$SRV_PIDFILE"))"
+    echo "server up (pid $(cat "$SRV_PIDFILE"))"
 fi
 
 # ─── 3. tmux session: OWNER | bob ─────────────────────────────────────────────
@@ -104,7 +104,7 @@ tmux set -t "$SESSION" pane-border-format " #{pane_index} " >/dev/null
 
 mapfile -t PANES < <(tmux list-panes -t "$SESSION" -F '#{pane_id}')
 OWNER="${PANES[0]}"; MEMBER="${PANES[1]}"
-echo "⛧ panes: OWNER=$OWNER  MEMBER=$MEMBER   (attach: tmux attach -t $SESSION)"
+echo "panes: OWNER=$OWNER  MEMBER=$MEMBER   (attach: tmux attach -t $SESSION)"
 sleep 2
 
 echo
@@ -224,7 +224,7 @@ for r in "${RESULTS[@]}"; do echo "  $r"; done
 echo "----------------------------------------------------------------"
 echo "  PASS=$PASS  FAIL=$FAIL"
 echo
-echo "⛧ session left up for inspection:  tmux attach -t $SESSION"
-echo "⛧ tear down with:                  $0 --kill"
+echo "session left up for inspection:  tmux attach -t $SESSION"
+echo "tear down with:                  $0 --kill"
 
 exit $(( FAIL > 0 ? 1 : 0 ))

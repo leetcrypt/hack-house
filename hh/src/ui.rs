@@ -129,10 +129,10 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         kv("PgUp / PgDn  (driving)", "scroll the sandbox terminal's scrollback"),
         kv("Up / Down  ·  wheel", "scroll the sandbox terminal (mouse works while driving)"),
         kv("Ctrl-R  (when closed)", "reconnect to the house after a drop / AFK"),
-        kv("Ctrl-Q", "quit hack-house"),
+        kv("Ctrl-C  ·  Ctrl-Q", "quit hack-house"),
         Line::from(""),
         head("ROSTER GLYPHS"),
-        kv("⛧ owner   ⚡ sudoer", "◆ may drive    • member"),
+        kv(&format!("{} owner   ⚡ sudoer", theme.sigil), "◆ may drive    • member"),
         Line::from(""),
         Line::from(Span::styled(
             "  malware bless · press any key to close",
@@ -207,8 +207,12 @@ fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme
 
 fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
     if l.system {
+        // System lines carry the canonical ⛧ as a placeholder for "the house
+        // sigil"; swap it for the active theme's sigil so e.g. crypt shows ✝,
+        // never a pentagram. User messages (l.system == false) are left as typed.
+        let text = l.text.replace('⛧', &theme.sigil);
         return Line::from(Span::styled(
-            format!("  ⛧ {}", l.text),
+            format!("  {} {}", theme.sigil, text),
             Style::default().fg(theme.system).add_modifier(Modifier::ITALIC),
         ));
     }
@@ -261,10 +265,10 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
         .iter()
         .map(|u| {
             let me = u.username == app.me;
-            // ⛧ owner · ⚡ sudoer (VM superuser) · ◆ may drive · • member
+            // <sigil> owner · ⚡ sudoer (VM superuser) · ◆ may drive · • member
             let owner = app.owner.as_deref() == Some(u.username.as_str());
             let mark = if owner {
-                "⛧"
+                theme.sigil.as_str()
             } else if app.sudoers.contains(&u.username) {
                 "⚡"
             } else if app.drivers.contains(&u.username) {
@@ -301,8 +305,8 @@ fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &The
             }))
             .title(Span::styled(
                 match &app.pending_offer {
-                    Some(o) => format!(" ⛧ incoming: {} — /accept or /reject ", o.name),
-                    None if app.driving => " ⛧ DRIVING the shell — Esc to release ".to_string(),
+                    Some(o) => format!(" {} incoming: {} — /accept or /reject ", theme.sigil, o.name),
+                    None if app.driving => format!(" {} DRIVING the shell — Esc to release ", theme.sigil),
                     None => " message · enter send · /drive for shell · ctrl-q quit ".to_string(),
                 },
                 Style::default().fg(theme.title),

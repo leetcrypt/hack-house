@@ -1,216 +1,168 @@
 <div align="center">
 
-# CMD-CHAT
+# hack-house
 
-### end-to-end encrypted terminal chat with file transfer
+### encrypted collaborative terminal sessions with a summoned sandbox
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Rust](https://img.shields.io/badge/client-rust-orange.svg)](https://www.rust-lang.org/)
+[![Python 3.10+](https://img.shields.io/badge/server-python%203.10+-blue.svg)](https://www.python.org/downloads/)
 
 </div>
 
 ---
 
-Encrypted chat that runs in your terminal. You host the server, you control the room. Close the window — everything's gone. Messages and files are encrypted client-side before the server ever sees them.
+**hack-house** is a multi-user, end-to-end-encrypted terminal session. A small
+crew shares an encrypted chat room and, when summoned, a disposable sandboxed
+Linux box they drive together — with real Linux users, an owner who delegates
+the keys, and file transfer in between.
+
+The server never sees plaintext. Messages, files, and terminal output are all
+relayed as opaque ciphertext. Close the window and the house empties — nothing
+is written to disk on the server.
+
+> hack-house is the evolution of **cmd-chat**. The Python (Sanic) server is the
+> same proven zero-knowledge relay; the flagship client is now a Rust
+> [`ratatui`](https://ratatui.rs) TUI. SRP + HKDF→Fernet are byte-for-byte
+> compatible across both, so the original Python client still interoperates.
 
 ## Features
 
-- **End-to-end encrypted** — messages encrypted with Fernet (AES-128-CBC + HMAC) before leaving your machine
-- **TLS by default** — auto-generated self-signed certs, or bring your own
-- **SRP authentication** — password never sent over the network (zero-knowledge proof)
-- **Encrypted file transfer** — `/send`, `/accept`, `/reject` with SHA-256 verification
-- **RAM only** — nothing written to disk on the server
-- **Rate limiting** — brute-force protection on auth endpoints
-- **No IP leaks** — client IPs never broadcast to other users
-- **Password hidden** — prompted securely via `getpass`, never visible in `ps` or shell history
+- **End-to-end encrypted** — Fernet (AES-128-CBC + HMAC), encrypted client-side before anything leaves your machine
+- **SRP authentication** — the password is never sent over the network (zero-knowledge proof)
+- **Zero-knowledge server** — relays only ciphertext; cannot read messages, files, or terminal output
+- **RAM only** — nothing persisted on the server; close it and history is gone
+- **Shared sandbox** — summon a disposable `local` / `docker` / `multipass` box the whole room can watch and drive
+- **Real permissions** — the sandbox owner grants/revokes *drive* (keyboard) and *sudo* (VM superuser) per user
+- **Encrypted file transfer** — `/send` → `/accept` with SHA-256 verification
+- **TLS** — self-signed by default, or bring your own cert; `--no-tls` for local/Tailscale use
+- **Themes** — switchable "vestments" (`church` · `neon` · `crypt`)
 
-## Install
+## Layout
+
+| Path | What |
+|------|------|
+| `hh/` | The Rust `ratatui` client (the flagship) |
+| `cmd_chat/`, `cmd_chat.py` | The Python (Sanic) server + legacy Python client |
+| `hh/lets-hack.sh` | Spin up a local test "clergy" in tmux (server + N client panes) |
+| `hh/direnv-autostart/` | `cd` into a directory to auto-launch a session (direnv) |
+
+## Quick start
+
+### 1. Build the client + start a server (one command)
+
+The fastest way to see it working is the tmux harness, which builds the client,
+boots a fresh `--no-tls` server on `127.0.0.1:4173`, and opens a pane per user:
 
 ```bash
-git clone https://github.com/diorwave/cmd-chat.git
-cd cmd-chat
+cd hh
+./lets-hack.sh                  # alice + bob, tiled in tmux
+./lets-hack.sh neo trinity      # custom users
+./lets-hack.sh --theme neon     # pick vestments
+./lets-hack.sh --kill           # tear it all down
+```
+
+### 2. Manual setup
+
+**Server** (Python):
+
+```bash
 pip install -r requirements.txt
+python3 cmd_chat.py serve 0.0.0.0 3000 --password <room-password>
 ```
 
-## Quick Start
-
-**Host a chat room:**
+**Client** (Rust):
 
 ```bash
-python3 cmd_chat.py serve 0.0.0.0 3000
-```
-
-You'll be prompted for a room password (hidden input). An admin token and TLS cert path will print to the console.
-
-**Connect to a chat room:**
-
-```bash
-python3 cmd_chat.py connect SERVER_IP 3000 yourname --insecure
-```
-
-`--insecure` is needed for self-signed certs. You'll be prompted for the room password.
-
-## Securing Your Connection
-
-### Tailscale (recommended)
-
-Both parties install [Tailscale](https://tailscale.com). Traffic goes through an encrypted WireGuard tunnel. No port forwarding, works across NATs.
-
-```bash
-# Host
-python3 cmd_chat.py serve 0.0.0.0 3000
-
-# Friend connects using your Tailscale IP
-python3 cmd_chat.py connect 100.x.x.x 3000 theirname --insecure
-```
-
-Find your Tailscale IP: `tailscale ip -4`
-
-### LAN (same network)
-
-Use your local IP. Both devices must be on the same WiFi/network.
-
-```bash
-python3 cmd_chat.py connect 192.168.1.x 3000 theirname --insecure
-```
-
-### Public Internet
-
-Requires port forwarding on your router (TCP port 3000 to your machine). Use `--cert` and `--key` with a real certificate for production use.
-
-```bash
-python3 cmd_chat.py connect PUBLIC_IP 3000 theirname --insecure
-```
-
-Find your public IP: `curl ifconfig.me`
-
-## Sharing the Room Password
-
-The password must be shared outside the chat. Never send it over an unencrypted channel.
-
-1. **In person** — tell them verbally
-2. **Signal** — disappearing message set to 30 seconds
-3. **One-time link** — [onetimesecret.com](https://onetimesecret.com) (self-destructs after one view)
-4. **Split it** — send half via Telegram, half via SMS
-
-## Chat Commands
-
-| Command | Action |
-|---------|--------|
-| `/send <filepath>` | Propose a file transfer to the room |
-| `/accept` | Accept a pending file offer |
-| `/reject` | Decline a pending file offer |
-| `q` | Disconnect |
-
-### File Transfer
-
-Files are chunked (64KB), encrypted with the room key, and relayed through the server as opaque ciphertext. The server never sees file names, contents, or metadata.
-
-```
-alice> /send report.pdf
-bob>   "alice wants to send report.pdf (1.2 MB) — /accept or /reject"
-bob>   /accept
-       Receiving: 100% (1.2 MB/1.2 MB)
-       File saved: ./downloads/report.pdf — SHA-256 verified
-```
-
-- Max file size: 50 MB
-- Files saved to `./downloads/` relative to where the client was launched
-- SHA-256 integrity check on every transfer
-
-## CLI Reference
-
-### Server
-
-```bash
-python3 cmd_chat.py serve <bind_ip> <port> [options]
+cd hh
+cargo build --release
+./target/release/hack-house connect <server_ip> 3000 <yourname> \
+    --password <room-password> --insecure
 ```
 
 | Flag | Purpose |
 |------|---------|
-| `--password`, `-p` | Room password (prompted if omitted) |
-| `--cert` | Path to TLS certificate |
-| `--key` | Path to TLS private key |
-| `--no-tls` | Disable TLS (local dev only) |
+| `--password` | Room password (required) |
+| `--no-tls` | Connect without TLS (local / trusted tunnel) |
+| `--insecure` | Skip TLS cert verification (self-signed certs) |
+| `--theme <path>` | Load a vestments TOML (see `hh/themes/`) |
 
-### Client
-
-```bash
-python3 cmd_chat.py connect <server_ip> <port> <username> [options]
-```
-
-| Flag | Purpose |
-|------|---------|
-| `--password`, `-p` | Room password (prompted if omitted) |
-| `--insecure`, `-k` | Skip TLS cert verification (self-signed certs) |
-| `--no-tls` | Connect without TLS |
-
-### Environment Variable
-
-Set `CMD_CHAT_PASSWORD` to skip the password prompt for both server and client.
-
-## Helper Scripts
-
-### `./lab/host-chat.sh`
-
-One-command server setup. Detects your IPs (Tailscale, LAN, public), prints the exact connect command your friend needs, then starts the server.
+### 3. Autostart with direnv (optional)
 
 ```bash
-./lab/host-chat.sh              # TLS on port 4000
-./lab/host-chat.sh --port 5000  # custom port
-./lab/host-chat.sh --no-tls     # disable TLS
+cd hh/direnv-autostart
+./setup.sh           # installs direnv, hooks your shell, allows this dir
 ```
 
-### `./lab/setup-lab.sh`
+After that, `cd` into the directory launches a single session for the logged-in
+user with a freshly minted in-memory room password (revealed in-app with `/pw`).
+Nothing is written to disk.
 
-Spins up a tmux session with the server and two chat clients side-by-side for local testing.
+## Using it
 
-```bash
-./lab/setup-lab.sh                          # default lab
-./lab/setup-lab.sh --no-tls --port 4001     # plain HTTP
-./lab/setup-lab.sh --user1 alice --user2 bob
-./lab/setup-lab.sh --teardown               # clean up
-```
+Type to chat. Slash commands and keys:
 
-Attach with `tmux attach -t cmd-chat-lab`. Switch panes with `Ctrl+B` then arrow keys.
+| Command / key | Action |
+|---|---|
+| `<text>` ↵ | Send an encrypted chat message |
+| `/help` · `F1` | Help overlay |
+| `/pw` | Show this room's password (local only — never broadcast) |
+| `/theme [name]` | Switch vestments, or list them |
+| `/send <path>` | Offer a file (or directory) to the room |
+| `/accept` · `/reject` | Respond to a pending file offer |
+| `/sbx launch [local\|docker\|multipass] [image]` | Summon the shared sandbox |
+| `/sbx stop` | Tear down the sandbox you host |
+| `/drive` · `F2` | Take the shared shell (`Esc` releases) |
+| `/grant <user>` · `/revoke <user>` | Owner: delegate/withdraw drive |
+| `/sudo <user>` · `/unsudo <user>` | Owner: delegate/withdraw VM superuser |
+| `Ctrl+C` · `Ctrl+Q` | Quit gracefully |
+| `Ctrl+C` (while driving) | Interrupt the running command |
+| `Ctrl+R` | Reconnect after a drop |
+| `↑/↓` · `PgUp/PgDn` · mouse wheel | Scroll chat / sandbox scrollback |
 
-## How It Works
+File transfers are chunked (64 KB), encrypted with the room key, relayed as
+ciphertext, and SHA-256 verified on arrival. Files land in `./downloads/`.
+
+## Securing your connection
+
+- **Tailscale (recommended)** — both parties join a tailnet; traffic rides an encrypted WireGuard tunnel, no port forwarding. Connect with `--no-tls` over the trusted tunnel, or keep TLS on.
+- **LAN** — use your local IP; both devices on the same network.
+- **Public internet** — forward the port and use a real cert (`--cert`/`--key` on the server).
+
+Share the room password out-of-band (in person, a disappearing Signal message,
+or a one-time-secret link) — never over an unencrypted channel.
+
+## How it works
 
 ```
 CLIENT                              SERVER                         CLIENT
-  │                                   │                               │
-  │── POST /srp/init {A} ──────────► │                               │
-  │◄── {B, salt, room_salt} ──────── │                               │
-  │                                   │                               │
-  │  derive room_key = HKDF(password, room_salt)                      │
-  │                                   │                               │
-  │── POST /srp/verify {M} ────────► │                               │
-  │◄── {H_AMK, ws_token} ─────────── │                               │
-  │                                   │                               │
-  │══ WSS /ws/chat?ws_token ════════► │ ◄══════════════════════════════│
-  │                                   │                               │
-  │  encrypt(msg, room_key) ────────► │ ──── ciphertext ────────────► │
-  │                                   │           decrypt(ciphertext, room_key)
-  │                                   │                               │
-  │  server stores ONLY ciphertext    │                               │
-  │  server CANNOT read messages      │                               │
+  │── POST /srp/init {A} ──────────►│                               │
+  │◄── {B, salt, room_salt} ────────│                               │
+  │  derive room_key = HKDF(password, room_salt)                    │
+  │── POST /srp/verify {M} ────────►│                               │
+  │◄── {H_AMK, ws_token} ───────────│                               │
+  │══ WSS /ws/chat?ws_token ═══════►│◄══════════════════════════════│
+  │  encrypt(msg, room_key) ───────►│──── ciphertext ──────────────►│
+  │                                  │        decrypt(ct, room_key)  │
+  │  server stores ONLY ciphertext — it cannot read messages        │
 ```
 
-**SRP (Secure Remote Password)** — both sides prove they know the password without transmitting it. A network observer learns nothing.
+- **SRP** — both sides prove they know the password without transmitting it.
+- **Room key** — each client derives `HKDF(password, room_salt)` independently; the server never holds it.
+- **Sandbox** — the host runs a PTY locally and relays its output as encrypted `_sbx` frames; drivers' keystrokes flow back the same way. Permissions are enforced both at the app layer (drive ACL) and in the VM (real unix users / sudo).
 
-**Room Key** — derived independently by each client via `HKDF(password, room_salt)`. All clients with the same password get the same key. The server never has the key.
-
-**WebSocket Auth** — HMAC-SHA256 token issued after SRP verification. Prevents session hijacking.
-
-## Admin
-
-The server prints an admin token at startup. Use it to clear message history:
+### Crypto parity
 
 ```bash
-curl -k -X DELETE https://SERVER:3000/clear \
-  -H "Authorization: Bearer <admin-token>"
+cd hh
+cargo run -- selftest                              # offline: Rust SRP ≡ Python golden vectors
+cargo run -- handshake <ip> <port> <name> --password <pw> --no-tls
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Security reports: see [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT
+MIT · *hack the planet*

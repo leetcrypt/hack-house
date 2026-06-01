@@ -1,18 +1,25 @@
-/__pycache__/
-/i-try/
-/venv/
-test_rsa.py
-.gitignore
-commiter.py
-__pycache__
+# Python
+__pycache__/
 *.pyc
-.idea
+/venv/
+.venv/
+.pytest_cache/
+.benchmarks/
+build/
+dist/
+*.egg-info/
+cmd_chat.egg-info/
+secured_console_chat.egg-info/
+
+# Secrets / keys
 *.pem
-__pycache__
-cmd_chat.egg-info
-build
-dist
+
+# Editor / OS
+.idea/
+
+# Project scratch
+/i-try/
+test_rsa.py
+commiter.py
 true.txt
-secured_console_chat.egg-info
-.pytest_cache//.venv/
 /downloads/

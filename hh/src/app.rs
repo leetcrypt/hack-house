@@ -379,6 +379,27 @@ fn handle_ft(
     }
 }
 
+/// Put the terminal back the way we found it: leave raw mode, leave the
+/// alternate screen, stop mouse capture, show the cursor. Best-effort — every
+/// step is independent so one failing (e.g. already-restored) can't strand the
+/// rest. Safe to call more than once.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(std::io::stdout(), crossterm::cursor::Show);
+}
+
+/// RAII: restores the terminal on drop. As long as a guard is alive, *any* exit
+/// from `run` — normal return, `?` error, or a panic unwinding through the
+/// frame — leaves the user's terminal (or tmux pane) usable instead of stuck in
+/// raw/alt-screen mode.
+struct TermGuard;
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme) -> Result<()> {
     let (tx, mut rx) = unbounded_channel::<Net>();
     let app_tx = tx.clone();
@@ -403,6 +424,24 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
+
+    // From here on the terminal is in raw/alt-screen mode. The guard restores it
+    // on every exit path (return, `?`, panic); the panic hook additionally prints
+    // the panic *after* restoring, so a crash leaves a readable message in the
+    // pane instead of garbled raw-mode output.
+    let _term_guard = TermGuard;
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_panic(info);
+    }));
+
+    // Graceful shutdown on signals: a `kill`, a closed tmux pane (SIGHUP), or a
+    // Ctrl-C delivered while NOT in raw mode all break the loop cleanly so the
+    // guard above can restore the terminal — no more being "booted" with a
+    // broken pane. (In raw mode Ctrl-C arrives as a key event, handled below.)
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     let mut app = App::new(session.username.clone());
     app.password = params.password.clone();
@@ -444,7 +483,13 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                 match maybe {
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
                         app.error = None; // any keypress dismisses the error popup
-                        if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('q')) {
+                        // Ctrl-Q always quits. Ctrl-C quits too — *unless* we're
+                        // driving the sandbox, where it must reach the PTY as an
+                        // interrupt (handled in the `app.driving` branch below).
+                        if k.modifiers.contains(KeyModifiers::CONTROL)
+                            && (matches!(k.code, KeyCode::Char('q'))
+                                || (matches!(k.code, KeyCode::Char('c')) && !app.driving))
+                        {
                             break Ok(());
                         }
                         if k.modifiers.contains(KeyModifiers::CONTROL)
@@ -675,6 +720,8 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                     None => {}
                 }
             }
+            _ = sigterm.recv() => { break Ok(()); }
+            _ = sighup.recv() => { break Ok(()); }
             _ = tick.tick() => {}
         }
     };

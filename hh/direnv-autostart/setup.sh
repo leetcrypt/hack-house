@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup.sh — one-time setup for the hack-house direnv autostart ⛧
+# setup.sh — one-time setup for the hack-house direnv autostart
 #
 # Installs direnv (if missing), hooks your shell, and allows the .envrc in this
 # directory so that simply `cd`-ing here launches your hack-house session.
@@ -24,15 +24,15 @@ esac
 
 # 1. ensure direnv is installed
 if command -v direnv >/dev/null 2>&1; then
-    echo "⛧ direnv already installed ($(direnv version 2>/dev/null))"
+    echo "direnv already installed ($(direnv version 2>/dev/null))"
 elif command -v apt-get >/dev/null 2>&1; then
-    echo "⛧ installing direnv via apt…"
+    echo "installing direnv via apt…"
     sudo apt-get update -qq && sudo apt-get install -y direnv
 elif command -v brew >/dev/null 2>&1; then
-    echo "⛧ installing direnv via brew…"
+    echo "installing direnv via brew…"
     brew install direnv
 else
-    echo "⛧ installing direnv via the official script (→ ~/.local/bin)…"
+    echo "installing direnv via the official script (→ ~/.local/bin)…"
     mkdir -p "$HOME/.local/bin"
     export bin_path="$HOME/.local/bin"
     curl -sfL https://direnv.net/install.sh | bash
@@ -46,10 +46,10 @@ add_hook() { # $1 = rc file, $2 = hook line
     local rc="$1" line="$2"
     [[ -f "$rc" ]] || return 0
     if grep -qF 'direnv hook' "$rc"; then
-        echo "⛧ shell hook already present in $rc"
+        echo "shell hook already present in $rc"
     else
         printf '\n# direnv (hack-house autostart)\n%s\n' "$line" >> "$rc"
-        echo "⛧ added direnv hook to $rc"
+        echo "added direnv hook to $rc"
     fi
 }
 add_hook "$HOME/.bashrc" "$hook_line_bash"
@@ -62,8 +62,8 @@ if [[ ! -f "$HERE/.envrc" ]]; then
     exit 1
 fi
 direnv allow "$HERE"
-echo "⛧ allowed $HERE/.envrc"
+echo "allowed $HERE/.envrc"
 
 echo
-echo "⛧ done. open a new shell (or: source ~/.bashrc), then:  cd $HERE"
+echo "done. open a new shell (or: source ~/.bashrc), then:  cd $HERE"
 echo "  your single-user hack-house boots automatically (fresh server, generated password)."

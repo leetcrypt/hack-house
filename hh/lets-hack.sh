@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lets-hack.sh — spin up a local hack-house test clergy in tmux ⛧
+# lets-hack.sh — spin up a local hack-house test clergy in tmux
 #
 # Builds the client, makes sure a --no-tls server is running, then opens one
 # tmux pane per user (default: alice bob) and attaches. Each pane is a real
@@ -29,7 +29,7 @@ set -uo pipefail
 
 usage() {
     cat <<EOF
-lets-hack.sh — spin up a local hack-house test clergy in tmux ⛧
+lets-hack.sh — spin up a local hack-house test clergy in tmux
 
 usage:
   ./lets-hack.sh [USERS...] [--theme NAME] [--fresh]
@@ -85,13 +85,13 @@ is_up() { curl -s --max-time 2 "http://$HOST:$PORT/health" 2>/dev/null | grep -q
 # holding the port (covers an untracked/stale server). Used by --kill / --fresh.
 stop_server() {
     if [[ -f "$SRV_PIDFILE" ]]; then
-        kill "$(cat "$SRV_PIDFILE")" 2>/dev/null && echo "⛧ stopped tracked server (pid $(cat "$SRV_PIDFILE"))"
+        kill "$(cat "$SRV_PIDFILE")" 2>/dev/null && echo "stopped tracked server (pid $(cat "$SRV_PIDFILE"))"
         rm -f "$SRV_PIDFILE"
     fi
     local pid
     pid="$(ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)"
     if [[ -n "$pid" ]]; then
-        kill "$pid" 2>/dev/null && echo "⛧ stopped server holding :$PORT (pid $pid)"
+        kill "$pid" 2>/dev/null && echo "stopped server holding :$PORT (pid $pid)"
     fi
 }
 
@@ -119,7 +119,7 @@ done
 # --kill: tear down the tmux session and the server we started. (Done before
 # theme resolution so teardown never depends on a valid --theme.)
 if [[ $DO_KILL -eq 1 ]]; then
-    tmux kill-session -t "$SESSION" 2>/dev/null && echo "⛧ killed tmux session $SESSION"
+    tmux kill-session -t "$SESSION" 2>/dev/null && echo "killed tmux session $SESSION"
     stop_server
     exit 0
 fi
@@ -138,7 +138,7 @@ fi
 [[ ${#USERS[@]} -eq 0 ]] && USERS=(alice bob)
 
 # 1. build the client
-echo "⛧ building client…"
+echo "building client…"
 ( cd "$HERE" && cargo build --quiet ) || { echo "✖ build failed"; exit 1; }
 
 # 2. (re)boot the server on $PORT. Default behaviour: always create a *fresh*
@@ -146,20 +146,20 @@ echo "⛧ building client…"
 #    message history / ghost users. Pass --reuse to keep an existing live server
 #    (handy for reconnect tests where the server must outlive a client restart).
 if [[ $REUSE -eq 1 ]] && is_up; then
-    echo "⛧ --reuse: keeping server already live on $HOST:$PORT"
+    echo "--reuse: keeping server already live on $HOST:$PORT"
 else
     if is_up; then
-        echo "⛧ replacing server already live on $HOST:$PORT…"
+        echo "replacing server already live on $HOST:$PORT…"
         stop_server
         for _ in $(seq 1 20); do is_up || break; sleep 0.5; done
         is_up && { echo "✖ could not free port $PORT — is another process holding it?"; exit 1; }
     fi
-    echo "⛧ booting fresh server on $HOST:$PORT…"
+    echo "booting fresh server on $HOST:$PORT…"
     "$PY" "$ROOT/cmd_chat.py" serve "$HOST" "$PORT" --password "$PW" --no-tls >"$SRV_LOG" 2>&1 &
     echo $! > "$SRV_PIDFILE"
     for _ in $(seq 1 20); do is_up && break; sleep 1; done
     is_up || { echo "✖ server did not come up — see $SRV_LOG"; exit 1; }
-    echo "⛧ server up (pid $(cat "$SRV_PIDFILE"), log $SRV_LOG)"
+    echo "server up (pid $(cat "$SRV_PIDFILE"), log $SRV_LOG)"
 fi
 
 # 3. (re)build the tmux session: one pane per user, tiled.
@@ -173,7 +173,7 @@ fi
 launch_cmd() { # $1 = username  → command string for the pane's `sh -c`
     local theme_arg=""
     [[ -n "$THEME_PATH" ]] && theme_arg="$(printf -- '--theme %q' "$THEME_PATH")"
-    printf '%q connect %q %q %q --password %q --no-tls %s; ec=$?; printf "\n⛧ %s left the house (exit %%s) — press enter to close\n" "$ec"; read _' \
+    printf '%q connect %q %q %q --password %q --no-tls %s; ec=$?; printf "\n%s left the house (exit %%s) — press enter to close\n" "$ec"; read _' \
         "$BIN" "$HOST" "$PORT" "$1" "$PW" "$theme_arg" "$1"
 }
 
@@ -194,8 +194,8 @@ for ((i = 1; i < ${#USERS[@]}; i++)); do
 done
 tmux select-layout -t "$SESSION" tiled >/dev/null
 
-echo "⛧ clergy: ${USERS[*]}  ·  session: $SESSION  ·  $HOST:$PORT  ·  vestments: ${THEME:-church (default)}"
-echo "⛧ tear down later with:  $0 --kill"
+echo "clergy: ${USERS[*]}  ·  session: $SESSION  ·  $HOST:$PORT  ·  vestments: ${THEME:-church (default)}"
+echo "tear down later with:  $0 --kill"
 
 # 4. land in the clergy. From a plain shell we replace this process with `attach`.
 #    From inside tmux we can't nest an attach, so switch the current client to
@@ -204,6 +204,6 @@ echo "⛧ tear down later with:  $0 --kill"
 if [[ -z "${TMUX:-}" ]]; then
     exec tmux attach -t "$SESSION"
 else
-    echo "⛧ inside tmux — switching this client to '$SESSION' (detach with Ctrl-b d)"
+    echo "inside tmux — switching this client to '$SESSION' (detach with Ctrl-b d)"
     tmux switch-client -t "$SESSION"
 fi

@@ -26,7 +26,7 @@ done
 daemon_up() { docker info >/dev/null 2>&1; }
 
 if daemon_up; then
-    [[ $CHECK_ONLY -eq 1 ]] || echo "⛧ docker daemon already running" >&2
+    [[ $CHECK_ONLY -eq 1 ]] || echo "docker daemon already running" >&2
     exit 0
 fi
 [[ $CHECK_ONLY -eq 1 ]] && exit 1
@@ -61,7 +61,7 @@ fi
 
 # Confirmation (skipped with --yes).
 if [[ $ASSUME_YES -ne 1 ]]; then
-    printf '⛧ docker daemon is not running. Start it with "%s"? [y/N] ' "$start_cmd" >&2
+    printf 'docker daemon is not running. Start it with "%s"? [y/N] ' "$start_cmd" >&2
     read -r reply
     case "$reply" in
         y|Y|yes|YES) ;;
@@ -69,12 +69,12 @@ if [[ $ASSUME_YES -ne 1 ]]; then
     esac
 fi
 
-echo "⛧ starting docker daemon: $start_cmd" >&2
+echo "starting docker daemon: $start_cmd" >&2
 eval "$start_cmd" || { echo "✖ failed to start docker daemon (sudo password needed? run it in a terminal)" >&2; exit 1; }
 
 # Wait for it to accept connections (Desktop / a fresh VM can take a while).
 for _ in $(seq 1 60); do
-    daemon_up && { echo "⛧ docker daemon is up ⛧" >&2; exit 0; }
+    daemon_up && { echo "docker daemon is up" >&2; exit 0; }
     sleep 1
 done
 

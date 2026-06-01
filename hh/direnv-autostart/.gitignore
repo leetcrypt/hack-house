@@ -1,0 +1,3 @@
+# direnv local state — never commit. (The room password is generated in memory
+# at launch and never written to disk, so there is no secret file to ignore.)
+.direnv/

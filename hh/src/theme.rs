@@ -1,6 +1,6 @@
-//! Loadable colour/layout themes ("vestments"). Default is the churchofmalware
-//! occult-monochrome: black ground, white/grey ink, ⛧ accents. Override with a
-//! TOML file via `--theme <path>`.
+//! Loadable colour/layout themes ("vestments"). Default is "crypt": occult
+//! monochrome — white/grey ink on a lifted slate surface, ✝ accents. Switch to
+//! the neon "church" vestments with `/theme church` or a TOML via `--theme`.
 
 use anyhow::Context;
 use ratatui::style::Color;
@@ -29,28 +29,30 @@ pub struct Theme {
     /// Width of the roster column.
     pub roster_width: u16,
     /// Glyph flanking the "hack-house" title (and used for occult accents).
-    /// Defaults to ⛧ (inverted pentagram); themes can pick their own sigil.
+    /// Each theme picks its own sigil (crypt: ✝, church: ⛧, …).
     pub sigil: String,
 }
 
 impl Default for Theme {
-    /// "church" — Church of Malware: neon on black. Cyan window-chrome, acid-green
-    /// text/prompts, purple system/occult lines, hot-magenta self/owner accents.
+    /// "crypt" — occult monochrome: white ink on a lifted slate surface. Gray
+    /// window-chrome, readable mid-gray timestamps, muted-gray system lines, a
+    /// ✝ sigil. Neutral by default; switch to the neon "church" vestments with
+    /// `/theme church` or `--theme`.
     fn default() -> Self {
         Self {
-            name: "church".into(),
-            border: Color::Rgb(0x19, 0xb3, 0xff),    // cyan window chrome
-            title: Color::Rgb(0x7d, 0xf9, 0xff),     // bright cyan
-            accent: Color::Rgb(0x39, 0xff, 0x14),    // acid green (⛧ glyphs, prompt)
-            dim: Color::Rgb(0x47, 0x5a, 0x7a),       // muted slate-blue
-            me: Color::Rgb(0x39, 0xff, 0x14),        // your messages = acid green
-            other: Color::Rgb(0x56, 0xc8, 0xff),     // others = soft cyan
-            system: Color::Rgb(0xb4, 0x6c, 0xff),    // system / occult = purple
-            input: Color::Rgb(0x39, 0xff, 0x14),
-            roster_me: Color::Rgb(0xff, 0x39, 0xc0), // you / owner = hot magenta
-            bg: Color::Reset,                        // ride the terminal's own black
+            name: "crypt".into(),
+            border: Color::Rgb(0x6e, 0x6e, 0x7a),    // gray chrome, defined against the surface
+            title: Color::Rgb(0xff, 0xff, 0xff),     // white
+            accent: Color::Rgb(0xff, 0xff, 0xff),    // white (sigil / prompt)
+            dim: Color::Rgb(0x9a, 0x9a, 0xa6),       // timestamps — readable mid-gray
+            me: Color::Rgb(0xff, 0xff, 0xff),        // your messages = white
+            other: Color::Rgb(0xc8, 0xc8, 0xd0),     // others = bright gray
+            system: Color::Rgb(0xb0, 0xb0, 0xbc),    // system / occult = legible muted gray
+            input: Color::Rgb(0xff, 0xff, 0xff),
+            roster_me: Color::Rgb(0xff, 0xff, 0xff), // you / owner = white
+            bg: Color::Rgb(0x1c, 0x1c, 0x22),        // slate panel lifts text off pure-black
             roster_width: 22,
-            sigil: "⛧".into(),                       // inverted pentagram
+            sigil: "✝".into(),                       // inverted cross / crypt
         }
     }
 }
@@ -91,10 +93,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_church() {
+    fn default_is_crypt() {
         let t = Theme::default();
-        assert_eq!(t.name, "church");
-        assert_eq!(t.accent, Color::Rgb(0x39, 0xff, 0x14));
+        assert_eq!(t.name, "crypt");
+        assert_eq!(t.accent, Color::Rgb(0xff, 0xff, 0xff));
     }
 
     #[test]

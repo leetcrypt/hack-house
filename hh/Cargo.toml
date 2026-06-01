@@ -2,7 +2,7 @@
 name = "hack-house"
 version = "0.1.0"
 edition = "2021"
-description = "hack-house — encrypted collaborative sessions with a summoned sandbox. ⛧"
+description = "hack-house — encrypted collaborative sessions with a summoned sandbox."
 license = "MIT"
 
 [[bin]]
@@ -34,7 +34,7 @@ vt100 = "0.15"
 tar = "0.4"
 
 # async + tui
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 ratatui = { version = "0.29", features = ["serde", "unstable-rendered-line-info"] }

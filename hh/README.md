@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⛧ hack-house ⛧
+# hack-house
 
 ### encrypted collaborative sessions with a summoned sandbox
 
@@ -29,19 +29,19 @@ compatible with the Python `srp` / `cryptography` stack.
 | phase | feature | state |
 |---|---|---|
 | **P0** | Rust↔Python SRP / Fernet crypto parity | ✅ proven (golden vectors + live + cross-lang E2E) |
-| **P2** | multi-user session (cap 4, infra for more) + authoritative roster | ✅ server-side done |
-| **P1** | ratatui UI (chat, roster, themes) | 🚧 in progress |
-| **P3** | sandbox box (multipass/docker) + shared PTY | ⏳ designed (see `../docs/spec-collaborative-sandbox.md`) |
-| **P4** | permissions (app RBAC + VM unix users / sudo) | ⏳ designed |
-| **P5** | file + directory uploads into the shared session | ⏳ designed |
+| **P2** | multi-user session (cap 4, infra for more) + authoritative roster | ✅ done |
+| **P1** | ratatui UI (chat, roster, themes, help overlay) | ✅ done |
+| **P3** | sandbox box (local / docker / multipass) + shared PTY | ✅ done |
+| **P4** | permissions (app drive ACL + VM unix users / sudo) | ✅ done |
+| **P5** | file + directory transfer into the shared session | ✅ done |
 
 ## crypto parity — the load-bearing proof
 
 ```
 $ hack-house selftest            # offline: Rust SRP ≡ Python srp golden vectors
 $ hack-house handshake <ip> <port> <name> --password <pw> --no-tls
-  ⛧ /srp/verify ok — server identity proven (H_AMK ✓)
-  ⛧ round-trip ✓ decrypted: "the house is open ⛧"
+  /srp/verify ok — server identity proven (H_AMK ✓)
+  round-trip ✓ decrypted: "the house is open"
 ```
 
 `tools/gen_vectors.py` regenerates the golden vectors from the live Python
