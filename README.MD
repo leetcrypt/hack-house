@@ -17,14 +17,21 @@ crew shares an encrypted chat room and, when summoned, a disposable sandboxed
 Linux box they drive together — with real Linux users, an owner who delegates
 the keys, and file transfer in between.
 
+A privacy- and security-oriented chatroom, with file sharing and shared terminal
+sessions on top. For sharing. For learning. For hacking. For building. For demos.
+For teaching. For mentorship — for the people who don't want to trust
+corporations to manage their data and communications.
+
 The server never sees plaintext. Messages, files, and terminal output are all
 relayed as opaque ciphertext. Close the window and the house empties — nothing
 is written to disk on the server.
 
-> hack-house is the evolution of **cmd-chat**. The Python (Sanic) server is the
-> same proven zero-knowledge relay; the flagship client is now a Rust
-> [`ratatui`](https://ratatui.rs) TUI. SRP + HKDF→Fernet are byte-for-byte
+> hack-house is the evolution of **cmd-chat**
+> ([diorwave/cmd-chat](https://github.com/diorwave/cmd-chat)). The Python (Sanic)
+> server is the same proven zero-knowledge relay; the flagship client is now a
+> Rust [`ratatui`](https://ratatui.rs) TUI. SRP + HKDF→Fernet are byte-for-byte
 > compatible across both, so the original Python client still interoperates.
+
 
 ## Features
 
