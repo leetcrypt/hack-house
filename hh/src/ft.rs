@@ -152,7 +152,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hh-ft-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("note.txt");
-        std::fs::write(&src, b"offering to the coven").unwrap();
+        std::fs::write(&src, b"offering to the clergy").unwrap();
 
         let (name, bytes, is_dir) = read_payload(src.to_str().unwrap()).unwrap();
         assert_eq!(name, "note.txt");
@@ -161,7 +161,7 @@ mod tests {
             sha256: sha256_hex(&bytes), dir: false, from: "x".into() };
         let dl = dir.join("dl");
         let out = save(&dl, &offer, &bytes).unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), b"offering to the coven");
+        assert_eq!(std::fs::read(&out).unwrap(), b"offering to the clergy");
         std::fs::remove_dir_all(&dir).ok();
     }
 

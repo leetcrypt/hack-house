@@ -8,7 +8,10 @@ use crate::ui;
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -67,7 +70,7 @@ pub enum Net {
     SbxInput { from: String, bytes: Vec<u8> },
     Perm { owner: String, drivers: Vec<String>, sudoers: Vec<String> },
     Ft(ft::Ft),
-    Sys(String),
+    Err(String),
     Closed,
 }
 
@@ -97,6 +100,12 @@ pub struct App {
     pub sbx_scroll: usize,
     /// Whether the help overlay is showing.
     pub show_help: bool,
+    /// A reconnect handshake is in flight (Ctrl-R after a disconnect).
+    pub reconnecting: bool,
+    /// Transient error shown as a popup over the clergy (cleared on next keypress).
+    pub error: Option<String>,
+    /// The room password this client authenticated with (shown by `/pw`).
+    pub password: String,
 }
 
 impl App {
@@ -118,6 +127,9 @@ impl App {
             chat_scroll: 0,
             sbx_scroll: 0,
             show_help: false,
+            reconnecting: false,
+            error: None,
+            password: String::new(),
         }
     }
 
@@ -152,6 +164,15 @@ impl App {
         });
     }
 
+    /// Surface an error: kept in chat scrollback for history AND shown as a
+    /// popup over the clergy so it can't bleed onto / be overwritten at the
+    /// input box. Dismissed by the next keypress.
+    fn err(&mut self, text: impl Into<String>) {
+        let t = text.into();
+        self.sys(format!("✖ {t}"));
+        self.error = Some(t);
+    }
+
     fn apply(&mut self, n: Net) {
         match n {
             Net::Init { lines, users } => {
@@ -160,7 +181,7 @@ impl App {
                 self.connected = true;
                 self.chat_scroll = 0;
                 self.sys(format!("joined as {} ⛧", self.me));
-                self.sys("/sbx launch · /drive (Esc releases) · /send <file> · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys("/sbx launch · /drive (Esc releases) · /send <file> · /pw show password · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => self.push_line(l),
             Net::Roster { users, capacity } => {
@@ -222,10 +243,10 @@ impl App {
                 self.sudoers = sudo;
             }
             Net::Ft(_) => {} // handled in the run loop (needs out channel + disk)
-            Net::Sys(t) => self.sys(t),
+            Net::Err(t) => self.err(t),
             Net::Closed => {
                 self.connected = false;
-                self.sys("connection closed");
+                self.sys("connection closed — press Ctrl-R to reconnect");
             }
         }
     }
@@ -235,6 +256,16 @@ fn sbx_dims(term_w: u16, term_h: u16) -> (u16, u16) {
     let body_h = term_h.saturating_sub(4);
     let sbx_h = (body_h as u32 * 55 / 100) as u16;
     (sbx_h.saturating_sub(2).max(1), term_w.saturating_sub(2).max(1))
+}
+
+/// One page of sandbox scrollback = the visible grid height (defaults to 10 if
+/// no sandbox is up). The run loop clamps `sbx_scroll` to the grid height anyway.
+fn sbx_page(app: &App) -> usize {
+    app.sandbox
+        .as_ref()
+        .map(|v| v.parser.screen().size().0 as usize)
+        .unwrap_or(10)
+        .max(1)
 }
 
 fn key_to_pty(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
@@ -271,7 +302,7 @@ fn broadcast_acl(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, app: &App)
     }));
 }
 
-/// Stream a payload to the coven as `_ft` chunks (background, paced).
+/// Stream a payload to the clergy as `_ft` chunks (background, paced).
 fn spawn_send(id: String, payload: Arc<Vec<u8>>, out: UnboundedSender<WsMsg>, room: Arc<fernet::Fernet>) {
     tokio::spawn(async move {
         for (seq, chunk) in payload.chunks(ft::CHUNK).enumerate() {
@@ -332,11 +363,11 @@ fn handle_ft(
             if let Some(t) = app.transfers.remove(&id) {
                 if t.accepted {
                     if ft::sha256_hex(&t.buf) != t.meta.sha256 {
-                        app.sys(format!("✖ {} — SHA-256 mismatch, discarded", t.meta.name));
+                        app.err(format!("{} — SHA-256 mismatch, discarded", t.meta.name));
                     } else {
                         match ft::save(downloads, &t.meta, &t.buf) {
                             Ok(p) => app.sys(format!("⛧ saved {} ({}) — verified ✓", p.display(), ft::human(t.buf.len()))),
-                            Err(e) => app.sys(format!("save failed: {e}")),
+                            Err(e) => app.err(format!("save failed: {e}")),
                         }
                     }
                 }
@@ -348,12 +379,12 @@ fn handle_ft(
     }
 }
 
-pub async fn run(session: Session, theme: Theme) -> Result<()> {
-    let ws = net::connect(&session).await?;
-    let (mut write, read) = ws.split();
+pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme) -> Result<()> {
     let (tx, mut rx) = unbounded_channel::<Net>();
     let app_tx = tx.clone();
-    tokio::spawn(net::reader(read, session.room.clone(), tx));
+    let mut write = net::open(&session, tx.clone()).await?;
+    // Carries the result of a background reconnect handshake back to the loop.
+    let (recon_tx, mut recon_rx) = unbounded_channel::<std::result::Result<Session, String>>();
 
     // All outgoing frames funnel through here so background tasks (file chunks,
     // PTY relay) can transmit without owning the socket.
@@ -370,18 +401,25 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
     let mut app = App::new(session.username.clone());
+    app.password = params.password.clone();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
     let result = loop {
         // Apply the sandbox scrollback offset (0 = follow live).
-        let sbs = app.sbx_scroll;
+        //
+        // vt100 0.15.2 panics ("subtract with overflow" in grid::visible_rows)
+        // if the scrollback offset ever exceeds the visible grid height: it does
+        // `rows_len - offset` on usize without clamping. Cap our offset to the
+        // grid height so a fast scroll can never cross that line and crash us.
         if let Some(v) = &mut app.sandbox {
-            v.parser.set_scrollback(sbs);
+            let rows = v.parser.screen().size().0 as usize;
+            app.sbx_scroll = app.sbx_scroll.min(rows);
+            v.parser.set_scrollback(app.sbx_scroll);
         }
         if let Err(e) = term.draw(|f| ui::draw(f, &app, &theme)) {
             break Err(e.into());
@@ -405,10 +443,30 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
             maybe = events.next() => {
                 match maybe {
                     Some(Ok(Event::Key(k))) if k.kind == KeyEventKind::Press => {
+                        app.error = None; // any keypress dismisses the error popup
                         if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('q')) {
                             break Ok(());
                         }
-                        if app.show_help {
+                        if k.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(k.code, KeyCode::Char('r'))
+                            && !app.connected
+                        {
+                            // Reconnect: re-run the SRP handshake off-thread so the UI
+                            // stays responsive, then re-attach the websocket on success.
+                            if !app.reconnecting {
+                                app.reconnecting = true;
+                                app.sys("⛧ reconnecting…");
+                                let p = params.clone();
+                                let rtx = recon_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let r = net::authenticate(
+                                        &p.ip, p.port, &p.user, &p.password, p.no_tls, p.insecure,
+                                    )
+                                    .map_err(|e| e.to_string());
+                                    let _ = rtx.send(r);
+                                });
+                            }
+                        } else if app.show_help {
                             app.show_help = false; // any key dismisses the overlay
                         } else if k.code == KeyCode::F(1) {
                             app.show_help = true;  // F1 from any mode
@@ -422,6 +480,12 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                         } else if app.driving {
                             if k.code == KeyCode::Esc {
                                 app.driving = false;
+                            } else if k.code == KeyCode::PageUp {
+                                // Scroll the shared shell's scrollback without releasing the
+                                // drive: PgUp/PgDn aren't forwarded to the PTY anyway.
+                                app.sbx_scroll = (app.sbx_scroll + sbx_page(&app)).min(2000);
+                            } else if k.code == KeyCode::PageDown {
+                                app.sbx_scroll = app.sbx_scroll.saturating_sub(sbx_page(&app));
                             } else if let Some(bytes) = key_to_pty(k.code, k.modifiers) {
                                 if let Some(sb) = &mut broker {
                                     // I own the sandbox: write straight to the PTY — instant,
@@ -437,7 +501,7 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                                     let line = app.input.trim().to_string();
                                     app.input.clear();
                                     app.chat_scroll = 0; // jump back to live on send
-                                    handle_command(&line, &mut app, &mut active_send, &mut send_seq,
+                                    handle_command(&line, &mut app, &mut theme, &mut active_send, &mut send_seq,
                                         &mut broker, &mut broker_meta, &mut launching, &mut announced_dims,
                                         &out_tx, &pty_tx, &broker_tx, &app_tx, &session, &term);
                                 }
@@ -474,6 +538,27 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                                 KeyCode::Char(c) => app.input.push(c),
                                 _ => {}
                             }
+                        }
+                    }
+                    Some(Ok(Event::Mouse(m))) => {
+                        // Mouse wheel scrolls the sandbox terminal if one is up
+                        // (incl. while driving), otherwise the chat — mirrors ↑/↓.
+                        match m.kind {
+                            MouseEventKind::ScrollUp => {
+                                if app.sandbox.is_some() {
+                                    app.sbx_scroll = (app.sbx_scroll + 3).min(2000);
+                                } else {
+                                    app.chat_scroll = (app.chat_scroll + 3).min(app.lines.len().saturating_sub(1));
+                                }
+                            }
+                            MouseEventKind::ScrollDown => {
+                                if app.sandbox.is_some() {
+                                    app.sbx_scroll = app.sbx_scroll.saturating_sub(3);
+                                } else {
+                                    app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     Some(Err(e)) => break Err(e.into()),
@@ -529,6 +614,36 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
                     None => {}
                 }
             }
+            recon = recon_rx.recv() => {
+                if let Some(result) = recon {
+                    app.reconnecting = false;
+                    match result {
+                        Ok(s) => {
+                            session = s;
+                            match net::open(&session, tx.clone()).await {
+                                Ok(w) => {
+                                    write = w;
+                                    app.sys("⛧ websocket re-attached — syncing…");
+                                    // If we host the sandbox, re-announce it so the
+                                    // rest of the house re-syncs the shared shell.
+                                    if let Some((be, _)) = &broker_meta {
+                                        if let Some(v) = &app.sandbox {
+                                            let (rows, cols) = v.parser.screen().size();
+                                            send_frame(&out_tx, &session.room, json!({
+                                                "_sbx":"status","state":"ready",
+                                                "backend": be.label(),"rows": rows,"cols": cols
+                                            }));
+                                            broadcast_acl(&out_tx, &session.room, &app);
+                                        }
+                                    }
+                                }
+                                Err(e) => app.err(format!("reconnect failed: {e}")),
+                            }
+                        }
+                        Err(e) => app.sys(format!("reconnect failed: {e}")),
+                    }
+                }
+            }
             pty = pty_rx.recv() => {
                 if let Some(mut bytes) = pty {
                     // Coalesce a burst (e.g. `tree`) into one frame: fewer round-trips,
@@ -571,7 +686,7 @@ pub async fn run(session: Session, theme: Theme) -> Result<()> {
         }
     }
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    execute!(term.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     term.show_cursor()?;
     result
 }
@@ -585,6 +700,7 @@ enum BrokerMsg {
 fn handle_command(
     line: &str,
     app: &mut App,
+    theme: &mut Theme,
     active_send: &mut Option<ActiveSend>,
     send_seq: &mut u64,
     broker: &mut Option<sbx::Sandbox>,
@@ -601,6 +717,32 @@ fn handle_command(
     let room = &session.room;
     if line == "/help" || line == "/?" {
         app.show_help = true;
+    } else if line == "/pw" || line == "/password" {
+        // Show the room password locally (never broadcast). Handy when the
+        // server's password was autogenerated and you need to read it off / share
+        // it out-of-band to invite someone into the room.
+        if app.password.is_empty() {
+            app.sys("⛧ no room password (joined without one)");
+        } else {
+            app.sys(format!("⛧ room password: {}", app.password));
+        }
+    } else if let Some(rest) = line.strip_prefix("/theme") {
+        // Live vestment switch: `/theme <name>`, or bare `/theme` to list options.
+        let name = rest.trim();
+        if name.is_empty() {
+            app.sys(format!("vestments: {} — /theme <name>", Theme::available().join(" · ")));
+        } else {
+            match Theme::by_name(name) {
+                Ok(t) => {
+                    *theme = t;
+                    app.sys(format!("donned the {name} vestments"));
+                }
+                Err(_) => app.err(format!(
+                    "no theme '{name}' — try: {}",
+                    Theme::available().join(" · ")
+                )),
+            }
+        }
     } else if line == "/drive" {
         // Mobile-friendly alternative to F2 (no function key needed).
         if app.sandbox.is_none() {
@@ -624,7 +766,7 @@ fn handle_command(
                 }));
                 app.sys(format!("offered {} ({}) — waiting for an /accept", name, ft::human(size)));
             }
-            Err(e) => app.sys(format!("send failed: {e}")),
+            Err(e) => app.err(format!("send failed: {e}")),
         }
     } else if line == "/accept" {
         if let Some(o) = app.pending_offer.take() {
@@ -651,15 +793,25 @@ fn handle_command(
                 if app.sandbox.is_some() || broker.is_some() || *launching {
                     app.sys("a sandbox is already running");
                 } else {
-                    let backend = p.next().and_then(sbx::Backend::parse).unwrap_or(sbx::Backend::Local);
-                    let image = p.next().map(str::to_string).unwrap_or_else(|| backend.default_image().to_string());
-                    let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                    let (rows, cols) = sbx_dims(sz.0, sz.1);
-                    *launching = true;
-                    let members: Vec<String> = app.users.iter().map(|u| u.username.clone()).collect();
-                    app.sys(format!("summoning {} sandbox… (provisioning unix users; multipass boot ~30s)", backend.label()));
-                    spawn_launch(backend, image, app.me.clone(), members, rows, cols,
-                        pty_tx.clone(), broker_tx.clone(), app_tx.clone());
+                    // `--start` (alias `--start-daemon` / `-y`) opts in to booting
+                    // a stopped Docker daemon; everything else is positional.
+                    let args: Vec<&str> = p.collect();
+                    let start_daemon = args.iter().any(|a| matches!(*a, "--start" | "--start-daemon" | "-y"));
+                    let mut pos = args.iter().copied().filter(|a| !a.starts_with('-'));
+                    let backend = pos.next().and_then(sbx::Backend::parse).unwrap_or(sbx::Backend::Local);
+                    let image = pos.next().map(str::to_string).unwrap_or_else(|| backend.default_image().to_string());
+
+                    if backend == sbx::Backend::Docker && !start_daemon && !sbx::docker_daemon_up() {
+                        app.err("docker daemon is not running — retry with `/sbx launch docker --start` to boot it (sudo), or run ./ensure-docker.sh in a terminal first");
+                    } else {
+                        let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
+                        let (rows, cols) = sbx_dims(sz.0, sz.1);
+                        *launching = true;
+                        let members: Vec<String> = app.users.iter().map(|u| u.username.clone()).collect();
+                        app.sys(format!("summoning {} sandbox… (provisioning unix users; multipass boot ~30s)", backend.label()));
+                        spawn_launch(backend, image, app.me.clone(), members, rows, cols, start_daemon,
+                            pty_tx.clone(), broker_tx.clone(), app_tx.clone());
+                    }
                 }
             }
             Some("stop") => {
@@ -743,6 +895,7 @@ fn spawn_launch(
     members: Vec<String>,
     rows: u16,
     cols: u16,
+    start_daemon: bool,
     pty_tx: UnboundedSender<Vec<u8>>,
     broker_tx: UnboundedSender<BrokerMsg>,
     app_tx: UnboundedSender<Net>,
@@ -751,10 +904,10 @@ fn spawn_launch(
         let name = SBX_NAME.to_string();
         let prep = {
             let (n, img) = (name.clone(), image.clone());
-            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img)).await
+            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon)).await
         };
         if let Err(e) = prep.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))) {
-            let _ = app_tx.send(Net::Sys(format!("sandbox prepare failed: {e}")));
+            let _ = app_tx.send(Net::Err(format!("sandbox prepare failed: {e}")));
             let _ = broker_tx.send(BrokerMsg::Failed);
             return;
         }
@@ -778,7 +931,7 @@ fn spawn_launch(
                 let _ = broker_tx.send(BrokerMsg::Ready { sb, backend, name, rows, cols });
             }
             Err(e) => {
-                let _ = app_tx.send(Net::Sys(format!("sandbox launch failed: {e}")));
+                let _ = app_tx.send(Net::Err(format!("sandbox launch failed: {e}")));
                 let _ = broker_tx.send(BrokerMsg::Failed);
             }
         }

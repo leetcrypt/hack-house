@@ -16,7 +16,7 @@ def generate_ws_token(user_id: str, secret: bytes) -> str:
 
 
 def _roster_frame(app: Sanic) -> str:
-    """Authoritative presence snapshot — all coven members converge on this."""
+    """Authoritative presence snapshot — all clergy members converge on this."""
     users = app.ctx.session_store.get_all()
     return json.dumps(
         {
@@ -46,7 +46,7 @@ async def srp_init(request: Request, app: Sanic) -> HTTPResponse:
             return response.json({"error": "Username taken"}, status=409)
 
         if app.ctx.session_store.count() >= app.ctx.max_users:
-            return response.json({"error": "Coven full"}, status=409)
+            return response.json({"error": "Clergy full"}, status=409)
 
         user_id, B, salt = app.ctx.srp_manager.init_auth(username, client_public)
 
@@ -82,7 +82,7 @@ async def srp_verify(request: Request, app: Sanic) -> HTTPResponse:
         # Authoritative capacity gate — the slot is only consumed once a session
         # is actually added here (init is best-effort / racy).
         if app.ctx.session_store.count() >= app.ctx.max_users:
-            return response.json({"error": "Coven full"}, status=409)
+            return response.json({"error": "Clergy full"}, status=409)
 
         H_AMK, session_key = app.ctx.srp_manager.verify_auth(user_id, client_proof)
 
@@ -173,7 +173,7 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
         pass
     finally:
         await manager.disconnect(user_id)
-        # Free the slot + username so the coven can be rejoined (was previously
+        # Free the slot + username so the clergy can be rejoined (was previously
         # held until the 1h stale sweep, which also blocked the name).
         app.ctx.session_store.remove(user_id)
         await manager.broadcast(

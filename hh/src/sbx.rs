@@ -2,15 +2,45 @@
 //!
 //! The broker (owner's client) spawns a sandbox shell inside a PTY. Output bytes
 //! are pumped out of a reader thread onto an mpsc channel; the broker encrypts
-//! them with the room key and relays them to the coven as `sbx pty_data` frames.
+//! them with the room key and relays them to the clergy as `sbx pty_data` frames.
 //! Input frames (`sbx pty_input`) are written back into the PTY. The server only
 //! ever sees ciphertext — identical trust model to chat/file transfer.
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
+
+/// Helper that ensures the Docker daemon is running (ships beside this source).
+const ENSURE_DOCKER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/ensure-docker.sh");
+
+/// Is the Docker daemon accepting connections? (`docker info` succeeds.)
+pub fn docker_daemon_up() -> bool {
+    Command::new("docker")
+        .arg("info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Start the Docker daemon via `ensure-docker.sh --yes`, waiting until it's
+/// ready. Returns the script's last error line on failure (e.g. needs sudo).
+fn start_docker_daemon() -> Result<()> {
+    let out = Command::new("bash")
+        .arg(ENSURE_DOCKER)
+        .arg("--yes")
+        .output()
+        .context("running ensure-docker.sh")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let last = err.lines().last().unwrap_or("could not start the docker daemon");
+        anyhow::bail!("{last}");
+    }
+    Ok(())
+}
 
 /// Which sandbox to summon. Multipass = strong isolation (default for real use),
 /// Docker = fast, Local = no isolation (dev/testing only).
@@ -50,7 +80,7 @@ impl Backend {
 /// One-time setup before the PTY shell is spawned. Blocking — run off the UI
 /// thread (Multipass boots a real VM, ~20-30s). Idempotent: reuses an instance
 /// that already exists.
-pub fn prepare(backend: Backend, name: &str, image: &str) -> Result<()> {
+pub fn prepare(backend: Backend, name: &str, image: &str, start_daemon: bool) -> Result<()> {
     match backend {
         Backend::Local => Ok(()),
         Backend::Multipass => {
@@ -60,24 +90,48 @@ pub fn prepare(backend: Backend, name: &str, image: &str) -> Result<()> {
                 .map(|o| o.status.success())
                 .unwrap_or(false);
             if !exists {
-                let st = Command::new("multipass")
+                // Capture output so it can't bleed onto the TUI surface; surface
+                // the failure reason through the returned error instead.
+                let out = Command::new("multipass")
                     .args(["launch", "--name", name, "--cpus", "1", "--memory", "1G", "--disk", "5G", image])
-                    .status()
+                    .output()
                     .context("multipass launch (is multipass installed?)")?;
-                anyhow::ensure!(st.success(), "multipass launch failed");
+                if !out.status.success() {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    anyhow::bail!("multipass launch failed: {}", err.lines().last().unwrap_or("").trim());
+                }
             } else {
-                let _ = Command::new("multipass").args(["start", name]).status();
+                let _ = Command::new("multipass").args(["start", name])
+                    .stdout(Stdio::null()).stderr(Stdio::null()).status();
             }
             Ok(())
         }
         Backend::Docker => {
+            // The daemon must be up before any `docker` call. Rather than fail
+            // with a raw connection error, start it (the caller confirmed via
+            // `/sbx launch docker --start`).
+            if !docker_daemon_up() {
+                if start_daemon {
+                    start_docker_daemon().context("starting docker daemon")?;
+                } else {
+                    anyhow::bail!(
+                        "docker daemon is not running — retry with `/sbx launch docker --start`"
+                    );
+                }
+            }
             // Persistent container so we can exec in to provision users + shells.
-            let _ = Command::new("docker").args(["rm", "-f", name]).status();
-            let st = Command::new("docker")
+            let _ = Command::new("docker").args(["rm", "-f", name])
+                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            // Capture output so a failure can't paint over the TUI; the reason is
+            // surfaced through the returned error (shown in the error popup).
+            let out = Command::new("docker")
                 .args(["run", "-d", "--name", name, "--hostname", name, "-w", "/root", image, "sleep", "infinity"])
-                .status()
+                .output()
                 .context("docker run (is docker installed?)")?;
-            anyhow::ensure!(st.success(), "docker run failed");
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                anyhow::bail!("docker run failed: {}", err.lines().last().unwrap_or("").trim());
+            }
             Ok(())
         }
     }
@@ -88,10 +142,12 @@ pub fn prepare(backend: Backend, name: &str, image: &str) -> Result<()> {
 pub fn teardown(backend: Backend, name: &str) {
     match backend {
         Backend::Multipass => {
-            let _ = Command::new("multipass").args(["delete", name, "--purge"]).status();
+            let _ = Command::new("multipass").args(["delete", name, "--purge"])
+                .stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
         Backend::Docker => {
-            let _ = Command::new("docker").args(["rm", "-f", name]).status();
+            let _ = Command::new("docker").args(["rm", "-f", name])
+                .stdout(Stdio::null()).stderr(Stdio::null()).status();
         }
         Backend::Local => {}
     }
@@ -125,7 +181,7 @@ fn command_for(backend: Backend, name: &str, run_user: &str) -> CommandBuilder {
     }
 }
 
-/// Sanitize a coven display name into a safe unix username.
+/// Sanitize a clergy display name into a safe unix username.
 pub fn unix_name(name: &str) -> String {
     let s: String = name
         .to_lowercase()
@@ -139,12 +195,15 @@ pub fn unix_name(name: &str) -> String {
 fn mp(name: &str, args: &[&str]) {
     let mut a = vec!["exec", name, "--"];
     a.extend_from_slice(args);
-    let _ = Command::new("multipass").args(a).status();
+    // Null stdio so provisioning chatter never bleeds onto the TUI surface.
+    let _ = Command::new("multipass").args(a)
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 fn dk(name: &str, args: &[&str]) {
     let mut a = vec!["exec", name];
     a.extend_from_slice(args);
-    let _ = Command::new("docker").args(a).status();
+    let _ = Command::new("docker").args(a)
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
 /// Grant a Multipass user real *passwordless* sudo (group + sudoers.d drop-in)
@@ -160,7 +219,7 @@ fn mp_revoke_sudo(name: &str, u: &str) {
     mp(name, &["sudo", "bash", "-c", &script]);
 }
 
-/// Provision a real unix account per coven member inside the VM/container and
+/// Provision a real unix account per clergy member inside the VM/container and
 /// make the owner a superuser (sudoer). Returns the unix user the shared shell
 /// should run as. Blocking — call off the UI thread.
 pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) -> String {
@@ -219,7 +278,7 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Spawn the backend in a PTY. A reader thread pushes raw output bytes onto
-    /// `out`; the caller relays them (encrypted) to the coven.
+    /// `out`; the caller relays them (encrypted) to the clergy.
     pub fn launch(
         backend: Backend,
         name: &str,

@@ -84,11 +84,19 @@ fn main() -> Result<()> {
             theme,
         } => {
             let session = net::authenticate(&ip, port, &user, &password, no_tls, insecure)?;
+            let params = net::ConnParams {
+                ip,
+                port,
+                user,
+                password,
+                no_tls,
+                insecure,
+            };
             let theme = match theme {
                 Some(p) => theme::Theme::load(&p)?,
                 None => theme::Theme::default(),
             };
-            tokio::runtime::Runtime::new()?.block_on(app::run(session, theme))
+            tokio::runtime::Runtime::new()?.block_on(app::run(params, session, theme))
         }
         Cmd::Roomkey { password, room_salt_hex } => {
             let salt = hex::decode(room_salt_hex)?;

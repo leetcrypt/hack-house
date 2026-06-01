@@ -24,6 +24,21 @@ pub struct Session {
     pub insecure: bool,
 }
 
+/// The credentials needed to (re)authenticate a Session — kept so the UI can
+/// re-run the SRP handshake and rejoin after a disconnect (AFK / server blip).
+#[derive(Clone)]
+pub struct ConnParams {
+    pub ip: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
+    pub no_tls: bool,
+    pub insecure: bool,
+}
+
+/// The write half of a split websocket; outgoing frames are sent here.
+pub type WsSink = futures_util::stream::SplitSink<Ws, WsMsg>;
+
 /// Full SRP handshake against the Sanic server. Returns a ready Session
 /// (room key derived, ws url built) but does not open the websocket.
 pub fn authenticate(
@@ -97,6 +112,15 @@ pub async fn connect(session: &Session) -> Result<Ws> {
         .await
         .context("websocket connect")?;
     Ok(ws)
+}
+
+/// Open the websocket for a session, spawn the reader task feeding `tx`, and
+/// hand back the write half. Used for the initial connect and every reconnect.
+pub async fn open(session: &Session, tx: UnboundedSender<Net>) -> Result<WsSink> {
+    let ws = connect(session).await?;
+    let (write, read) = ws.split();
+    tokio::spawn(reader(read, session.room.clone(), tx));
+    Ok(write)
 }
 
 fn parse_users(v: &Value) -> Vec<User> {

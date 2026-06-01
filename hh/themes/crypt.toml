@@ -1,12 +1,14 @@
-# crypt — churchofmalware occult monochrome (default)
+# crypt — occult monochrome: white ink on a lifted slate surface
 name = "crypt"
-border = "darkgray"
-title = "white"
-accent = "white"
-dim = "darkgray"
-me = "white"
-other = "gray"
-system = "darkgray"
-input = "white"
-roster_me = "white"
+bg = "#1c1c22"          # slate panel — lifts the text off pure-black for legibility
+border = "#6e6e7a"      # gray chrome, defined against the surface
+title = "#ffffff"
+accent = "#ffffff"
+dim = "#9a9aa6"         # timestamps — readable mid-gray (was near-invisible darkgray)
+me = "#ffffff"
+other = "#c8c8d0"       # others' messages — bright gray
+system = "#b0b0bc"      # system / occult lines — legible, still muted
+input = "#ffffff"
+roster_me = "#ffffff"
 roster_width = 22
+sigil = "✝"             # inverted cross / crypt

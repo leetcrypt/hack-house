@@ -9,6 +9,11 @@ use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
+    // Paint the whole frame in the theme background first so every panel (and the
+    // gaps between them) sits on the same surface. With bg = Reset this is a no-op
+    // and we ride the terminal's own colour.
+    f.render_widget(Block::default().style(Style::default().bg(theme.bg)), f.area());
+
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -39,6 +44,35 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     if app.show_help {
         draw_help(f, f.area(), theme);
     }
+    if let Some(msg) = &app.error {
+        draw_error(f, f.area(), theme, msg);
+    }
+}
+
+/// Transient error popup, anchored top-right over the clergy so it never bleeds
+/// onto the input box. Cleared by the next keypress (see the run loop).
+fn draw_error(f: &mut Frame, area: Rect, theme: &Theme, msg: &str) {
+    let text = format!("⚠ {msg}");
+    let w = area.width.saturating_sub(2).min(48).max(16);
+    let inner = w.saturating_sub(2).max(1);
+    let rows = (text.chars().count() as u16).div_ceil(inner) + 2;
+    let h = rows.min(area.height.saturating_sub(2)).max(3);
+    let x = area.x + area.width.saturating_sub(w + 1); // hug the right edge
+    let y = area.y + 1; // just under the top bar, over the clergy
+    let rect = Rect { x, y, width: w, height: h };
+    f.render_widget(Clear, rect);
+    let popup = Paragraph::new(text)
+        .style(Style::default().fg(theme.title).bg(theme.bg))
+        .block(
+            Block::bordered()
+                .border_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+                .title(Span::styled(
+                    format!(" {} error · any key ", theme.sigil),
+                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(popup, rect);
 }
 
 fn centered(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -68,9 +102,10 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
             Span::styled(v.to_string(), dim),
         ])
     };
-    let head = |s: &str| Line::from(Span::styled(s.to_string(), acc));
+    let sig = &theme.sigil;
+    let head = |s: &str| Line::from(Span::styled(format!("{sig} {s}"), acc));
     let lines = vec![
-        head("⛧ COMMANDS (type in the input bar)"),
+        head("COMMANDS (type in the input bar)"),
         kv("/sbx launch [backend]", "summon a sandbox: local | docker | multipass"),
         kv("/sbx stop", "tear down the sandbox (purges the VM)"),
         kv("/drive", "type into the shared shell  (Esc releases)"),
@@ -81,18 +116,22 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         kv("/send <file>", "offer a file to the room"),
         kv("/sendd <dir>", "offer a directory (sent as a tar)"),
         kv("/accept  ·  /reject", "respond to an incoming file offer"),
+        kv("/theme [name]", "change vestments live: church | neon | crypt"),
+        kv("/pw", "show this room's password (local only)"),
         kv("/help", "show / hide this menu"),
         Line::from(""),
-        head("⛧ KEYS"),
+        head("KEYS"),
         kv("Enter", "send chat message"),
         kv("F1  ·  /help", "toggle this help (any key closes it)"),
         kv("F2  ·  /drive", "take the shell  ·  Esc releases it"),
         kv("Ctrl-C  (while driving)", "interrupt the running command"),
         kv("PgUp / PgDn", "scroll chat  ·  Home/End = oldest/live"),
-        kv("Up / Down", "scroll the sandbox terminal (when not driving)"),
+        kv("PgUp / PgDn  (driving)", "scroll the sandbox terminal's scrollback"),
+        kv("Up / Down  ·  wheel", "scroll the sandbox terminal (mouse works while driving)"),
+        kv("Ctrl-R  (when closed)", "reconnect to the house after a drop / AFK"),
         kv("Ctrl-Q", "quit hack-house"),
         Line::from(""),
-        head("⛧ ROSTER GLYPHS"),
+        head("ROSTER GLYPHS"),
         kv("⛧ owner   ⚡ sudoer", "◆ may drive    • member"),
         Line::from(""),
         Line::from(Span::styled(
@@ -103,11 +142,12 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
     let w = centered(78, 90, area);
     f.render_widget(Clear, w);
     let help = Paragraph::new(lines)
+        .style(Style::default().bg(theme.bg)) // fill the popup with the theme surface
         .block(
             Block::bordered()
                 .border_style(Style::default().fg(theme.accent))
                 .title(Span::styled(
-                    " ⛧ hack-house — help ⛧ ",
+                    format!(" {0} hack-house — help {0} ", theme.sigil),
                     Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
                 )),
         )
@@ -123,12 +163,14 @@ fn draw_sandbox(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &T
         .rows(0, cols)
         .map(|r| Line::from(Span::styled(r, Style::default().fg(theme.title))))
         .collect();
-    let drive = if app.driving {
-        " · DRIVING — type here · Esc to release".to_string()
+    let drive = if app.driving && app.sbx_scroll > 0 {
+        format!(" · DRIVING · ↑{} scrollback (PgDn=live)", app.sbx_scroll)
+    } else if app.driving {
+        " · DRIVING — type here · Esc · PgUp/wheel scroll".to_string()
     } else if app.sbx_scroll > 0 {
         format!(" · ↑{} scrollback (↓/End=live)", app.sbx_scroll)
     } else {
-        " · /drive (or F2) · ↑/↓ scroll".to_string()
+        " · /drive (or F2) · ↑/↓/wheel scroll".to_string()
     };
     let title = format!(" sandbox · {}{} ", sv.backend, drive);
     let border = if app.driving { theme.accent } else { theme.border };
@@ -142,10 +184,16 @@ fn draw_sandbox(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &T
 
 fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let cap = if app.capacity > 0 { app.capacity } else { app.users.len() };
-    let status = if app.connected { "🔒 e2e" } else { "✖ closed" };
+    let status = if app.connected {
+        "🔒 e2e"
+    } else if app.reconnecting {
+        "… reconnecting"
+    } else {
+        "✖ closed · Ctrl-R to reconnect"
+    };
     let bar = Line::from(vec![
         Span::styled(
-            " ⛧ hack-house ⛧ ",
+            format!(" {0} hack-house {0} ", theme.sigil),
             Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("· {status} "), Style::default().fg(theme.dim)),
@@ -177,12 +225,20 @@ fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
 }
 
 fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
-    let visible = area.height.saturating_sub(2) as usize;
-    let len = app.lines.len();
-    // Window ends `chat_scroll` lines above the live bottom.
-    let end = len.saturating_sub(app.chat_scroll);
-    let start = end.saturating_sub(visible);
-    let lines: Vec<Line> = app.lines[start..end].iter().map(|l| fmt_line(l, app, theme)).collect();
+    let inner_h = area.height.saturating_sub(2) as usize; // rows inside the border
+    let text_w = area.width.saturating_sub(2).max(1); // wrap width inside the border
+    let lines: Vec<Line> = app.lines.iter().map(|l| fmt_line(l, app, theme)).collect();
+
+    // Measure the TRUE wrapped height and scroll to the bottom. Selecting N
+    // logical lines and letting the Paragraph top-anchor them clips any wrapped
+    // line off the bottom — so the newest messages stay hidden until later ones
+    // push them up into view (worse when the sandbox shrinks the chat pane).
+    let total_rows = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(text_w);
+    let max_scroll = total_rows.saturating_sub(inner_h);
+    let scroll = max_scroll.saturating_sub(app.chat_scroll) as u16;
+
     let title = if app.chat_scroll > 0 {
         format!(" chat ↑{} (End=live) ", app.chat_scroll)
     } else {
@@ -194,7 +250,8 @@ fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Them
                 .border_style(Style::default().fg(theme.border))
                 .title(Span::styled(title, Style::default().fg(theme.title))),
         )
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(chat, area);
 }
 
@@ -225,7 +282,7 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
     let roster = List::new(items).block(
         Block::bordered()
             .border_style(Style::default().fg(theme.border))
-            .title(Span::styled(" coven ", Style::default().fg(theme.title))),
+            .title(Span::styled(" clergy ", Style::default().fg(theme.title))),
     );
     f.render_widget(roster, area);
 }

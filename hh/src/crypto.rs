@@ -28,7 +28,7 @@ A099ED8193E0757767A13DD52312AB4B03310DCD7F48A9DA04FD50E8083969EDB767B0CF60\
 60279004E57AE6AF874E7303CE53299CCC041C7BC308D82A5698F3A8D0C38271AE35F8E9DB\
 FBB694B5C803D89F7AE435DE236D525F54759B65E372FCD68EF20FA7111F9E4AFF73";
 
-/// The SRP identity used by every cmd-chat / coven room (server hardcodes this).
+/// The SRP identity used by every cmd-chat / clergy room (server hardcodes this).
 /// The user's chosen display name is independent of this value.
 pub const SRP_IDENTITY: &[u8] = b"chat";
 

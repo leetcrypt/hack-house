@@ -10,3 +10,4 @@ system = "#7a5cff"
 input = "#39ff14"
 roster_me = "#ff2fd0"
 roster_width = 24
+sigil = "⚡"             # cyberpunk bolt

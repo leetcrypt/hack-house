@@ -10,3 +10,4 @@ system = "#b46cff"      # system / occult lines (purple)
 input = "#39ff14"
 roster_me = "#ff39c0"   # you / owner (hot magenta)
 roster_width = 22
+sigil = "⛧"             # inverted pentagram

@@ -1,4 +1,4 @@
-"""Use-case tests for the hack-house multi-user coven features (capacity cap,
+"""Use-case tests for the hack-house multi-user clergy features (capacity cap,
 roster, username + slot lifecycle). In-process via sanic-testing.
 """
 import base64
@@ -27,7 +27,7 @@ def _init(test_client, name):
     )
 
 
-class TestCovenCapacity:
+class TestClergyCapacity:
     def test_accepts_up_to_capacity(self, app, test_client):
         app.ctx.max_users = 4
         for n in ("a", "b", "c"):
