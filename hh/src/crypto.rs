@@ -133,11 +133,7 @@ impl SrpClient {
 
     /// Process the server challenge (salt, B). Returns (M, K, H_AMK_expected).
     /// `M` is sent to the server; `h_amk` is compared to the server's reply.
-    pub fn process_challenge(
-        &self,
-        salt: &[u8],
-        b_bytes: &[u8],
-    ) -> anyhow::Result<Challenge> {
+    pub fn process_challenge(&self, salt: &[u8], b_bytes: &[u8]) -> anyhow::Result<Challenge> {
         let n = &self.n;
         let width = long_to_bytes(n).len();
         let big_b = bytes_to_long(b_bytes);
@@ -218,7 +214,7 @@ mod tests {
 
     fn a_bytes() -> Vec<u8> {
         let mut v = vec![0x80u8];
-        v.extend(std::iter::repeat(0x22u8).take(31));
+        v.extend(std::iter::repeat_n(0x22u8, 31));
         v
     }
 
@@ -245,7 +241,9 @@ mod fernet_interop {
     #[test]
     fn rust_decrypts_python_fernet() {
         let f = fernet::Fernet::new(KEY).unwrap();
-        let pt = f.decrypt(TOK).expect("rust must decrypt python fernet token");
+        let pt = f
+            .decrypt(TOK)
+            .expect("rust must decrypt python fernet token");
         assert_eq!(pt, b"hello from python fernet");
     }
 }

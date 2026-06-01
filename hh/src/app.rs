@@ -59,16 +59,37 @@ struct ActiveSend {
 
 /// Decoded events arriving from the websocket reader task.
 pub enum Net {
-    Init { lines: Vec<ChatLine>, users: Vec<User> },
+    Init {
+        lines: Vec<ChatLine>,
+        users: Vec<User>,
+    },
     Message(ChatLine),
-    Roster { users: Vec<User>, capacity: usize },
+    Roster {
+        users: Vec<User>,
+        capacity: usize,
+    },
     Joined(String),
     Left(String),
-    SbxStatus { backend: String, ready: bool, rows: u16, cols: u16 },
-    SbxResize { rows: u16, cols: u16 },
+    SbxStatus {
+        backend: String,
+        ready: bool,
+        rows: u16,
+        cols: u16,
+    },
+    SbxResize {
+        rows: u16,
+        cols: u16,
+    },
     SbxData(Vec<u8>),
-    SbxInput { from: String, bytes: Vec<u8> },
-    Perm { owner: String, drivers: Vec<String>, sudoers: Vec<String> },
+    SbxInput {
+        from: String,
+        bytes: Vec<u8>,
+    },
+    Perm {
+        owner: String,
+        drivers: Vec<String>,
+        sudoers: Vec<String>,
+    },
     Ft(ft::Ft),
     Err(String),
     Closed,
@@ -195,7 +216,12 @@ impl App {
                     self.sys(format!("{name} left"));
                 }
             }
-            Net::SbxStatus { backend, ready, rows, cols } => {
+            Net::SbxStatus {
+                backend,
+                ready,
+                rows,
+                cols,
+            } => {
                 if ready {
                     self.sandbox = Some(SbxView {
                         parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
@@ -223,19 +249,29 @@ impl App {
                 }
             }
             Net::SbxInput { .. } => {} // broker enforces + writes in the run loop
-            Net::Perm { owner, drivers, sudoers } => {
+            Net::Perm {
+                owner,
+                drivers,
+                sudoers,
+            } => {
                 let new: std::collections::HashSet<String> = drivers.into_iter().collect();
                 let sudo: std::collections::HashSet<String> = sudoers.into_iter().collect();
                 if !owner.is_empty() && self.owner.as_deref() != Some(owner.as_str()) {
                     self.sys(format!("⛧ {owner} is the superuser (sandbox owner)"));
                 }
-                if new.contains(&self.me) && !self.drivers.contains(&self.me) && self.owner.is_some() {
+                if new.contains(&self.me)
+                    && !self.drivers.contains(&self.me)
+                    && self.owner.is_some()
+                {
                     self.sys("⛧ you were granted drive (F2 to take the shell)");
                 } else if !new.contains(&self.me) && self.drivers.contains(&self.me) {
                     self.driving = false;
                     self.sys("⛧ your drive permission was revoked");
                 }
-                if sudo.contains(&self.me) && !self.sudoers.contains(&self.me) && self.owner.is_some() {
+                if sudo.contains(&self.me)
+                    && !self.sudoers.contains(&self.me)
+                    && self.owner.is_some()
+                {
                     self.sys("⛧ you were granted sudo (superuser) in the VM");
                 }
                 self.owner = Some(owner).filter(|o| !o.is_empty());
@@ -255,7 +291,10 @@ impl App {
 fn sbx_dims(term_w: u16, term_h: u16) -> (u16, u16) {
     let body_h = term_h.saturating_sub(4);
     let sbx_h = (body_h as u32 * 55 / 100) as u16;
-    (sbx_h.saturating_sub(2).max(1), term_w.saturating_sub(2).max(1))
+    (
+        sbx_h.saturating_sub(2).max(1),
+        term_w.saturating_sub(2).max(1),
+    )
 }
 
 /// One page of sandbox scrollback = the visible grid height (defaults to 10 if
@@ -297,17 +336,29 @@ fn send_frame(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, value: serde_
 fn broadcast_acl(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, app: &App) {
     let drivers: Vec<&String> = app.drivers.iter().collect();
     let sudoers: Vec<&String> = app.sudoers.iter().collect();
-    send_frame(out, room, json!({
-        "_perm":"acl","owner": app.owner, "drivers": drivers, "sudoers": sudoers
-    }));
+    send_frame(
+        out,
+        room,
+        json!({
+            "_perm":"acl","owner": app.owner, "drivers": drivers, "sudoers": sudoers
+        }),
+    );
 }
 
 /// Stream a payload to the clergy as `_ft` chunks (background, paced).
-fn spawn_send(id: String, payload: Arc<Vec<u8>>, out: UnboundedSender<WsMsg>, room: Arc<fernet::Fernet>) {
+fn spawn_send(
+    id: String,
+    payload: Arc<Vec<u8>>,
+    out: UnboundedSender<WsMsg>,
+    room: Arc<fernet::Fernet>,
+) {
     tokio::spawn(async move {
         for (seq, chunk) in payload.chunks(ft::CHUNK).enumerate() {
             let frame = json!({"_ft":"chunk","id": id,"seq": seq,"data": STANDARD.encode(chunk)});
-            if out.send(WsMsg::Text(room.encrypt(frame.to_string().as_bytes()))).is_err() {
+            if out
+                .send(WsMsg::Text(room.encrypt(frame.to_string().as_bytes())))
+                .is_err()
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -331,10 +382,19 @@ fn handle_ft(
             }
             app.sys(format!(
                 "⛧ {} offers {} ({}{}) — /accept or /reject",
-                o.from, o.name, ft::human(o.size as usize),
+                o.from,
+                o.name,
+                ft::human(o.size as usize),
                 if o.dir { ", directory" } else { "" }
             ));
-            app.transfers.insert(o.id.clone(), Transfer { meta: o.clone(), buf: Vec::new(), accepted: false });
+            app.transfers.insert(
+                o.id.clone(),
+                Transfer {
+                    meta: o.clone(),
+                    buf: Vec::new(),
+                    accepted: false,
+                },
+            );
             app.pending_offer = Some(o);
         }
         ft::Ft::Accept(id) => {
@@ -366,13 +426,22 @@ fn handle_ft(
                         app.err(format!("{} — SHA-256 mismatch, discarded", t.meta.name));
                     } else {
                         match ft::save(downloads, &t.meta, &t.buf) {
-                            Ok(p) => app.sys(format!("⛧ saved {} ({}) — verified ✓", p.display(), ft::human(t.buf.len()))),
+                            Ok(p) => app.sys(format!(
+                                "⛧ saved {} ({}) — verified ✓",
+                                p.display(),
+                                ft::human(t.buf.len())
+                            )),
                             Err(e) => app.err(format!("save failed: {e}")),
                         }
                     }
                 }
             }
-            if app.pending_offer.as_ref().map(|o| o.id == id).unwrap_or(false) {
+            if app
+                .pending_offer
+                .as_ref()
+                .map(|o| o.id == id)
+                .unwrap_or(false)
+            {
                 app.pending_offer = None;
             }
         }
@@ -410,7 +479,8 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
     // All outgoing frames funnel through here so background tasks (file chunks,
     // PTY relay) can transmit without owning the socket.
     let (out_tx, mut out_rx) = unbounded_channel::<WsMsg>();
-    let (pty_tx, mut pty_rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) = unbounded_channel();
+    let (pty_tx, mut pty_rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) =
+        unbounded_channel();
     let (broker_tx, mut broker_rx) = unbounded_channel::<BrokerMsg>();
     let mut broker: Option<sbx::Sandbox> = None;
     let mut broker_meta: Option<(sbx::Backend, String)> = None;
@@ -472,7 +542,11 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                     if let Some(sb) = &broker {
                         let _ = sb.resize(dims.0, dims.1);
                     }
-                    send_frame(&out_tx, &session.room, json!({"_sbx":"resize","rows":dims.0,"cols":dims.1}));
+                    send_frame(
+                        &out_tx,
+                        &session.room,
+                        json!({"_sbx":"resize","rows":dims.0,"cols":dims.1}),
+                    );
                 }
             }
         }
@@ -702,22 +776,19 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                 }
             }
             outgoing = out_rx.recv() => {
-                match outgoing {
-                    Some(first) => {
-                        // Flush a batch to keep file-chunk bursts from redrawing per frame.
-                        let mut batch = vec![first];
-                        while let Ok(m) = out_rx.try_recv() {
-                            batch.push(m);
-                            if batch.len() >= 64 { break; }
-                        }
-                        for m in batch {
-                            if write.send(m).await.is_err() {
-                                app.connected = false;
-                                break;
-                            }
+                if let Some(first) = outgoing {
+                    // Flush a batch to keep file-chunk bursts from redrawing per frame.
+                    let mut batch = vec![first];
+                    while let Ok(m) = out_rx.try_recv() {
+                        batch.push(m);
+                        if batch.len() >= 64 { break; }
+                    }
+                    for m in batch {
+                        if write.send(m).await.is_err() {
+                            app.connected = false;
+                            break;
                         }
                     }
-                    None => {}
                 }
             }
             _ = sigterm.recv() => { break Ok(()); }
@@ -733,13 +804,23 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
         }
     }
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        term.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     term.show_cursor()?;
     result
 }
 
 enum BrokerMsg {
-    Ready { sb: sbx::Sandbox, backend: sbx::Backend, name: String, rows: u16, cols: u16 },
+    Ready {
+        sb: sbx::Sandbox,
+        backend: sbx::Backend,
+        name: String,
+        rows: u16,
+        cols: u16,
+    },
     Failed,
 }
 
@@ -777,7 +858,10 @@ fn handle_command(
         // Live vestment switch: `/theme <name>`, or bare `/theme` to list options.
         let name = rest.trim();
         if name.is_empty() {
-            app.sys(format!("vestments: {} — /theme <name>", Theme::available().join(" · ")));
+            app.sys(format!(
+                "vestments: {} — /theme <name>",
+                Theme::available().join(" · ")
+            ));
         } else {
             match Theme::by_name(name) {
                 Ok(t) => {
@@ -800,18 +884,33 @@ fn handle_command(
         } else {
             app.sys("you don't have drive permission — the owner can /grant you");
         }
-    } else if let Some(path) = line.strip_prefix("/sendd ").or_else(|| line.strip_prefix("/send ")) {
+    } else if let Some(path) = line
+        .strip_prefix("/sendd ")
+        .or_else(|| line.strip_prefix("/send "))
+    {
         let path = path.trim();
         match ft::read_payload(path) {
             Ok((name, bytes, dir)) => {
                 *send_seq += 1;
                 let id = format!("{}-{}", app.me, send_seq);
                 let (size, sha) = (bytes.len(), ft::sha256_hex(&bytes));
-                *active_send = Some(ActiveSend { id: id.clone(), payload: Arc::new(bytes), sending: false });
-                send_frame(out_tx, room, json!({
-                    "_ft":"offer","id": id,"name": name,"size": size,"sha256": sha,"dir": dir
-                }));
-                app.sys(format!("offered {} ({}) — waiting for an /accept", name, ft::human(size)));
+                *active_send = Some(ActiveSend {
+                    id: id.clone(),
+                    payload: Arc::new(bytes),
+                    sending: false,
+                });
+                send_frame(
+                    out_tx,
+                    room,
+                    json!({
+                        "_ft":"offer","id": id,"name": name,"size": size,"sha256": sha,"dir": dir
+                    }),
+                );
+                app.sys(format!(
+                    "offered {} ({}) — waiting for an /accept",
+                    name,
+                    ft::human(size)
+                ));
             }
             Err(e) => app.err(format!("send failed: {e}")),
         }
@@ -843,21 +942,44 @@ fn handle_command(
                     // `--start` (alias `--start-daemon` / `-y`) opts in to booting
                     // a stopped Docker daemon; everything else is positional.
                     let args: Vec<&str> = p.collect();
-                    let start_daemon = args.iter().any(|a| matches!(*a, "--start" | "--start-daemon" | "-y"));
+                    let start_daemon = args
+                        .iter()
+                        .any(|a| matches!(*a, "--start" | "--start-daemon" | "-y"));
                     let mut pos = args.iter().copied().filter(|a| !a.starts_with('-'));
-                    let backend = pos.next().and_then(sbx::Backend::parse).unwrap_or(sbx::Backend::Local);
-                    let image = pos.next().map(str::to_string).unwrap_or_else(|| backend.default_image().to_string());
+                    let backend = pos
+                        .next()
+                        .and_then(sbx::Backend::parse)
+                        .unwrap_or(sbx::Backend::Local);
+                    let image = pos
+                        .next()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| backend.default_image().to_string());
 
-                    if backend == sbx::Backend::Docker && !start_daemon && !sbx::docker_daemon_up() {
+                    if backend == sbx::Backend::Docker && !start_daemon && !sbx::docker_daemon_up()
+                    {
                         app.err("docker daemon is not running — retry with `/sbx launch docker --start` to boot it (sudo), or run ./ensure-docker.sh in a terminal first");
                     } else {
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
                         let (rows, cols) = sbx_dims(sz.0, sz.1);
                         *launching = true;
-                        let members: Vec<String> = app.users.iter().map(|u| u.username.clone()).collect();
-                        app.sys(format!("summoning {} sandbox… (provisioning unix users; multipass boot ~30s)", backend.label()));
-                        spawn_launch(backend, image, app.me.clone(), members, rows, cols, start_daemon,
-                            pty_tx.clone(), broker_tx.clone(), app_tx.clone());
+                        let members: Vec<String> =
+                            app.users.iter().map(|u| u.username.clone()).collect();
+                        app.sys(format!(
+                            "summoning {} sandbox… (provisioning unix users; multipass boot ~30s)",
+                            backend.label()
+                        ));
+                        spawn_launch(
+                            backend,
+                            image,
+                            app.me.clone(),
+                            members,
+                            rows,
+                            cols,
+                            start_daemon,
+                            pty_tx.clone(),
+                            broker_tx.clone(),
+                            app_tx.clone(),
+                        );
                     }
                 }
             }
@@ -975,7 +1097,13 @@ fn spawn_launch(
                         }
                     }
                 });
-                let _ = broker_tx.send(BrokerMsg::Ready { sb, backend, name, rows, cols });
+                let _ = broker_tx.send(BrokerMsg::Ready {
+                    sb,
+                    backend,
+                    name,
+                    rows,
+                    cols,
+                });
             }
             Err(e) => {
                 let _ = app_tx.send(Net::Err(format!("sandbox launch failed: {e}")));

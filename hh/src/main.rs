@@ -45,7 +45,10 @@ enum Cmd {
         theme: Option<String>,
     },
     /// Debug: print the derived room Fernet key for a password + room_salt(hex).
-    Roomkey { password: String, room_salt_hex: String },
+    Roomkey {
+        password: String,
+        room_salt_hex: String,
+    },
     /// Run the offline SRP golden-vector self-test.
     Selftest,
     /// Debug: compute A and M from explicit a/salt/B hex (parity check vs python).
@@ -98,7 +101,10 @@ fn main() -> Result<()> {
             };
             tokio::runtime::Runtime::new()?.block_on(app::run(params, session, theme))
         }
-        Cmd::Roomkey { password, room_salt_hex } => {
+        Cmd::Roomkey {
+            password,
+            room_salt_hex,
+        } => {
             let salt = hex::decode(room_salt_hex)?;
             let f = crypto::room_fernet(password.as_bytes(), &salt)?;
             // fernet crate doesn't expose the key; re-derive + print the b64 key.
@@ -143,7 +149,7 @@ fn selftest() -> Result<()> {
     // Re-derive the golden vectors at runtime as a smoke check.
     let c = crypto::SrpClient::with_a(b"chat", b"labtest", &{
         let mut v = vec![0x80u8];
-        v.extend(std::iter::repeat(0x22u8).take(31));
+        v.extend(std::iter::repeat_n(0x22u8, 31));
         v
     });
     let a = hex::encode(c.a_bytes());
@@ -212,7 +218,10 @@ fn handshake(
 
     let server_hamk = STD.decode(verify["H_AMK"].as_str().context("no H_AMK")?)?;
     anyhow::ensure!(server_hamk == ch.h_amk, "server H_AMK mismatch — MITM?");
-    let ws_token = verify["ws_token"].as_str().context("no ws_token")?.to_string();
+    let ws_token = verify["ws_token"]
+        .as_str()
+        .context("no ws_token")?
+        .to_string();
     println!("/srp/verify ok — server identity proven (H_AMK ✓)");
 
     // Room key + encrypt a message the Python clients can read.
@@ -221,9 +230,7 @@ fn handshake(
 
     // Connect WS and send the ciphertext.
     let ws_scheme = if no_tls { "ws" } else { "wss" };
-    let ws_url = format!(
-        "{ws_scheme}://{ip}:{port}/ws/chat?user_id={user_id}&ws_token={ws_token}"
-    );
+    let ws_url = format!("{ws_scheme}://{ip}:{port}/ws/chat?user_id={user_id}&ws_token={ws_token}");
     let (mut sock, _resp) =
         tungstenite::connect(&ws_url).context("ws connect (insecure wss not yet wired)")?;
     println!("websocket attached to the house");

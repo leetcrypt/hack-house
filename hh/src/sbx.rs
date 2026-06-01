@@ -36,7 +36,10 @@ fn start_docker_daemon() -> Result<()> {
         .context("running ensure-docker.sh")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        let last = err.lines().last().unwrap_or("could not start the docker daemon");
+        let last = err
+            .lines()
+            .last()
+            .unwrap_or("could not start the docker daemon");
         anyhow::bail!("{last}");
     }
     Ok(())
@@ -93,16 +96,25 @@ pub fn prepare(backend: Backend, name: &str, image: &str, start_daemon: bool) ->
                 // Capture output so it can't bleed onto the TUI surface; surface
                 // the failure reason through the returned error instead.
                 let out = Command::new("multipass")
-                    .args(["launch", "--name", name, "--cpus", "1", "--memory", "1G", "--disk", "5G", image])
+                    .args([
+                        "launch", "--name", name, "--cpus", "1", "--memory", "1G", "--disk", "5G",
+                        image,
+                    ])
                     .output()
                     .context("multipass launch (is multipass installed?)")?;
                 if !out.status.success() {
                     let err = String::from_utf8_lossy(&out.stderr);
-                    anyhow::bail!("multipass launch failed: {}", err.lines().last().unwrap_or("").trim());
+                    anyhow::bail!(
+                        "multipass launch failed: {}",
+                        err.lines().last().unwrap_or("").trim()
+                    );
                 }
             } else {
-                let _ = Command::new("multipass").args(["start", name])
-                    .stdout(Stdio::null()).stderr(Stdio::null()).status();
+                let _ = Command::new("multipass")
+                    .args(["start", name])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
             }
             Ok(())
         }
@@ -120,17 +132,35 @@ pub fn prepare(backend: Backend, name: &str, image: &str, start_daemon: bool) ->
                 }
             }
             // Persistent container so we can exec in to provision users + shells.
-            let _ = Command::new("docker").args(["rm", "-f", name])
-                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let _ = Command::new("docker")
+                .args(["rm", "-f", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
             // Capture output so a failure can't paint over the TUI; the reason is
             // surfaced through the returned error (shown in the error popup).
             let out = Command::new("docker")
-                .args(["run", "-d", "--name", name, "--hostname", name, "-w", "/root", image, "sleep", "infinity"])
+                .args([
+                    "run",
+                    "-d",
+                    "--name",
+                    name,
+                    "--hostname",
+                    name,
+                    "-w",
+                    "/root",
+                    image,
+                    "sleep",
+                    "infinity",
+                ])
                 .output()
                 .context("docker run (is docker installed?)")?;
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!("docker run failed: {}", err.lines().last().unwrap_or("").trim());
+                anyhow::bail!(
+                    "docker run failed: {}",
+                    err.lines().last().unwrap_or("").trim()
+                );
             }
             Ok(())
         }
@@ -142,12 +172,18 @@ pub fn prepare(backend: Backend, name: &str, image: &str, start_daemon: bool) ->
 pub fn teardown(backend: Backend, name: &str) {
     match backend {
         Backend::Multipass => {
-            let _ = Command::new("multipass").args(["delete", name, "--purge"])
-                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let _ = Command::new("multipass")
+                .args(["delete", name, "--purge"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         }
         Backend::Docker => {
-            let _ = Command::new("docker").args(["rm", "-f", name])
-                .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let _ = Command::new("docker")
+                .args(["rm", "-f", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
         }
         Backend::Local => {}
     }
@@ -163,7 +199,11 @@ fn command_for(backend: Backend, name: &str, run_user: &str) -> CommandBuilder {
             c
         }
         Backend::Docker => {
-            let user = if run_user.is_empty() { "root" } else { run_user };
+            let user = if run_user.is_empty() {
+                "root"
+            } else {
+                run_user
+            };
             let mut c = CommandBuilder::new("docker");
             c.args(["exec", "-it", "-u", user, name, "bash", "-il"]);
             c
@@ -196,14 +236,20 @@ fn mp(name: &str, args: &[&str]) {
     let mut a = vec!["exec", name, "--"];
     a.extend_from_slice(args);
     // Null stdio so provisioning chatter never bleeds onto the TUI surface.
-    let _ = Command::new("multipass").args(a)
-        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = Command::new("multipass")
+        .args(a)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 fn dk(name: &str, args: &[&str]) {
     let mut a = vec!["exec", name];
     a.extend_from_slice(args);
-    let _ = Command::new("docker").args(a)
-        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = Command::new("docker")
+        .args(a)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Grant a Multipass user real *passwordless* sudo (group + sudoers.d drop-in)
@@ -362,8 +408,8 @@ mod tests {
     #[test]
     fn local_shell_pty_roundtrip() {
         let (tx, rx) = mpsc::channel();
-        let mut sb = Sandbox::launch(Backend::Local, "test", "", 24, 80, tx)
-            .expect("launch local shell");
+        let mut sb =
+            Sandbox::launch(Backend::Local, "test", "", 24, 80, tx).expect("launch local shell");
         sb.write_input(b"echo HELLO_PTY_42\n").unwrap();
 
         let mut acc = String::new();
@@ -401,8 +447,7 @@ mod relay_tests {
         use base64::Engine;
 
         let (tx, rx) = mpsc::channel();
-        let mut sb = Sandbox::launch(Backend::Local, "test", "", 24, 80, tx)
-            .expect("launch");
+        let mut sb = Sandbox::launch(Backend::Local, "test", "", 24, 80, tx).expect("launch");
         sb.write_input(b"echo RELAY_MARKER_7\n").unwrap();
 
         // Remote client side: a vt100 parser fed from decoded data frames.

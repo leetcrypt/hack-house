@@ -41,18 +41,18 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             name: "crypt".into(),
-            border: Color::Rgb(0x6e, 0x6e, 0x7a),    // gray chrome, defined against the surface
-            title: Color::Rgb(0xff, 0xff, 0xff),     // white
-            accent: Color::Rgb(0xff, 0xff, 0xff),    // white (sigil / prompt)
-            dim: Color::Rgb(0x9a, 0x9a, 0xa6),       // timestamps — readable mid-gray
-            me: Color::Rgb(0xff, 0xff, 0xff),        // your messages = white
-            other: Color::Rgb(0xc8, 0xc8, 0xd0),     // others = bright gray
-            system: Color::Rgb(0xb0, 0xb0, 0xbc),    // system / occult = legible muted gray
+            border: Color::Rgb(0x6e, 0x6e, 0x7a), // gray chrome, defined against the surface
+            title: Color::Rgb(0xff, 0xff, 0xff),  // white
+            accent: Color::Rgb(0xff, 0xff, 0xff), // white (sigil / prompt)
+            dim: Color::Rgb(0x9a, 0x9a, 0xa6),    // timestamps — readable mid-gray
+            me: Color::Rgb(0xff, 0xff, 0xff),     // your messages = white
+            other: Color::Rgb(0xc8, 0xc8, 0xd0),  // others = bright gray
+            system: Color::Rgb(0xb0, 0xb0, 0xbc), // system / occult = legible muted gray
             input: Color::Rgb(0xff, 0xff, 0xff),
             roster_me: Color::Rgb(0xff, 0xff, 0xff), // you / owner = white
             bg: Color::Rgb(0x1c, 0x1c, 0x22),        // slate panel lifts text off pure-black
             roster_width: 22,
-            sigil: "✝".into(),                       // inverted cross / crypt
+            sigil: "✝".into(), // inverted cross / crypt
         }
     }
 }

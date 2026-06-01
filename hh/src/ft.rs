@@ -55,13 +55,24 @@ pub fn read_payload(path: &str) -> Result<(String, Vec<u8>, bool)> {
     let meta = std::fs::metadata(p).with_context(|| format!("not found: {path}"))?;
     if meta.is_dir() {
         let bytes = tar_dir(p)?;
-        anyhow::ensure!(bytes.len() <= MAX_SIZE, "directory too large ({})", human(bytes.len()));
+        anyhow::ensure!(
+            bytes.len() <= MAX_SIZE,
+            "directory too large ({})",
+            human(bytes.len())
+        );
         let base = p.file_name().and_then(|s| s.to_str()).unwrap_or("dir");
         Ok((format!("{base}.tar"), bytes, true))
     } else {
-        anyhow::ensure!(meta.len() as usize <= MAX_SIZE, "file too large (max 50 MB)");
+        anyhow::ensure!(
+            meta.len() as usize <= MAX_SIZE,
+            "file too large (max 50 MB)"
+        );
         let bytes = std::fs::read(p)?;
-        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
         Ok((name, bytes, false))
     }
 }
@@ -89,17 +100,29 @@ pub fn save(downloads: &Path, offer: &Offer, data: &[u8]) -> Result<PathBuf> {
             let mut e = entry?;
             let path = e.path()?.into_owned();
             // Explicit zip-slip guard (belt-and-suspenders; unpack_in also refuses).
-            anyhow::ensure!(safe_entry(&path), "unsafe tar entry rejected: {}", path.display());
+            anyhow::ensure!(
+                safe_entry(&path),
+                "unsafe tar entry rejected: {}",
+                path.display()
+            );
             if top.is_none() {
                 top = path.components().next().map(|c| c.as_os_str().to_owned());
             }
             e.unpack_in(downloads)
                 .with_context(|| format!("extract {}", path.display()))?;
         }
-        Ok(top.map(|t| downloads.join(t)).unwrap_or_else(|| downloads.to_path_buf()))
+        Ok(top
+            .map(|t| downloads.join(t))
+            .unwrap_or_else(|| downloads.to_path_buf()))
     } else {
-        let stem = Path::new(&offer.name).file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-        let ext = Path::new(&offer.name).extension().and_then(|s| s.to_str()).unwrap_or("");
+        let stem = Path::new(&offer.name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file");
+        let ext = Path::new(&offer.name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
         let dest = unique(downloads, stem, ext);
         std::fs::write(&dest, data)?;
         Ok(dest)
@@ -113,8 +136,16 @@ fn safe_entry(path: &Path) -> bool {
 
 fn unique(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     let mk = |n: usize| {
-        let base = if n == 0 { stem.to_string() } else { format!("{stem}_{n}") };
-        if ext.is_empty() { dir.join(base) } else { dir.join(format!("{base}.{ext}")) }
+        let base = if n == 0 {
+            stem.to_string()
+        } else {
+            format!("{stem}_{n}")
+        };
+        if ext.is_empty() {
+            dir.join(base)
+        } else {
+            dir.join(format!("{base}.{ext}"))
+        }
     };
     (0..).map(mk).find(|p| !p.exists()).unwrap()
 }
@@ -157,8 +188,14 @@ mod tests {
         let (name, bytes, is_dir) = read_payload(src.to_str().unwrap()).unwrap();
         assert_eq!(name, "note.txt");
         assert!(!is_dir);
-        let offer = Offer { id: "1".into(), name, size: bytes.len() as u64,
-            sha256: sha256_hex(&bytes), dir: false, from: "x".into() };
+        let offer = Offer {
+            id: "1".into(),
+            name,
+            size: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+            dir: false,
+            from: "x".into(),
+        };
         let dl = dir.join("dl");
         let out = save(&dl, &offer, &bytes).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"offering to the clergy");
@@ -176,8 +213,14 @@ mod tests {
         let (name, bytes, is_dir) = read_payload(proj.to_str().unwrap()).unwrap();
         assert_eq!(name, "proj.tar");
         assert!(is_dir);
-        let offer = Offer { id: "1".into(), name, size: bytes.len() as u64,
-            sha256: sha256_hex(&bytes), dir: true, from: "x".into() };
+        let offer = Offer {
+            id: "1".into(),
+            name,
+            size: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+            dir: true,
+            from: "x".into(),
+        };
         let dl = dir.join("dl");
         let out = save(&dl, &offer, &bytes).unwrap(); // -> dl/proj
         assert!(out.ends_with("proj"));

@@ -84,13 +84,15 @@ pub fn authenticate(
         .json()?;
 
     let server_hamk = STANDARD.decode(verify["H_AMK"].as_str().context("no H_AMK")?)?;
-    anyhow::ensure!(server_hamk == ch.h_amk, "server identity check failed (H_AMK) — MITM?");
+    anyhow::ensure!(
+        server_hamk == ch.h_amk,
+        "server identity check failed (H_AMK) — MITM?"
+    );
     let ws_token = verify["ws_token"].as_str().context("no ws_token")?;
 
     let fernet = crypto::room_fernet(password.as_bytes(), &room_salt)?;
     let ws_scheme = if no_tls { "ws" } else { "wss" };
-    let ws_url =
-        format!("{ws_scheme}://{ip}:{port}/ws/chat?user_id={user_id}&ws_token={ws_token}");
+    let ws_url = format!("{ws_scheme}://{ip}:{port}/ws/chat?user_id={user_id}&ws_token={ws_token}");
 
     Ok(Session {
         username: user.to_string(),
@@ -160,14 +162,18 @@ fn decode_msg(room: &fernet::Fernet, m: &Value, live: bool) -> Decoded {
             // Control frames are live-only — never replayed from the stored snapshot.
             if t.starts_with("{\"_sbx\":") {
                 return if live {
-                    parse_sbx(&t, sender).map(Decoded::Sbx).unwrap_or(Decoded::Skip)
+                    parse_sbx(&t, sender)
+                        .map(Decoded::Sbx)
+                        .unwrap_or(Decoded::Skip)
                 } else {
                     Decoded::Skip
                 };
             }
             if t.starts_with("{\"_ft\":") {
                 return if live {
-                    crate::ft::parse(&t, sender).map(|f| Decoded::Sbx(Net::Ft(f))).unwrap_or(Decoded::Skip)
+                    crate::ft::parse(&t, sender)
+                        .map(|f| Decoded::Sbx(Net::Ft(f)))
+                        .unwrap_or(Decoded::Skip)
                 } else {
                     Decoded::Skip
                 };
@@ -177,7 +183,11 @@ fn decode_msg(room: &fernet::Fernet, m: &Value, live: bool) -> Decoded {
         Err(_) => ("[unreadable — wrong room password?]".to_string(), true),
     };
     let stamp = m["timestamp"].as_str().unwrap_or("");
-    let ts = if stamp.len() >= 19 { stamp[11..19].to_string() } else { String::new() };
+    let ts = if stamp.len() >= 19 {
+        stamp[11..19].to_string()
+    } else {
+        String::new()
+    };
     Decoded::Chat(ChatLine {
         ts,
         username: m["username"].as_str().unwrap_or("?").to_string(),
@@ -232,7 +242,11 @@ fn parse_perm(text: &str) -> Option<Net> {
 }
 
 /// Read websocket frames forever, forwarding decoded `Net` events to the UI.
-pub async fn reader(mut read: impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin, room: Arc<fernet::Fernet>, tx: UnboundedSender<Net>) {
+pub async fn reader(
+    mut read: impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    room: Arc<fernet::Fernet>,
+    tx: UnboundedSender<Net>,
+) {
     while let Some(frame) = read.next().await {
         let txt = match frame {
             Ok(WsMsg::Text(t)) => t,
@@ -254,7 +268,10 @@ pub async fn reader(mut read: impl StreamExt<Item = Result<WsMsg, tokio_tungsten
                         _ => None,
                     })
                     .collect();
-                tx.send(Net::Init { lines, users: parse_users(&v["users"]) })
+                tx.send(Net::Init {
+                    lines,
+                    users: parse_users(&v["users"]),
+                })
             }
             "message" => match decode_msg(&room, &v["data"], true) {
                 Decoded::Chat(l) => tx.send(Net::Message(l)),
@@ -265,7 +282,9 @@ pub async fn reader(mut read: impl StreamExt<Item = Result<WsMsg, tokio_tungsten
                 users: parse_users(&v["users"]),
                 capacity: v["capacity"].as_u64().unwrap_or(0) as usize,
             }),
-            "user_joined" => tx.send(Net::Joined(v["username"].as_str().unwrap_or("?").to_string())),
+            "user_joined" => tx.send(Net::Joined(
+                v["username"].as_str().unwrap_or("?").to_string(),
+            )),
             "user_left" => tx.send(Net::Left(v["user_id"].as_str().unwrap_or("").to_string())),
             _ => Ok(()),
         };

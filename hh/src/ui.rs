@@ -12,7 +12,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     // Paint the whole frame in the theme background first so every panel (and the
     // gaps between them) sits on the same surface. With bg = Reset this is a no-op
     // and we ride the terminal's own colour.
-    f.render_widget(Block::default().style(Style::default().bg(theme.bg)), f.area());
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.bg)),
+        f.area(),
+    );
 
     let rows = Layout::vertical([
         Constraint::Length(1),
@@ -53,22 +56,33 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 /// onto the input box. Cleared by the next keypress (see the run loop).
 fn draw_error(f: &mut Frame, area: Rect, theme: &Theme, msg: &str) {
     let text = format!("⚠ {msg}");
-    let w = area.width.saturating_sub(2).min(48).max(16);
+    let w = area.width.saturating_sub(2).clamp(16, 48);
     let inner = w.saturating_sub(2).max(1);
     let rows = (text.chars().count() as u16).div_ceil(inner) + 2;
     let h = rows.min(area.height.saturating_sub(2)).max(3);
     let x = area.x + area.width.saturating_sub(w + 1); // hug the right edge
     let y = area.y + 1; // just under the top bar, over the clergy
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     f.render_widget(Clear, rect);
     let popup = Paragraph::new(text)
         .style(Style::default().fg(theme.title).bg(theme.bg))
         .block(
             Block::bordered()
-                .border_style(Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+                .border_style(
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .title(Span::styled(
                     format!(" {} error · any key ", theme.sigil),
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
                 )),
         )
         .wrap(Wrap { trim: false });
@@ -93,7 +107,9 @@ fn centered(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
-    let acc = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let acc = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
     let key = Style::default().fg(theme.title);
     let dim = Style::default().fg(theme.system);
     let kv = |k: &str, v: &str| {
@@ -106,17 +122,35 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
     let head = |s: &str| Line::from(Span::styled(format!("{sig} {s}"), acc));
     let lines = vec![
         head("COMMANDS (type in the input bar)"),
-        kv("/sbx launch [backend]", "summon a sandbox: local | docker | multipass"),
+        kv(
+            "/sbx launch [backend]",
+            "summon a sandbox: local | docker | multipass",
+        ),
         kv("/sbx stop", "tear down the sandbox (purges the VM)"),
         kv("/drive", "type into the shared shell  (Esc releases)"),
-        kv("/grant <user>", "let a member drive the shell        (owner)"),
-        kv("/revoke <user>", "take back drive permission          (owner)"),
-        kv("/sudo <user>", "delegate VM superuser (real sudo)   (owner)"),
-        kv("/unsudo <user>", "revoke VM superuser                 (owner)"),
+        kv(
+            "/grant <user>",
+            "let a member drive the shell        (owner)",
+        ),
+        kv(
+            "/revoke <user>",
+            "take back drive permission          (owner)",
+        ),
+        kv(
+            "/sudo <user>",
+            "delegate VM superuser (real sudo)   (owner)",
+        ),
+        kv(
+            "/unsudo <user>",
+            "revoke VM superuser                 (owner)",
+        ),
         kv("/send <file>", "offer a file to the room"),
         kv("/sendd <dir>", "offer a directory (sent as a tar)"),
         kv("/accept  ·  /reject", "respond to an incoming file offer"),
-        kv("/theme [name]", "change vestments live: church | neon | crypt"),
+        kv(
+            "/theme [name]",
+            "change vestments live: church | neon | crypt",
+        ),
         kv("/pw", "show this room's password (local only)"),
         kv("/help", "show / hide this menu"),
         Line::from(""),
@@ -126,17 +160,31 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         kv("F2  ·  /drive", "take the shell  ·  Esc releases it"),
         kv("Ctrl-C  (while driving)", "interrupt the running command"),
         kv("PgUp / PgDn", "scroll chat  ·  Home/End = oldest/live"),
-        kv("PgUp / PgDn  (driving)", "scroll the sandbox terminal's scrollback"),
-        kv("Up / Down  ·  wheel", "scroll the sandbox terminal (mouse works while driving)"),
-        kv("Ctrl-R  (when closed)", "reconnect to the house after a drop / AFK"),
+        kv(
+            "PgUp / PgDn  (driving)",
+            "scroll the sandbox terminal's scrollback",
+        ),
+        kv(
+            "Up / Down  ·  wheel",
+            "scroll the sandbox terminal (mouse works while driving)",
+        ),
+        kv(
+            "Ctrl-R  (when closed)",
+            "reconnect to the house after a drop / AFK",
+        ),
         kv("Ctrl-C  ·  Ctrl-Q", "quit hack-house"),
         Line::from(""),
         head("ROSTER GLYPHS"),
-        kv(&format!("{} owner   ⚡ sudoer", theme.sigil), "◆ may drive    • member"),
+        kv(
+            &format!("{} owner   ⚡ sudoer", theme.sigil),
+            "◆ may drive    • member",
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "  malware bless · press any key to close",
-            Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme.dim)
+                .add_modifier(Modifier::ITALIC),
         )),
     ];
     let w = centered(78, 90, area);
@@ -148,7 +196,9 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
                 .border_style(Style::default().fg(theme.accent))
                 .title(Span::styled(
                     format!(" {0} hack-house — help {0} ", theme.sigil),
-                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.title)
+                        .add_modifier(Modifier::BOLD),
                 )),
         )
         .wrap(Wrap { trim: false });
@@ -173,7 +223,11 @@ fn draw_sandbox(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &T
         " · /drive (or F2) · ↑/↓/wheel scroll".to_string()
     };
     let title = format!(" sandbox · {}{} ", sv.backend, drive);
-    let border = if app.driving { theme.accent } else { theme.border };
+    let border = if app.driving {
+        theme.accent
+    } else {
+        theme.border
+    };
     let pane = Paragraph::new(lines).block(
         Block::bordered()
             .border_style(Style::default().fg(border))
@@ -183,7 +237,11 @@ fn draw_sandbox(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &T
 }
 
 fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
-    let cap = if app.capacity > 0 { app.capacity } else { app.users.len() };
+    let cap = if app.capacity > 0 {
+        app.capacity
+    } else {
+        app.users.len()
+    };
     let status = if app.connected {
         "🔒 e2e"
     } else if app.reconnecting {
@@ -194,7 +252,9 @@ fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme
     let bar = Line::from(vec![
         Span::styled(
             format!(" {0} hack-house {0} ", theme.sigil),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("· {status} "), Style::default().fg(theme.dim)),
         Span::styled(
@@ -213,10 +273,16 @@ fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
         let text = l.text.replace('⛧', &theme.sigil);
         return Line::from(Span::styled(
             format!("  {} {}", theme.sigil, text),
-            Style::default().fg(theme.system).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme.system)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
-    let name_color = if l.username == app.me { theme.me } else { theme.other };
+    let name_color = if l.username == app.me {
+        theme.me
+    } else {
+        theme.other
+    };
     Line::from(vec![
         Span::styled(format!("{} ", l.ts), Style::default().fg(theme.dim)),
         Span::styled(
@@ -305,8 +371,13 @@ fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &The
             }))
             .title(Span::styled(
                 match &app.pending_offer {
-                    Some(o) => format!(" {} incoming: {} — /accept or /reject ", theme.sigil, o.name),
-                    None if app.driving => format!(" {} DRIVING the shell — Esc to release ", theme.sigil),
+                    Some(o) => format!(
+                        " {} incoming: {} — /accept or /reject ",
+                        theme.sigil, o.name
+                    ),
+                    None if app.driving => {
+                        format!(" {} DRIVING the shell — Esc to release ", theme.sigil)
+                    }
                     None => " message · enter send · /drive for shell · ctrl-q quit ".to_string(),
                 },
                 Style::default().fg(theme.title),
