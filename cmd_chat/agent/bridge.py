@@ -62,7 +62,44 @@ class AgentBridge(Client):
         frame = json.dumps({"_ai": "typing", "name": self.name, "on": on})
         await ws.send(self.room_fernet.encrypt(frame.encode()).decode())
 
+    async def _send_chat(self, ws, text: str) -> None:
+        await ws.send(self.room_fernet.encrypt(text.encode()).decode())
+
+    def _command_reply(self, question: str) -> str | None:
+        """Canned reply for a reserved verb, else None.
+
+        Handled locally so it never spends a model call:
+        - ``list``   → this agent's roster line (who's here / what it runs). With
+          several agents present each answers for itself, forming the roster.
+        - ``models`` → what the configured backend can serve (in-room
+          --list-models)."""
+        verb = question.strip().lower()
+        if verb == "list":
+            return (f"{self.name} (ai) here — {self.provider.name}/"
+                    f"{self.provider.model}, context {self.context_window}")
+        if verb != "models":
+            return None
+        discover = getattr(self.provider, "available_models", None)
+        if discover is None:
+            return f"{self.provider.name}: model discovery not supported."
+        try:
+            models = discover()
+        except Exception as e:  # noqa: BLE001 — report unreachable backend in-room
+            return f"[ai error: cannot reach {self.provider.name}: {e}]"
+        if not models:
+            return f"{self.provider.name}: no models reported."
+        # One line: the TUI collapses embedded newlines, so bracket the active
+        # model instead of using a multi-line, marker-prefixed list.
+        mark = lambda m: f"[{m}]" if m == self.provider.model else m  # noqa: E731
+        listing = ", ".join(mark(m) for m in models)
+        return f"{self.provider.name} models ([active]): {listing}"
+
     async def _answer(self, ws, question: str, asker: str) -> None:
+        canned = self._command_reply(question)
+        if canned is not None:
+            await self._send_chat(ws, canned)
+            self.success(f"answered /ai {question.strip().lower()} for {asker}")
+            return
         self.transcript.append(Msg("user", f"{asker}: {question}"))
         await self._send_typing(ws, True)
         try:
@@ -77,7 +114,7 @@ class AgentBridge(Client):
             await self._send_typing(ws, False)
         reply = reply.strip() or "[empty reply]"
         self.transcript.append(Msg("assistant", reply))
-        await ws.send(self.room_fernet.encrypt(reply.encode()).decode())
+        await self._send_chat(ws, reply)
         self.success(f"replied to {asker}")
 
     async def run_async(self) -> None:

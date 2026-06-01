@@ -129,14 +129,16 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         kv("/sbx stop", "tear down the sandbox (purges the VM)"),
         kv("/drive", "type into the shared shell  (Esc releases)"),
         kv(
-            "/ai start [model]",
-            "spawn a local AI agent      (default ollama/qwen2.5:3b)",
+            "/ai start [model|profile]",
+            "spawn an AI agent  (ollama model tag, or a models.toml profile)",
         ),
         kv("/ai stop", "dismiss the agent you started"),
         kv(
             "/ai <question>",
             "ask an AI agent in the room (/ai <name> <q> if many)",
         ),
+        kv("/ai list", "list AI agents present + their provider/model"),
+        kv("/ai models", "show models the active agent's backend can serve"),
         kv(
             "/grant <user>",
             "let a member drive the shell        (owner)",

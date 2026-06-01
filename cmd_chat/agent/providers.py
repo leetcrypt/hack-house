@@ -30,6 +30,11 @@ class Provider(Protocol):
     def complete(self, system: str, messages: list[Msg]) -> str:
         ...
 
+    # Optional: list models the backend can serve, for discovery/preflight.
+    # Providers that can't enumerate (e.g. a bespoke endpoint) may omit this.
+    def available_models(self) -> list[str]:
+        ...
+
 
 class OllamaProvider:
     """Local Ollama (default, recommended). No API key — privacy-preserving."""
@@ -51,6 +56,11 @@ class OllamaProvider:
         r = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
         r.raise_for_status()
         return (r.json().get("message", {}).get("content") or "").strip()
+
+    def available_models(self) -> list[str]:
+        r = requests.get(f"{self.host}/api/tags", timeout=self.timeout)
+        r.raise_for_status()
+        return [m.get("name", "") for m in r.json().get("models", [])]
 
 
 class AnthropicProvider:
@@ -92,6 +102,15 @@ class AnthropicProvider:
         blocks = r.json().get("content", [])
         return "".join(b.get("text", "") for b in blocks).strip()
 
+    def available_models(self) -> list[str]:
+        r = requests.get(
+            "https://api.anthropic.com/v1/models",
+            timeout=self.timeout,
+            headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01"},
+        )
+        r.raise_for_status()
+        return [m.get("id", "") for m in r.json().get("data", [])]
+
 
 class OpenAICompatibleProvider:
     """OpenAI-style /chat/completions — OpenAI, Groq, Together, local vLLM, etc."""
@@ -120,6 +139,14 @@ class OpenAICompatibleProvider:
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
 
+    def available_models(self) -> list[str]:
+        headers = {}
+        if self.api_key:
+            headers["authorization"] = f"Bearer {self.api_key}"
+        r = requests.get(f"{self.base_url}/models", headers=headers, timeout=self.timeout)
+        r.raise_for_status()
+        return [m.get("id", "") for m in r.json().get("data", [])]
+
 
 _BUILTINS = {
     "ollama": OllamaProvider,
@@ -144,3 +171,29 @@ def make_provider(spec: str, model: str | None = None, **opts) -> Provider:
     if model is not None:
         opts["model"] = model
     return cls(**opts)
+
+
+def preflight(provider: Provider) -> tuple[bool, str]:
+    """Cheap reachability + model-presence check before joining a room.
+
+    Returns ``(ok, message)``. Lets ``/ai start`` fail fast with a clear reason
+    (backend down / model not pulled / key missing) instead of erroring on the
+    first question. Providers without ``available_models`` are assumed reachable.
+    """
+    discover = getattr(provider, "available_models", None)
+    if discover is None:
+        return True, f"{provider.name}: no discovery endpoint — assuming reachable"
+    try:
+        models = discover()
+    except Exception as e:  # noqa: BLE001 — any failure means "not reachable yet"
+        return False, f"{provider.name}: cannot reach backend ({e})"
+    if provider.model in models:
+        return True, f"{provider.name}/{provider.model}: reachable"
+    if models:
+        sample = ", ".join(models[:8])
+        more = "…" if len(models) > 8 else ""
+        return False, (
+            f"{provider.name}: model '{provider.model}' not available. "
+            f"reachable models: {sample}{more}"
+        )
+    return True, f"{provider.name}: reachable (empty model list — skipping check)"

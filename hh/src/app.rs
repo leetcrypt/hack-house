@@ -96,6 +96,8 @@ pub enum Net {
         name: String,
         on: bool,
     },
+    /// A local system notice produced off-thread (e.g. async Ollama probe).
+    Sys(String),
     Err(String),
     Closed,
 }
@@ -298,6 +300,7 @@ impl App {
                 self.sudoers = sudo;
             }
             Net::Ft(_) => {} // handled in the run loop (needs out channel + disk)
+            Net::Sys(t) => self.sys(t),
             Net::Err(t) => self.err(t),
             Net::Closed => {
                 self.connected = false;
@@ -1108,22 +1111,100 @@ fn handle_command(
         if agent.is_some() {
             app.sys("an AI agent is already running from this client — /ai stop first");
         } else {
-            let m = rest.trim();
-            let model = if m.is_empty() { "qwen2.5:3b" } else { m };
+            let arg = rest.trim();
+            // A bare name (no ':' tag, no '/' path) is a models.toml profile;
+            // anything else is treated as a literal Ollama model tag.
+            let (profile, model): (Option<&str>, &str) = if arg.is_empty() {
+                (None, "qwen2.5:3b")
+            } else if arg.contains(':') || arg.contains('/') {
+                (None, arg)
+            } else {
+                (Some(arg), arg)
+            };
             let name = "oracle";
-            match spawn_agent(params, &app.password, name, model) {
+            match spawn_agent(params, &app.password, name, profile, model) {
                 Ok(child) => {
                     *agent = Some(child);
+                    let desc = match profile {
+                        Some(p) => format!("profile {p}"),
+                        None => format!("ollama/{model}"),
+                    };
                     app.sys(format!(
-                        "⛧ summoning {name} (ollama/{model})… it will announce when online"
+                        "⛧ summoning {name} ({desc})… it will announce when online"
                     ));
                 }
                 Err(e) => app.err(format!("/ai start failed: {e}")),
             }
         }
+    } else if line == "/ai list" || line == "/ai models" {
+        // Reap an agent that already exited so we don't forward into a dead pipe.
+        if agent
+            .as_mut()
+            .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+        {
+            *agent = None;
+        }
+        if agent.is_some() {
+            // A live agent answers these itself (canned, zero model-call).
+            let _ = out_tx.send(WsMsg::Text(room.encrypt(line.as_bytes())));
+        } else if line == "/ai list" {
+            app.sys("no AI agent running from this client — /ai start to summon one");
+        } else {
+            // No agent: still useful to show what could be started locally.
+            app.sys("querying local ollama…");
+            let tx = app_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let msg = match local_ollama_models() {
+                    Ok(ms) if !ms.is_empty() => format!(
+                        "local ollama models (start one with `/ai start <name>`): {}",
+                        ms.join(", ")
+                    ),
+                    Ok(_) => "ollama is reachable but has no models pulled — \
+                              `ollama pull qwen2.5:3b` or run ./bootstrap-ai.sh"
+                        .to_string(),
+                    Err(_) => "ollama not reachable at localhost:11434 — run \
+                               ./bootstrap-ai.sh, or `/ai start <profile>` for a cloud model"
+                        .to_string(),
+                };
+                let _ = tx.send(Net::Sys(msg));
+            });
+        }
     } else if !line.is_empty() && app.connected {
         let _ = out_tx.send(WsMsg::Text(room.encrypt(line.as_bytes())));
     }
+}
+
+/// Probe the local Ollama daemon for installed model tags. Used to answer
+/// `/ai models` before any agent is summoned (the agentless path); a running
+/// agent answers in-room instead. Honors `$OLLAMA_HOST`.
+fn local_ollama_models() -> Result<Vec<String>, String> {
+    let host = std::env::var("OLLAMA_HOST")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "http://localhost:11434".to_string());
+    let host = host.trim_end_matches('/');
+    let url = format!("{host}/api/tags");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .map_err(|e| e.to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let models = body
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(models)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1214,6 +1295,7 @@ fn spawn_agent(
     params: &net::ConnParams,
     password: &str,
     name: &str,
+    profile: Option<&str>,
     model: &str,
 ) -> std::result::Result<std::process::Child, String> {
     use std::process::{Command, Stdio};
@@ -1238,12 +1320,18 @@ fn spawn_agent(
         .arg(&params.ip)
         .arg(params.port.to_string())
         .arg("--name")
-        .arg(name)
-        .arg("--provider")
-        .arg("ollama")
-        .arg("--model")
-        .arg(model)
-        .stdin(Stdio::null())
+        .arg(name);
+    // A profile carries its own provider/model/endpoint from models.toml;
+    // otherwise summon a local Ollama model by tag.
+    match profile {
+        Some(p) => {
+            cmd.arg("--profile").arg(p);
+        }
+        None => {
+            cmd.arg("--provider").arg("ollama").arg("--model").arg(model);
+        }
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     if !password.is_empty() {

@@ -42,6 +42,8 @@ Encrypted chat that runs in your terminal. You host the server, you control the 
 | `hh/` | The Rust `ratatui` client (the flagship) |
 | `cmd_chat/`, `cmd_chat.py` | The Python (Sanic) server + legacy Python client |
 | `cmd_chat/agent/` | The model-agnostic AI agent bridge (joins a room as an encrypted client) |
+| `models.toml` | Named provider profiles for `/ai start <profile>` (see `docs/providers.md`) |
+| `docs/providers.md` | Connect any model — profiles, flags, discovery, bring-your-own-provider |
 | `hh/lets-hack.sh` | Spin up a local test "clergy" in tmux (server + N client panes) |
 | `bootstrap-ai.sh` | Optional: install Ollama + pull a model for the local `/ai` agent |
 | `hh/direnv-autostart/` | `cd` into a directory to auto-launch a session (direnv) |
@@ -144,9 +146,11 @@ Type to chat. Slash commands and keys:
 | `/theme [name]` | Switch vestments, or list them |
 | `/send <path>` | Offer a file (or directory) to the room |
 | `/accept` · `/reject` | Respond to a pending file offer |
-| `/ai start [model]` | Summon a local AI agent (default `ollama/qwen2.5:3b`) |
+| `/ai start [model\|profile]` | Summon a local AI agent (default `ollama/qwen2.5:3b`; a bare name is a `models.toml` profile) |
 | `/ai stop` | Dismiss the agent you summoned |
 | `/ai <question>` | Ask the agent (`/ai <name> <question>` if several present) |
+| `/ai list` | List the agents present (or hint to `/ai start` if none) |
+| `/ai models` | Models the active agent can serve — or, with no agent, your local Ollama tags |
 | `/sbx launch [local\|docker\|multipass] [image]` | Summon the shared sandbox |
 | `/sbx stop` | Tear down the sandbox you host |
 | `/drive` · `F2` | Take the shared shell (`Esc` releases) |
@@ -224,6 +228,16 @@ when you quit). Pick a model at summon time with `/ai start <model>`.
   endpoint (OpenAI, Groq, Together, local vLLM…), plus a `module:Class` hook for
   your own. Cloud providers are opt-in and read their API key from the agent's
   environment — never the room.
+- **Named profiles.** Register a backend once in `models.toml` and summon it by
+  name: `/ai start groq-llama`. Profiles store `api_key_env` (the *name* of an
+  env var, never the key), so the file is safe to commit. See the full
+  [provider guide](docs/providers.md) — profiles, explicit flags, discovery, and
+  bring-your-own-provider.
+- **Discoverable.** `/ai list` shows who's present and `/ai models` shows what
+  the active agent can serve (active model bracketed). With no agent running,
+  `/ai models` still probes your local Ollama so you can see what's pullable
+  before summoning. By hand, `--list-models` enumerates a backend and `--check`
+  preflights it (exit 0/1) without joining a room.
 - **End-to-end like everything else.** Replies are encrypted client-side; the
   server still only ever relays ciphertext.
 
