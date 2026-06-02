@@ -107,6 +107,9 @@ pub struct SbxView {
     pub backend: String,
 }
 
+/// Display handle the summoned Python agent joins under (see `spawn_agent`).
+const AGENT_NAME: &str = "oracle";
+
 pub struct App {
     pub me: String,
     pub lines: Vec<ChatLine>,
@@ -140,6 +143,10 @@ pub struct App {
     pub ai_typing: std::collections::HashSet<String>,
     /// Monotonic tick counter used to animate the AI spinner.
     pub spin: usize,
+    /// When set, agents we summon are auto-granted sandbox drive on each launch
+    /// (`/ai start <name> allow`). Re-applied in the broker Ready handler, since
+    /// launching a sandbox resets the ACL back to just the owner.
+    pub agent_sbx_allow: bool,
 }
 
 impl App {
@@ -167,6 +174,7 @@ impl App {
             password: String::new(),
             ai_typing: std::collections::HashSet::new(),
             spin: 0,
+            agent_sbx_allow: false,
         }
     }
 
@@ -600,6 +608,24 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             break Ok(());
                         }
                         if k.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(k.code, KeyCode::Char('x'))
+                        {
+                            // Panic kill switch (sandbox owner): revoke every
+                            // non-owner driver, interrupt whatever is running in
+                            // the PTY, and re-broadcast the locked-down ACL. Cuts a
+                            // runaway agent (or human) off mid-command.
+                            if let Some(sb) = &mut broker {
+                                let owner = app.me.clone();
+                                app.drivers.retain(|u| *u == owner);
+                                app.sudoers.retain(|u| *u == owner);
+                                app.agent_sbx_allow = false;
+                                let _ = sb.write_input(&[0x03]); // Ctrl-C into the shell
+                                broadcast_acl(&out_tx, &session.room, &app);
+                                app.sys("⛧ kill switch — revoked all drive + interrupted the shell");
+                            } else {
+                                app.sys("kill switch is for the sandbox owner (you don't hold the PTY)");
+                            }
+                        } else if k.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(k.code, KeyCode::Char('r'))
                             && !app.connected
                         {
@@ -766,6 +792,17 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             }
                         }
                         Net::SbxStatus { .. } if broker.is_some() => {}
+                        ev @ Net::Joined(_) => {
+                            // A late joiner (e.g. a just-summoned agent) missed any
+                            // ACL broadcast sent before they connected. If we host the
+                            // sandbox, re-broadcast so their local grant state syncs —
+                            // this is what makes `/ai start <m> allow` actually reach
+                            // the agent.
+                            if broker.is_some() {
+                                broadcast_acl(&out_tx, &session.room, &app);
+                            }
+                            app.apply(ev);
+                        }
                         other => app.apply(other),
                     }
                 }
@@ -788,6 +825,10 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                         app.drivers.insert(app.me.clone());
                         app.sudoers.clear();
                         app.sudoers.insert(app.me.clone()); // owner = superuser
+                        if app.agent_sbx_allow {
+                            // Re-apply a `/ai start … allow` grant the launch reset.
+                            app.drivers.insert(AGENT_NAME.to_string());
+                        }
                         send_frame(&out_tx, &session.room, json!({
                             "_sbx":"status","state":"ready","backend": backend.label(), "rows": rows, "cols": cols
                         }));
@@ -1170,6 +1211,12 @@ fn handle_command(
             let _ = child.kill();
             let _ = child.wait();
             app.sys("⛧ dismissed the AI agent");
+            // Drop any sandbox drive the agent held so a dead handle can't act.
+            app.agent_sbx_allow = false;
+            let revoked = app.drivers.remove(AGENT_NAME) | app.sudoers.remove(AGENT_NAME);
+            if revoked && app.sandbox.is_some() {
+                broadcast_acl(out_tx, room, app);
+            }
         } else {
             app.sys("no AI agent was started from this client");
         }
@@ -1187,20 +1234,32 @@ fn handle_command(
         if agent.is_some() {
             app.sys("an AI agent is already running from this client — /ai stop first");
         } else {
-            let arg = rest.trim();
+            // A trailing `allow` flag auto-grants the agent sandbox drive on launch.
+            let raw = rest.trim();
+            let (raw, grant_sbx) = match raw.strip_suffix("allow") {
+                Some(head) if head.is_empty() || head.ends_with(' ') => (head.trim(), true),
+                _ => (raw, false),
+            };
+            // Tolerate a leading agent-name token (`/ai start oracle allow`):
+            // there's only one agent, so treat it as addressing, not a profile.
+            let raw = match raw.strip_prefix(AGENT_NAME) {
+                Some(rest) if rest.is_empty() || rest.starts_with(' ') => rest.trim(),
+                _ => raw,
+            };
             // A bare name (no ':' tag, no '/' path) is a models.toml profile;
             // anything else is treated as a literal Ollama model tag.
-            let (profile, model): (Option<&str>, &str) = if arg.is_empty() {
+            let (profile, model): (Option<&str>, &str) = if raw.is_empty() {
                 (None, "qwen2.5:3b")
-            } else if arg.contains(':') || arg.contains('/') {
-                (None, arg)
+            } else if raw.contains(':') || raw.contains('/') {
+                (None, raw)
             } else {
-                (Some(arg), arg)
+                (Some(raw), raw)
             };
-            let name = "oracle";
+            let name = AGENT_NAME;
             match spawn_agent(params, &app.password, name, profile, model) {
                 Ok(child) => {
                     *agent = Some(child);
+                    app.agent_sbx_allow = grant_sbx;
                     let desc = match profile {
                         Some(p) => format!("profile {p}"),
                         None => format!("ollama/{model}"),
@@ -1208,6 +1267,17 @@ fn handle_command(
                     app.sys(format!(
                         "⛧ summoning {name} ({desc})… it will announce when online"
                     ));
+                    if grant_sbx {
+                        // Grant now if a sandbox is already running; otherwise the
+                        // Ready handler applies it when one launches.
+                        if app.sandbox.is_some() && app.owner.as_deref() == Some(app.me.as_str()) {
+                            app.drivers.insert(name.to_string());
+                            broadcast_acl(out_tx, room, app);
+                        }
+                        app.sys(format!(
+                            "⛧ {name} will get sandbox drive — Ctrl-X kills all drive in a pinch"
+                        ));
+                    }
                 }
                 Err(e) => app.err(format!("/ai start failed: {e}")),
             }
