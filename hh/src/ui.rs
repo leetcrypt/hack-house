@@ -45,7 +45,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     draw_input(f, rows[2], app, theme);
 
     if app.show_help {
-        draw_help(f, f.area(), theme);
+        draw_help(f, f.area(), theme, app.help_scroll);
     }
     if let Some(msg) = &app.error {
         draw_error(f, f.area(), theme, msg);
@@ -106,7 +106,30 @@ fn centered(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     .split(col)[1]
 }
 
-fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
+// Popup geometry — shared by the renderer and the scroll-clamp helper so the two
+// always agree on how many rows are visible.
+const HELP_PCT_X: u16 = 78;
+const HELP_PCT_Y: u16 = 90;
+fn help_popup(area: Rect) -> Rect {
+    centered(HELP_PCT_X, HELP_PCT_Y, area)
+}
+
+/// Largest vertical scroll offset for the help overlay given the full terminal
+/// area: total wrapped content rows minus the visible viewport (0 if it all fits).
+pub fn help_max_scroll(width: u16, height: u16, theme: &Theme) -> u16 {
+    let w = help_popup(Rect::new(0, 0, width, height));
+    let inner_w = w.width.saturating_sub(2);
+    let inner_h = w.height.saturating_sub(2);
+    if inner_w == 0 {
+        return 0;
+    }
+    let total = Paragraph::new(help_lines(theme))
+        .wrap(Wrap { trim: false })
+        .line_count(inner_w) as u16;
+    total.saturating_sub(inner_h)
+}
+
+fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
     let acc = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
@@ -118,9 +141,15 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
             Span::styled(v.to_string(), dim),
         ])
     };
-    let sig = &theme.sigil;
+    let sig = theme.sigil.clone();
     let head = |s: &str| Line::from(Span::styled(format!("{sig} {s}"), acc));
-    let lines = vec![
+    // List whatever vestments are actually installed, so new themes show up here
+    // automatically (church · neon · crypt · blush · matrix · wraith · …).
+    let theme_help = format!(
+        "change vestments live: {}",
+        Theme::available().join(" · ")
+    );
+    vec![
         head("COMMANDS (type in the input bar)"),
         kv(
             "/sbx launch [backend]",
@@ -158,10 +187,7 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         kv("/send <file>", "offer a file to the room"),
         kv("/sendd <dir>", "offer a directory (sent as a tar)"),
         kv("/accept  ·  /reject", "respond to an incoming file offer"),
-        kv(
-            "/theme [name]",
-            "change vestments live: church | neon | crypt",
-        ),
+        kv("/theme [name]", &theme_help),
         kv("/pw", "show this room's password (local only)"),
         kv("/help", "show / hide this menu"),
         Line::from(""),
@@ -192,27 +218,42 @@ fn draw_help(f: &mut Frame, area: Rect, theme: &Theme) {
         ),
         Line::from(""),
         Line::from(Span::styled(
-            "  malware bless · press any key to close",
+            "  malware bless · ↑/↓ · PgUp/PgDn scroll · Esc closes",
             Style::default()
                 .fg(theme.dim)
                 .add_modifier(Modifier::ITALIC),
         )),
-    ];
-    let w = centered(78, 90, area);
+    ]
+}
+
+fn draw_help(f: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
+    let w = help_popup(area);
+    let inner_w = w.width.saturating_sub(2);
+    let inner_h = w.height.saturating_sub(2);
+    let para = Paragraph::new(help_lines(theme)).wrap(Wrap { trim: false });
+    // Clamp so you can never scroll past the last line; show a hint when there's
+    // more below the fold.
+    let max = (para.line_count(inner_w) as u16).saturating_sub(inner_h);
+    let off = scroll.min(max);
+    let title = if max == 0 {
+        format!(" {0} hack-house — help {0} ", theme.sigil)
+    } else {
+        format!(" {0} hack-house — help {0}  ({off}/{max} ▼) ", theme.sigil)
+    };
     f.render_widget(Clear, w);
-    let help = Paragraph::new(lines)
+    let help = para
         .style(Style::default().bg(theme.bg)) // fill the popup with the theme surface
         .block(
             Block::bordered()
                 .border_style(Style::default().fg(theme.accent))
                 .title(Span::styled(
-                    format!(" {0} hack-house — help {0} ", theme.sigil),
+                    title,
                     Style::default()
                         .fg(theme.title)
                         .add_modifier(Modifier::BOLD),
                 )),
         )
-        .wrap(Wrap { trim: false });
+        .scroll((off, 0));
     f.render_widget(help, w);
 }
 

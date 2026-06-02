@@ -1,0 +1,14 @@
+# wraith — goth cyberpunk: blood & violet bleeding through obsidian
+name = "wraith"
+bg = "#0b0710"          # obsidian with a violet bruise
+border = "#5a2a4a"      # dark wine chrome
+title = "#e6d2ff"       # pale violet bone
+accent = "#b026ff"      # electric amethyst — ⸸ glyph, prompt
+dim = "#6a4a66"         # ashen mauve timestamps
+me = "#ff2b5e"          # your messages — arterial red
+other = "#9d4edd"       # others' messages — necro violet
+system = "#ff4f9a"      # system lines — toxic magenta
+input = "#ff2b5e"
+roster_me = "#ff1744"   # you — blood crimson
+roster_width = 22
+sigil = "⸸"             # inverted-cross dagger

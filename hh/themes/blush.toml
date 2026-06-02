@@ -1,0 +1,14 @@
+# blush — soft femme: rose & lavender ink on a warm plum dusk
+name = "blush"
+bg = "#241622"          # warm deep-plum surface (not pure black)
+border = "#a76a8f"      # dusty mauve chrome
+title = "#ffd9ec"       # pale blossom
+accent = "#ff7fcf"      # bubblegum pink — ❀ glyph, prompt
+dim = "#9a7088"         # muted rose-grey timestamps
+me = "#ff9ed8"          # your messages — soft pink
+other = "#c89bff"       # others' messages — lavender
+system = "#ffb3d9"      # system lines — petal pink
+input = "#ff9ed8"
+roster_me = "#ff5fb0"   # you — vivid rose
+roster_width = 22
+sigil = "❀"             # blossom
