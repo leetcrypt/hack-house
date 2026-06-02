@@ -33,7 +33,8 @@ enum Cmd {
     Connect {
         ip: String,
         port: u16,
-        user: String,
+        /// Display name (handle) to join as. Omit to be prompted on join.
+        user: Option<String>,
         #[arg(long)]
         password: String,
         #[arg(long, default_value_t = false)]
@@ -86,11 +87,28 @@ fn main() -> Result<()> {
             insecure,
             theme,
         } => {
-            let session = net::authenticate(&ip, port, &user, &password, no_tls, insecure)?;
+            // Pick a handle and authenticate. If no name was given on the CLI,
+            // prompt for one as the first thing on join — and re-prompt if the
+            // server rejects it (e.g. the name is already taken in the room).
+            let interactive = user.is_none();
+            let mut name = match user {
+                Some(u) => u,
+                None => prompt_handle()?,
+            };
+            let session = loop {
+                match net::authenticate(&ip, port, &name, &password, no_tls, insecure) {
+                    Ok(s) => break s,
+                    Err(e) if interactive => {
+                        eprintln!("✖ {e:#}\n  that handle didn't work (taken or full?) — pick another.");
+                        name = prompt_handle()?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
             let params = net::ConnParams {
                 ip,
                 port,
-                user,
+                user: name,
                 password,
                 no_tls,
                 insecure,
@@ -142,6 +160,25 @@ fn main() -> Result<()> {
             no_tls,
             insecure,
         } => handshake(&ip, port, &user, &password, no_tls, insecure),
+    }
+}
+
+/// Prompt for a display name on stdin before the TUI starts. Loops until a
+/// non-empty handle is entered; errors only if stdin closes (EOF).
+fn prompt_handle() -> Result<String> {
+    use std::io::Write;
+    loop {
+        print!("⛧ choose your handle: ");
+        std::io::stdout().flush()?;
+        let mut s = String::new();
+        if std::io::stdin().read_line(&mut s)? == 0 {
+            anyhow::bail!("no handle entered (stdin closed)");
+        }
+        let name = s.trim();
+        if !name.is_empty() {
+            return Ok(name.to_string());
+        }
+        eprintln!("a handle can't be empty.");
     }
 }
 
