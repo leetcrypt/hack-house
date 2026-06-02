@@ -739,25 +739,35 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                 }
             }
             net = rx.recv() => {
-                match net {
-                    Some(Net::SbxInput { from, bytes }) => {
-                        if let Some(sb) = &mut broker {
-                            if app.drivers.contains(&from) {
-                                let _ = sb.write_input(&bytes);
+                // Drain a burst of incoming frames per turn. The reader funnels both
+                // chat and high-volume `_sbx:data` terminal output through this one
+                // channel, and the loop redraws once per turn — so handling a single
+                // frame per redraw lets a busy sandbox stream bury chat arbitrarily far
+                // back in the queue. Pulling up to a cap of ready frames now keeps chat
+                // latency bounded no matter how hard the shared shell is scrolling.
+                let Some(first) = net else { break Ok(()) };
+                let mut burst = vec![first];
+                drain_ready(&mut rx, &mut burst, 256);
+                for ev in burst {
+                    match ev {
+                        Net::SbxInput { from, bytes } => {
+                            if let Some(sb) = &mut broker {
+                                if app.drivers.contains(&from) {
+                                    let _ = sb.write_input(&bytes);
+                                }
                             }
                         }
-                    }
-                    Some(Net::Ft(f)) => handle_ft(f, &mut app, &mut active_send, &out_tx, &session.room, &downloads),
-                    // The broker renders its sandbox locally from the PTY, so it
-                    // ignores its own echoed status/data; everyone else uses them.
-                    Some(Net::SbxData(b)) => {
-                        if broker.is_none() {
-                            if let Some(v) = &mut app.sandbox { v.parser.process(&b); }
+                        Net::Ft(f) => handle_ft(f, &mut app, &mut active_send, &out_tx, &session.room, &downloads),
+                        // The broker renders its sandbox locally from the PTY, so it
+                        // ignores its own echoed status/data; everyone else uses them.
+                        Net::SbxData(b) => {
+                            if broker.is_none() {
+                                if let Some(v) = &mut app.sandbox { v.parser.process(&b); }
+                            }
                         }
+                        Net::SbxStatus { .. } if broker.is_some() => {}
+                        other => app.apply(other),
                     }
-                    Some(Net::SbxStatus { .. }) if broker.is_some() => {}
-                    Some(n) => app.apply(n),
-                    None => break Ok(()),
                 }
             }
             msg = broker_rx.recv() => {
@@ -901,6 +911,19 @@ async fn writer_task(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Pull up to `cap` *already-ready* items out of `rx` (without awaiting) in FIFO
+/// order, appending to `buf`. The UI loop uses this to drain a burst of incoming
+/// frames per turn so a high-volume `_sbx:data` stream can't bury chat behind a
+/// one-frame-per-redraw cap.
+fn drain_ready<T>(rx: &mut UnboundedReceiver<T>, buf: &mut Vec<T>, cap: usize) {
+    while buf.len() < cap {
+        match rx.try_recv() {
+            Ok(m) => buf.push(m),
+            Err(_) => break, // empty or disconnected — nothing more to take right now
         }
     }
 }
@@ -1398,4 +1421,66 @@ fn spawn_agent(
     }
     cmd.spawn()
         .map_err(|e| format!("could not start agent ({}): {e}", program.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drain_ready;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    /// `drain_ready` pulls a bounded burst in FIFO order and stops at the cap.
+    #[tokio::test]
+    async fn drain_ready_is_fifo_and_capped() {
+        let (tx, mut rx) = unbounded_channel::<u32>();
+        for i in 0..1000 {
+            tx.send(i).unwrap();
+        }
+        // Mimic the loop: one awaited frame, then drain the ready burst.
+        let first = rx.recv().await.unwrap();
+        let mut buf = vec![first];
+        drain_ready(&mut rx, &mut buf, 256);
+        assert_eq!(buf.len(), 256, "burst must be capped");
+        assert_eq!(buf, (0..256).collect::<Vec<_>>(), "burst must stay FIFO");
+    }
+
+    /// An empty channel leaves the buffer untouched (no spurious items, no hang).
+    #[tokio::test]
+    async fn drain_ready_on_empty_is_a_noop() {
+        let (tx, mut rx) = unbounded_channel::<u32>();
+        tx.send(7).unwrap();
+        let first = rx.recv().await.unwrap();
+        let mut buf = vec![first];
+        drain_ready(&mut rx, &mut buf, 256);
+        assert_eq!(buf, vec![7]);
+    }
+
+    /// Regression for the "starting a sandbox stalls chat" bug: chat and a flood of
+    /// `_sbx:data` frames share one channel. Handling one frame per redraw would let
+    /// chat fall ~800 turns behind; batch draining must surface it within
+    /// ceil(801 / 256) = 4 turns no matter how hard the shell is scrolling.
+    #[tokio::test]
+    async fn chat_surfaces_promptly_under_sbx_flood() {
+        let (tx, mut rx) = unbounded_channel::<&'static str>();
+        for _ in 0..800 {
+            tx.send("sbx").unwrap();
+        }
+        tx.send("CHAT").unwrap();
+        for _ in 0..800 {
+            tx.send("sbx").unwrap();
+        }
+
+        let mut turns = 0usize;
+        let mut saw_chat = false;
+        while let Ok(first) = rx.try_recv() {
+            let mut burst = vec![first];
+            drain_ready(&mut rx, &mut burst, 256);
+            turns += 1;
+            if burst.contains(&"CHAT") {
+                saw_chat = true;
+                break;
+            }
+        }
+        assert!(saw_chat, "chat frame must be observed");
+        assert!(turns <= 4, "chat took {turns} turns to surface (expected <= 4)");
+    }
 }
