@@ -161,8 +161,10 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
             title: "AI AGENTS",
             items: vec![
                 kv("/ai start [model|profile]", "spawn an agent (ollama tag or models.toml profile)"),
+                kv("/ai start <model> allow", "spawn + auto-grant the agent sandbox drive"),
                 kv("/ai stop", "dismiss the agent you started"),
                 kv("/ai <question>", "ask an agent in the room (/ai <name> <q> if many)"),
+                kv("/ai <name> !<task>", "have a granted agent run a task in the sandbox"),
                 kv("/ai list", "list AI agents present + their provider/model"),
                 kv("/ai models", "show models the active agent's backend can serve"),
             ],
@@ -170,10 +172,11 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
         HelpCluster {
             title: "PERMISSIONS (owner)",
             items: vec![
-                kv("/grant <user>", "let a member drive the shell"),
-                kv("/revoke <user>", "take back drive permission"),
+                kv("/grant <user|agent>", "let a member OR an AI agent drive the shell"),
+                kv("/revoke <user|agent>", "take back sandbox drive permission"),
                 kv("/sudo <user>", "delegate VM superuser (real sudo)"),
                 kv("/unsudo <user>", "revoke VM superuser"),
+                kv("/ai start <name> allow", "shortcut: grant the agent drive at spawn"),
             ],
         },
         HelpCluster {
