@@ -45,7 +45,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     draw_input(f, rows[2], app, theme);
 
     if app.show_help {
-        draw_help(f, f.area(), theme, app.help_scroll);
+        draw_help(f, f.area(), app, theme);
     }
     if let Some(msg) = &app.error {
         draw_error(f, f.area(), theme, msg);
@@ -116,33 +116,29 @@ fn help_popup(area: Rect) -> Rect {
 
 /// Largest vertical scroll offset for the help overlay given the full terminal
 /// area: total wrapped content rows minus the visible viewport (0 if it all fits).
-pub fn help_max_scroll(width: u16, height: u16, theme: &Theme) -> u16 {
+pub fn help_max_scroll(width: u16, height: u16, app: &App, theme: &Theme) -> u16 {
     let w = help_popup(Rect::new(0, 0, width, height));
     let inner_w = w.width.saturating_sub(2);
     let inner_h = w.height.saturating_sub(2);
     if inner_w == 0 {
         return 0;
     }
-    let total = Paragraph::new(help_lines(theme))
+    let total = Paragraph::new(help_render_lines(app, theme))
         .wrap(Wrap { trim: false })
         .line_count(inner_w) as u16;
     total.saturating_sub(inner_h)
 }
 
-fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
-    let acc = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let key = Style::default().fg(theme.title);
-    let dim = Style::default().fg(theme.system);
-    let kv = |k: &str, v: &str| {
-        Line::from(vec![
-            Span::styled(format!("  {k:<26}"), key),
-            Span::styled(v.to_string(), dim),
-        ])
-    };
-    let sig = theme.sigil.clone();
-    let head = |s: &str| Line::from(Span::styled(format!("{sig} {s}"), acc));
+/// One named, collapsible group of help entries.
+struct HelpCluster {
+    title: &'static str,
+    items: Vec<(String, String)>,
+}
+
+/// The help content, grouped into topical clusters. Order here is the order the
+/// up/down highlight walks through.
+fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
+    let kv = |k: &str, v: &str| (k.to_string(), v.to_string());
     // List whatever vestments are actually installed, so new themes show up here
     // automatically (church · neon · crypt · blush · matrix · wraith · …).
     let theme_help = format!(
@@ -150,95 +146,126 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         Theme::available().join(" · ")
     );
     vec![
-        head("COMMANDS (type in the input bar)"),
-        kv(
-            "/sbx launch [backend]",
-            "summon a sandbox: local | docker | multipass",
-        ),
-        kv("/sbx stop", "tear down the sandbox (purges the VM)"),
-        kv("/drive", "type into the shared shell  (Esc releases)"),
-        kv(
-            "/ai start [model|profile]",
-            "spawn an AI agent  (ollama model tag, or a models.toml profile)",
-        ),
-        kv("/ai stop", "dismiss the agent you started"),
-        kv(
-            "/ai <question>",
-            "ask an AI agent in the room (/ai <name> <q> if many)",
-        ),
-        kv("/ai list", "list AI agents present + their provider/model"),
-        kv("/ai models", "show models the active agent's backend can serve"),
-        kv(
-            "/grant <user>",
-            "let a member drive the shell        (owner)",
-        ),
-        kv(
-            "/revoke <user>",
-            "take back drive permission          (owner)",
-        ),
-        kv(
-            "/sudo <user>",
-            "delegate VM superuser (real sudo)   (owner)",
-        ),
-        kv(
-            "/unsudo <user>",
-            "revoke VM superuser                 (owner)",
-        ),
-        kv("/send <file>", "offer a file to the room"),
-        kv("/sendd <dir>", "offer a directory (sent as a tar)"),
-        kv("/accept  ·  /reject", "respond to an incoming file offer"),
-        kv("/theme [name]", &theme_help),
-        kv("/pw", "show this room's password (local only)"),
-        kv("/help", "show / hide this menu"),
-        Line::from(""),
-        head("KEYS"),
-        kv("Enter", "send chat message"),
-        kv("F1  ·  /help", "toggle this help (any key closes it)"),
-        kv("F2  ·  /drive", "take the shell  ·  Esc releases it"),
-        kv("Ctrl-C  (while driving)", "interrupt the running command"),
-        kv("PgUp / PgDn", "scroll chat  ·  Home/End = oldest/live"),
-        kv(
-            "PgUp / PgDn  (driving)",
-            "scroll the sandbox terminal's scrollback",
-        ),
-        kv(
-            "Up / Down  ·  wheel",
-            "scroll the sandbox terminal (mouse works while driving)",
-        ),
-        kv(
-            "Ctrl-R  (when closed)",
-            "reconnect to the house after a drop / AFK",
-        ),
-        kv(
-            "Ctrl+Alt+P  ·  /theme random",
-            "conjure a random vestment (new palette + sigil)",
-        ),
-        kv(
-            "/theme save [name]",
-            "keep the vestment you're wearing for reuse",
-        ),
-        kv("Ctrl-C  ·  Ctrl-Q", "quit hack-house"),
-        Line::from(""),
-        head("ROSTER GLYPHS"),
-        kv(
-            &format!("{} owner   ⚡ sudoer", theme.sigil),
-            "◆ may drive    • member",
-        ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  malware bless · ↑/↓ · PgUp/PgDn scroll · Esc closes",
-            Style::default()
-                .fg(theme.dim)
-                .add_modifier(Modifier::ITALIC),
-        )),
+        HelpCluster {
+            title: "SANDBOX",
+            items: vec![
+                kv("/sbx launch [backend]", "summon a sandbox: local | docker | multipass"),
+                kv("/sbx stop", "tear down the sandbox (purges the VM)"),
+                kv("/sbx save [label]", "snapshot state (docker image; survives stop)"),
+                kv("/sbx load <label>", "launch a fresh sandbox from a saved snapshot"),
+                kv("/sbx snaps", "list saved snapshots"),
+                kv("/drive  ·  F2", "type into the shared shell  (Esc releases)"),
+            ],
+        },
+        HelpCluster {
+            title: "AI AGENTS",
+            items: vec![
+                kv("/ai start [model|profile]", "spawn an agent (ollama tag or models.toml profile)"),
+                kv("/ai stop", "dismiss the agent you started"),
+                kv("/ai <question>", "ask an agent in the room (/ai <name> <q> if many)"),
+                kv("/ai list", "list AI agents present + their provider/model"),
+                kv("/ai models", "show models the active agent's backend can serve"),
+            ],
+        },
+        HelpCluster {
+            title: "PERMISSIONS (owner)",
+            items: vec![
+                kv("/grant <user>", "let a member drive the shell"),
+                kv("/revoke <user>", "take back drive permission"),
+                kv("/sudo <user>", "delegate VM superuser (real sudo)"),
+                kv("/unsudo <user>", "revoke VM superuser"),
+            ],
+        },
+        HelpCluster {
+            title: "FILES",
+            items: vec![
+                kv("/send <file>", "offer a file to the room"),
+                kv("/sendd <dir>", "offer a directory (sent as a tar)"),
+                kv("/accept  ·  /reject", "respond to an incoming file offer"),
+            ],
+        },
+        HelpCluster {
+            title: "APPEARANCE",
+            items: vec![
+                kv("/theme [name]", &theme_help),
+                kv("/theme save [name]", "keep the vestment you're wearing for reuse"),
+                kv("Ctrl+Alt+P  ·  /theme random", "conjure a random vestment (palette + sigil)"),
+            ],
+        },
+        HelpCluster {
+            title: "KEYS",
+            items: vec![
+                kv("Enter", "send chat message"),
+                kv("F1  ·  /help", "toggle this help"),
+                kv("Ctrl-C  (while driving)", "interrupt the running command"),
+                kv("PgUp / PgDn", "scroll chat  ·  Home/End = oldest/live"),
+                kv("PgUp / PgDn  (driving)", "scroll the sandbox terminal's scrollback"),
+                kv("Up / Down  ·  wheel", "scroll the sandbox terminal (mouse works while driving)"),
+                kv("Ctrl-R  (when closed)", "reconnect to the house after a drop / AFK"),
+                kv("/pw", "show this room's password (local only)"),
+                kv("Ctrl-C  ·  Ctrl-Q", "quit hack-house"),
+            ],
+        },
+        HelpCluster {
+            title: "ROSTER GLYPHS",
+            items: vec![kv(
+                &format!("{} owner   ⚡ sudoer", theme.sigil),
+                "◆ may drive    • member",
+            )],
+        },
     ]
 }
 
-fn draw_help(f: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
+/// Number of help clusters — used to size/clamp the navigation state.
+pub fn help_cluster_count(theme: &Theme) -> usize {
+    help_clusters(theme).len()
+}
+
+/// Flatten the clusters into rendered lines given the current collapse state and
+/// highlighted cluster. Shared by `draw_help` and `help_max_scroll` so the
+/// scroll math always matches what's painted.
+fn help_render_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
+    let clusters = help_clusters(theme);
+    let acc = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let sel = Style::default()
+        .fg(theme.bg)
+        .bg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let key = Style::default().fg(theme.title);
+    let dim = Style::default().fg(theme.system);
+    let sig = theme.sigil.clone();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, c) in clusters.iter().enumerate() {
+        let expanded = app.help_expanded.get(i).copied().unwrap_or(false);
+        let marker = if expanded { "▾" } else { "▸" };
+        let style = if i == app.help_selected { sel } else { acc };
+        lines.push(Line::from(Span::styled(
+            format!("{sig} {marker} {}  ({})", c.title, c.items.len()),
+            style,
+        )));
+        if expanded {
+            for (k, v) in &c.items {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {k:<26}"), key),
+                    Span::styled(v.clone(), dim),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ select · ←/→ or Enter expand · PgUp/PgDn scroll · Esc closes",
+        Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+    )));
+    lines
+}
+
+fn draw_help(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let w = help_popup(area);
     let inner_w = w.width.saturating_sub(2);
     let inner_h = w.height.saturating_sub(2);
-    let para = Paragraph::new(help_lines(theme)).wrap(Wrap { trim: false });
+    let scroll = app.help_scroll;
+    let para = Paragraph::new(help_render_lines(app, theme)).wrap(Wrap { trim: false });
     // Clamp so you can never scroll past the last line; show a hint when there's
     // more below the fold.
     let max = (para.line_count(inner_w) as u16).saturating_sub(inner_h);

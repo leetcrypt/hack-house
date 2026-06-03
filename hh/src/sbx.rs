@@ -189,6 +189,90 @@ pub fn teardown(backend: Backend, name: &str) {
     }
 }
 
+/// Local Docker image repo under which sandbox snapshots are committed
+/// (`hh-snap:<label>`). Owner-side only — never pushed anywhere.
+pub const SNAP_REPO: &str = "hh-snap";
+
+/// Snapshot the running sandbox's filesystem state to a named artifact on the
+/// owner's machine. Blocking — run off the UI thread.
+///
+/// - **Docker:** `docker commit` into `hh-snap:<label>` — instant, captures the
+///   live container (including provisioned users), and survives `/sbx stop`
+///   because the image is independent of the container.
+/// - **Multipass:** `multipass snapshot <name> --name <label>`. Multipass
+///   requires the instance be **stopped** first; if it isn't, multipass's own
+///   error is surfaced verbatim.
+/// - **Local:** no backing VM/container, so nothing to save.
+///
+/// Returns a short human description of what was written on success.
+pub fn save_state(backend: Backend, name: &str, label: &str) -> Result<String> {
+    match backend {
+        Backend::Docker => {
+            let tag = format!("{SNAP_REPO}:{label}");
+            let out = Command::new("docker")
+                .args(["commit", name, &tag])
+                .output()
+                .context("docker commit (is docker installed?)")?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                anyhow::bail!("docker commit failed: {}", err.lines().last().unwrap_or("").trim());
+            }
+            Ok(format!("image {tag}"))
+        }
+        Backend::Multipass => {
+            let out = Command::new("multipass")
+                .args(["snapshot", name, "--name", label])
+                .output()
+                .context("multipass snapshot (is multipass installed?)")?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                anyhow::bail!("multipass snapshot failed: {}", err.lines().last().unwrap_or("").trim());
+            }
+            Ok(format!("snapshot {name}.{label}"))
+        }
+        Backend::Local => {
+            anyhow::bail!("the local shell has no VM state to save — launch a docker or multipass sandbox first")
+        }
+    }
+}
+
+/// List saved snapshot labels for a backend (Docker image tags under
+/// `hh-snap`, or multipass snapshots of the instance). Blocking.
+pub fn list_snapshots(backend: Backend, name: &str) -> Result<Vec<String>> {
+    match backend {
+        Backend::Docker => {
+            let out = Command::new("docker")
+                .args(["images", SNAP_REPO, "--format", "{{.Tag}}"])
+                .output()
+                .context("docker images")?;
+            Ok(String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "<none>")
+                .map(str::to_string)
+                .collect())
+        }
+        Backend::Multipass => {
+            // `multipass list --snapshots` columns: Instance Snapshot Parent Comment.
+            let out = Command::new("multipass")
+                .args(["list", "--snapshots"])
+                .output()
+                .context("multipass list --snapshots")?;
+            Ok(String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .skip(1) // header row
+                .filter_map(|l| {
+                    let mut cols = l.split_whitespace();
+                    let inst = cols.next()?;
+                    let snap = cols.next()?;
+                    (inst == name).then(|| snap.to_string())
+                })
+                .collect())
+        }
+        Backend::Local => Ok(Vec::new()),
+    }
+}
+
 /// Build the shell command for a backend, running as unix user `run_user`
 /// (empty = backend default). The container/VM is already up (see `prepare`).
 fn command_for(backend: Backend, name: &str, run_user: &str) -> CommandBuilder {

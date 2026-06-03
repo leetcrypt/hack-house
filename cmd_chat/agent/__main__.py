@@ -4,7 +4,7 @@ Examples
 --------
     # local Ollama (default, recommended)
     python -m cmd_chat.agent 127.0.0.1 3000 --name oracle \
-        --password hunter2 --model llama3 --no-tls
+        --password hunter2 --model qwen2.5:3b --no-tls
 
     # cloud, opt-in
     python -m cmd_chat.agent 127.0.0.1 3000 --name claude \

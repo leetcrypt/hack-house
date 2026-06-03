@@ -141,6 +141,11 @@ pub struct App {
     pub show_help: bool,
     /// Vertical scroll offset (rows) into the help overlay when it doesn't fit.
     pub help_scroll: u16,
+    /// Index of the currently highlighted help cluster (up/down moves it).
+    pub help_selected: usize,
+    /// Per-cluster expand/collapse state (left/right/Enter toggles); sized to the
+    /// cluster count when the overlay opens.
+    pub help_expanded: Vec<bool>,
     /// A reconnect handshake is in flight (Ctrl-R after a disconnect).
     pub reconnecting: bool,
     /// Transient error shown as a popup over the clergy (cleared on next keypress).
@@ -180,6 +185,8 @@ impl App {
             sbx_scroll: 0,
             show_help: false,
             help_scroll: 0,
+            help_selected: 0,
+            help_expanded: Vec::new(),
             reconnecting: false,
             error: None,
             password: String::new(),
@@ -219,6 +226,16 @@ impl App {
             text: text.into(),
             system: true,
         });
+    }
+
+    /// Open the help overlay fresh: first cluster highlighted, scrolled to top,
+    /// all clusters collapsed (the empty expand vec renders as all-collapsed and
+    /// is resized to the cluster count on the first navigation key).
+    fn open_help(&mut self) {
+        self.show_help = true;
+        self.help_scroll = 0;
+        self.help_selected = 0;
+        self.help_expanded.clear();
     }
 
     /// Surface an error: kept in chat scrollback for history AND shown as a
@@ -679,16 +696,42 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 });
                             }
                         } else if app.show_help {
-                            // While the help overlay is up, arrows / paging scroll it
-                            // (when it's taller than the screen); only Esc closes, so
-                            // stray keystrokes can't dismiss a menu you're still reading.
+                            // tmux-style nav: up/down highlight a cluster, left/right
+                            // (or Enter) collapse/expand it, PgUp/PgDn scroll the
+                            // overflow, only Esc closes so stray keys can't dismiss a
+                            // menu you're still reading.
+                            let count = ui::help_cluster_count(&theme);
                             let max = term
                                 .size()
-                                .map(|s| ui::help_max_scroll(s.width, s.height, &theme))
+                                .map(|s| ui::help_max_scroll(s.width, s.height, &app, &theme))
                                 .unwrap_or(0);
+                            // keep the expand state sized to the clusters
+                            if app.help_expanded.len() != count {
+                                app.help_expanded.resize(count, false);
+                            }
                             match k.code {
-                                KeyCode::Up => app.help_scroll = app.help_scroll.saturating_sub(1),
-                                KeyCode::Down => app.help_scroll = (app.help_scroll + 1).min(max),
+                                KeyCode::Up => {
+                                    app.help_selected = app.help_selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    app.help_selected =
+                                        (app.help_selected + 1).min(count.saturating_sub(1));
+                                }
+                                KeyCode::Left => {
+                                    if let Some(e) = app.help_expanded.get_mut(app.help_selected) {
+                                        *e = false; // collapse the highlighted cluster
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if let Some(e) = app.help_expanded.get_mut(app.help_selected) {
+                                        *e = true; // reveal the highlighted cluster
+                                    }
+                                }
+                                KeyCode::Enter | KeyCode::Char(' ') => {
+                                    if let Some(e) = app.help_expanded.get_mut(app.help_selected) {
+                                        *e = !*e; // toggle
+                                    }
+                                }
                                 KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
                                 KeyCode::PageDown => app.help_scroll = (app.help_scroll + 10).min(max),
                                 KeyCode::Home => app.help_scroll = 0,
@@ -699,9 +742,14 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 }
                                 _ => {} // ignore other keys so the menu stays put
                             }
+                            // clamp scroll in case collapsing shrank the content
+                            let max = term
+                                .size()
+                                .map(|s| ui::help_max_scroll(s.width, s.height, &app, &theme))
+                                .unwrap_or(0);
+                            app.help_scroll = app.help_scroll.min(max);
                         } else if k.code == KeyCode::F(1) {
-                            app.show_help = true;  // F1 from any mode
-                            app.help_scroll = 0;
+                            app.open_help(); // F1 from any mode
                         } else if k.code == KeyCode::F(2) {
                             if app.sandbox.is_none() {
                             } else if app.can_drive() {
@@ -1025,8 +1073,7 @@ fn handle_command(
 ) {
     let room = &session.room;
     if line == "/help" || line == "/?" {
-        app.show_help = true;
-        app.help_scroll = 0;
+        app.open_help();
     } else if line == "/pw" || line == "/password" {
         // Show the room password locally (never broadcast). Handy when the
         // server's password was autogenerated and you need to read it off / share
@@ -1194,7 +1241,73 @@ fn handle_command(
                     app.sys("you are not hosting a sandbox");
                 }
             }
-            _ => app.sys("usage: /sbx launch [local|docker|multipass] [image] | /sbx stop"),
+            Some("save") => {
+                let label = p.next().unwrap_or("snap").to_string();
+                if !is_snap_label(&label) {
+                    app.sys("snapshot label must be alphanumerics, '.', '_' or '-'");
+                } else if let Some((be, name)) = broker_meta.clone() {
+                    app.sys(format!("saving sandbox state as '{label}'…"));
+                    let (tx, lbl) = (app_tx.clone(), label.clone());
+                    tokio::spawn(async move {
+                        let res = tokio::task::spawn_blocking(move || sbx::save_state(be, &name, &label)).await;
+                        let _ = match res {
+                            Ok(Ok(desc)) => tx.send(Net::Sys(format!(
+                                "⛧ saved sandbox → {desc} · reload with `/sbx load {lbl}`"))),
+                            Ok(Err(e)) => tx.send(Net::Err(format!("save failed: {e}"))),
+                            Err(e) => tx.send(Net::Err(format!("save task: {e}"))),
+                        };
+                    });
+                } else {
+                    app.sys("only the sandbox host can /sbx save (launch one first)");
+                }
+            }
+            Some("load") => match p.next() {
+                None => app.sys("usage: /sbx load <label>  (a docker snapshot saved via /sbx save)"),
+                Some(label) if !is_snap_label(label) => {
+                    app.sys("snapshot label must be alphanumerics, '.', '_' or '-'");
+                }
+                Some(label) => {
+                    if app.sandbox.is_some() || broker.is_some() || *launching {
+                        app.sys("stop the current sandbox first (`/sbx stop`) before loading a snapshot");
+                    } else if !sbx::docker_daemon_up() {
+                        app.err("docker daemon is not running — `/sbx launch docker --start` once to boot it, then retry");
+                    } else {
+                        let image = format!("{}:{}", sbx::SNAP_REPO, label);
+                        let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
+                        let (rows, cols) = sbx_dims(sz.0, sz.1);
+                        *launching = true;
+                        let members: Vec<String> =
+                            app.users.iter().map(|u| u.username.clone()).collect();
+                        app.sys(format!("loading sandbox from {image}…"));
+                        spawn_launch(
+                            sbx::Backend::Docker, image, app.me.clone(), members, rows, cols,
+                            false, pty_tx.clone(), broker_tx.clone(), app_tx.clone(),
+                        );
+                    }
+                }
+            },
+            Some("snaps") | Some("snapshots") => {
+                let be = broker_meta
+                    .as_ref()
+                    .map(|(b, _)| *b)
+                    .unwrap_or(sbx::Backend::Docker);
+                let (tx, name) = (app_tx.clone(), SBX_NAME.to_string());
+                tokio::spawn(async move {
+                    let res = tokio::task::spawn_blocking(move || sbx::list_snapshots(be, &name)).await;
+                    let _ = match res {
+                        Ok(Ok(v)) if !v.is_empty() => {
+                            tx.send(Net::Sys(format!("saved snapshots: {}", v.join(", "))))
+                        }
+                        Ok(Ok(_)) => tx.send(Net::Sys(
+                            "no saved snapshots yet — `/sbx save [label]` to make one".into())),
+                        Ok(Err(e)) => tx.send(Net::Err(format!("snaps: {e}"))),
+                        Err(e) => tx.send(Net::Err(format!("snaps task: {e}"))),
+                    };
+                });
+            }
+            _ => app.sys(
+                "usage: /sbx launch [local|docker|multipass] [image] · stop · save [label] · load <label> · snaps",
+            ),
         }
     } else if let Some(rest) = line.strip_prefix("/unsudo") {
         let target = rest.trim();
@@ -1402,6 +1515,14 @@ fn local_ollama_models() -> Result<Vec<String>, String> {
         })
         .unwrap_or_default();
     Ok(models)
+}
+
+/// A safe snapshot label — compatible with both a Docker image tag and a
+/// multipass snapshot name (alphanumerics plus `.`, `_`, `-`).
+fn is_snap_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 #[allow(clippy::too_many_arguments)]
