@@ -1191,6 +1191,9 @@ fn handle_command(
                     let start_daemon = args
                         .iter()
                         .any(|a| matches!(*a, "--start" | "--start-daemon" | "-y"));
+                    // VirtualBox isn't a shared-PTY backend — a GUI VM (a Windows
+                    // guest especially) has no shell to relay. Steer to /sbx gui.
+                    let wants_vbox = args.iter().any(|a| matches!(*a, "virtualbox" | "vbox"));
                     let mut pos = args.iter().copied().filter(|a| !a.starts_with('-'));
                     let backend = pos
                         .next()
@@ -1201,7 +1204,11 @@ fn handle_command(
                         .map(str::to_string)
                         .unwrap_or_else(|| backend.default_image().to_string());
 
-                    if backend == sbx::Backend::Docker && !start_daemon && !sbx::docker_daemon_up()
+                    if wants_vbox {
+                        app.sys("VirtualBox VMs run locally in their own GUI — use `/sbx gui <vm>` (list them with `/sbx vms`)");
+                    } else if backend == sbx::Backend::Docker
+                        && !start_daemon
+                        && !sbx::docker_daemon_up()
                     {
                         app.err("docker daemon is not running — retry with `/sbx launch docker --start` to boot it (sudo), or run ./ensure-docker.sh in a terminal first");
                     } else {
@@ -1305,8 +1312,67 @@ fn handle_command(
                     };
                 });
             }
+            Some("vms") => {
+                let tx = app_tx.clone();
+                tokio::spawn(async move {
+                    let res = tokio::task::spawn_blocking(|| {
+                        let ver = sbx::vbox_version().ok_or_else(|| {
+                            "VirtualBox isn't installed — install it with `/sbx gui <vm> --install`, or run ./ensure-vbox.sh".to_string()
+                        })?;
+                        let vms = sbx::list_vms().map_err(|e| e.to_string())?;
+                        Ok::<_, String>((ver, vms))
+                    })
+                    .await;
+                    let _ = match res {
+                        Ok(Ok((ver, v))) if !v.is_empty() => tx.send(Net::Sys(format!(
+                            "VirtualBox {ver} detected · VMs: {}",
+                            v.join(", ")
+                        ))),
+                        Ok(Ok((ver, _))) => tx.send(Net::Sys(format!(
+                            "VirtualBox {ver} detected · no VMs registered"
+                        ))),
+                        Ok(Err(e)) => tx.send(Net::Err(e)),
+                        Err(e) => tx.send(Net::Err(format!("vms task: {e}"))),
+                    };
+                });
+            }
+            Some("gui") => {
+                let gargs: Vec<&str> = p.collect();
+                let install = gargs.iter().any(|a| *a == "--install");
+                let name = gargs
+                    .iter()
+                    .copied()
+                    .find(|a| !a.starts_with('-'))
+                    .map(str::to_string);
+                match name {
+                    None => app.sys("usage: /sbx gui <vm> [--install]   (list VMs with /sbx vms)"),
+                    Some(vm) => {
+                        app.sys(format!("launching {vm} in the VirtualBox GUI…"));
+                        let tx = app_tx.clone();
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(move || {
+                                if !sbx::vbox_installed() {
+                                    if install {
+                                        sbx::ensure_vbox_install()
+                                            .map_err(|e| format!("install failed: {e}"))?;
+                                    } else {
+                                        return Err("VirtualBox isn't installed — retry with `/sbx gui <vm> --install` (needs sudo), or run ./ensure-vbox.sh first".to_string());
+                                    }
+                                }
+                                sbx::gui_launch(&vm).map_err(|e| e.to_string())
+                            })
+                            .await;
+                            let _ = match res {
+                                Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
+                                Ok(Err(e)) => tx.send(Net::Err(e)),
+                                Err(e) => tx.send(Net::Err(format!("gui task: {e}"))),
+                            };
+                        });
+                    }
+                }
+            }
             _ => app.sys(
-                "usage: /sbx launch [local|docker|multipass] [image] · stop · save [label] · load <label> · snaps",
+                "usage: /sbx launch [local|docker|multipass] [image] · gui <vm> · vms · stop · save [label] · load <label> · snaps",
             ),
         }
     } else if let Some(rest) = line.strip_prefix("/unsudo") {

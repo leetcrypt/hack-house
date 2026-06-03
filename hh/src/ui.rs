@@ -154,6 +154,8 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                 kv("/sbx save [label]", "snapshot state (docker image; survives stop)"),
                 kv("/sbx load <label>", "launch a fresh sandbox from a saved snapshot"),
                 kv("/sbx snaps", "list saved snapshots"),
+                kv("/sbx vms", "list local VirtualBox VMs"),
+                kv("/sbx gui <vm>", "boot a VirtualBox VM locally in its GUI"),
                 kv("/drive  ·  F2", "type into the shared shell  (Esc releases)"),
             ],
         },

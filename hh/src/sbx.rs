@@ -14,6 +14,8 @@ use std::sync::mpsc;
 
 /// Helper that ensures the Docker daemon is running (ships beside this source).
 const ENSURE_DOCKER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/ensure-docker.sh");
+/// Detect-first VirtualBox installer (ships beside this source).
+const ENSURE_VBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/ensure-vbox.sh");
 
 /// Is the Docker daemon accepting connections? (`docker info` succeeds.)
 pub fn docker_daemon_up() -> bool {
@@ -43,6 +45,102 @@ fn start_docker_daemon() -> Result<()> {
         anyhow::bail!("{last}");
     }
     Ok(())
+}
+
+// ---- VirtualBox (local GUI VMs) ---------------------------------------------
+// VirtualBox is integrated as a *local* facility rather than a shared-PTY
+// backend: a room shares a VM by handing out its appliance, and each member
+// boots it in the real VirtualBox GUI on their own machine. None of this relays
+// over the room — only the (separately `/send`-ed) image does — so the
+// zero-knowledge model is untouched. A Windows guest has no sshd/guestcontrol
+// shell to drive, so the GUI launch is the honest fit, not a faked PTY.
+
+/// Is VirtualBox installed? (`VBoxManage --version` succeeds.)
+pub fn vbox_installed() -> bool {
+    Command::new("VBoxManage")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// VirtualBox version string (e.g. `7.1.2r164945`), or None if not installed.
+pub fn vbox_version() -> Option<String> {
+    let out = Command::new("VBoxManage").arg("--version").output().ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !v.is_empty()).then_some(v)
+}
+
+/// Install VirtualBox via `ensure-vbox.sh --yes`. Consent is the caller's job
+/// (they passed `--install`); detection is the script's (idempotent if present).
+/// Returns the script's last error line on failure (e.g. needs sudo).
+pub fn ensure_vbox_install() -> Result<()> {
+    let out = Command::new("bash")
+        .arg(ENSURE_VBOX)
+        .arg("--yes")
+        .output()
+        .context("running ensure-vbox.sh")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let last = err.lines().last().unwrap_or("could not install VirtualBox");
+        anyhow::bail!("{last}");
+    }
+    Ok(())
+}
+
+/// Names of registered VirtualBox VMs (`VBoxManage list vms`). Each line is
+/// `"name" {uuid}`; we return the unquoted names.
+pub fn list_vms() -> Result<Vec<String>> {
+    let out = Command::new("VBoxManage")
+        .args(["list", "vms"])
+        .output()
+        .context("VBoxManage list vms (is VirtualBox installed?)")?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let start = l.find('"')? + 1;
+            let end = l[start..].find('"')? + start;
+            Some(l[start..end].to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Is a VM currently running? (`VBoxManage list runningvms`)
+pub fn vm_running(name: &str) -> bool {
+    Command::new("VBoxManage")
+        .args(["list", "runningvms"])
+        .output()
+        .map(|o| {
+            let needle = format!("\"{name}\"");
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.contains(&needle))
+        })
+        .unwrap_or(false)
+}
+
+/// Launch a registered VM's GUI locally (`VBoxManage startvm <name> --type gui`).
+/// The window opens on the caller's own desktop — this is the "share a VM, run
+/// it locally" path; nothing about the display is relayed to the room.
+pub fn gui_launch(name: &str) -> Result<String> {
+    if vm_running(name) {
+        return Ok(format!("{name} is already running"));
+    }
+    let out = Command::new("VBoxManage")
+        .args(["startvm", name, "--type", "gui"])
+        .output()
+        .context("VBoxManage startvm (is VirtualBox installed?)")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "startvm failed: {}",
+            err.lines().last().unwrap_or("").trim()
+        );
+    }
+    Ok(format!("launched {name} (GUI)"))
 }
 
 /// Which sandbox to summon. Multipass = strong isolation (default for real use),
