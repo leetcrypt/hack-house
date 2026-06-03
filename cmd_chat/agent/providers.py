@@ -72,6 +72,29 @@ class OllamaProvider:
         return [m.get("name", "") for m in r.json().get("models", [])]
 
 
+class OllamaEmbedder:
+    """Local text embeddings via Ollama (default ``nomic-embed-text``), used for
+    the agent's in-RAM semantic recall. Local + free, so it stays on by default
+    regardless of which provider answers chat. No key, nothing persisted."""
+
+    name = "ollama-embed"
+
+    def __init__(self, model: str = "nomic-embed-text", host: str | None = None,
+                 timeout: int = 60):
+        self.model = model
+        self.host = (host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
+        self.timeout = timeout
+
+    def embed(self, text: str) -> list[float]:
+        r = requests.post(
+            f"{self.host}/api/embeddings",
+            json={"model": self.model, "prompt": text},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        return r.json().get("embedding") or []
+
+
 class AnthropicProvider:
     """Anthropic Messages API. Cloud — opt-in. Needs ANTHROPIC_API_KEY."""
 

@@ -18,6 +18,7 @@ import re
 import websockets
 
 from ..client.client import Client
+from .memory import MemoryIndex
 from .providers import Msg, Provider
 
 DEFAULT_SYSTEM = (
@@ -66,7 +67,8 @@ class AgentBridge(Client):
     def __init__(self, server: str, port: int, name: str, provider: Provider,
                  password: str | None = None, insecure: bool = False, no_tls: bool = False,
                  system_prompt: str | None = None, context_window: int = 12,
-                 token_budget: int = 3000):
+                 token_budget: int = 3000, embedder=None, rag_top_k: int = 4,
+                 rag_min_score: float = 0.35):
         super().__init__(server, port, username=name, password=password,
                          insecure=insecure, no_tls=no_tls)
         self.name = name
@@ -78,6 +80,15 @@ class AgentBridge(Client):
         # is smaller wins. Keeps small local models inside their effective ctx.
         self.token_budget = token_budget
         self.transcript: list[Msg] = []
+        # In-RAM semantic recall (RAG). The long-term store keeps far more than
+        # the verbatim window so we can surface relevant old lines on demand.
+        # Disabled (embedder=None) → falls back to recency-only context.
+        self.embedder = embedder
+        self.memory = MemoryIndex() if embedder is not None else None
+        self.rag_top_k = rag_top_k
+        self.rag_min_score = rag_min_score  # drop weak cosine matches as noise
+        self._embed_q: asyncio.Queue[Msg] = asyncio.Queue()
+        self._embed_warned = False  # log embedder failure once, then stay quiet
         # Sandbox-drive state, mirrored from the owner's `_perm:acl` broadcasts.
         self.granted = False           # may we type into the shared PTY?
         self.can_sudo = False          # does our VM account have sudo?
@@ -119,12 +130,68 @@ class AgentBridge(Client):
             text = dec.get("text", "")
             if not text or text == "[decrypt failed]" or text.startswith('{"_'):
                 continue
-            self.transcript.append(Msg("user", f"{sender}: {text}"))
+            msg = Msg("user", f"{sender}: {text}")
+            self.transcript.append(msg)
+            self._remember(msg)
             seeded += 1
         # Keep the same rolling bound the live path uses.
         self.transcript = self.transcript[-(self.context_window * 2):]
         if seeded:
             self.info(f"backfilled {seeded} prior message(s) for context")
+
+    # ── In-RAM semantic recall (RAG) ─────────────────────────────────────
+    def _remember(self, msg: Msg) -> None:
+        """Queue a message for background embedding into the memory index. A
+        no-op when RAG is disabled. Embedding happens off the recv loop so a
+        slow embedder can never stall frame draining."""
+        if self.memory is not None:
+            self._embed_q.put_nowait(msg)
+
+    async def _embed_worker(self) -> None:
+        """Drain the embed queue, embedding each message and storing the vector.
+        Eventually-consistent on purpose: a question may arrive before the most
+        recent line is indexed — that line is still in the verbatim window, so
+        nothing is lost. If the embedder is unreachable we say so once and keep
+        accepting work (it may recover)."""
+        while self.running:
+            msg = await self._embed_q.get()
+            try:
+                vec = await asyncio.to_thread(self.embedder.embed, msg.content)
+                self.memory.add(msg, vec)
+            except Exception as e:  # noqa: BLE001 — degrade to recency-only recall
+                if not self._embed_warned:
+                    self.info(f"semantic recall unavailable (embedder: {e})")
+                    self._embed_warned = True
+            finally:
+                self._embed_q.task_done()
+
+    async def _retrieve(self, query: str, exclude: set[str]) -> list[Msg]:
+        """Top-k past messages semantically relevant to ``query``, minus weak
+        matches and anything already in the recent verbatim window (``exclude``)."""
+        if self.memory is None or len(self.memory) == 0:
+            return []
+        try:
+            qvec = await asyncio.to_thread(self.embedder.embed, query)
+        except Exception:  # noqa: BLE001 — embedder down → just skip recall
+            return []
+        hits = self.memory.search(qvec, self.rag_top_k)
+        return [
+            m for score, m in hits
+            if score >= self.rag_min_score and m.content not in exclude
+        ]
+
+    async def _model_messages(self, query: str) -> list[Msg]:
+        """Assemble the message list for a model call: a single recalled-context
+        preamble (if RAG surfaced anything) followed by the recent verbatim
+        window. Recalled lines are clearly fenced as stale, untrusted context —
+        never elevated to system role — so they inform without instructing."""
+        window = self._window()
+        retrieved = await self._retrieve(query, exclude={m.content for m in window})
+        if not retrieved:
+            return window
+        recall = "Relevant earlier messages (recalled context, may be stale):\n" + \
+                 "\n".join(f"- {m.content}" for m in retrieved)
+        return [Msg("user", recall)] + window
 
     def _addressed_question(self, text: str) -> str | None:
         """Return the question if this ``/ai …`` line targets us, else None."""
@@ -261,11 +328,11 @@ class AgentBridge(Client):
             return
         await self._send_typing(ws, True)
         try:
+            context = await self._model_messages(task)
             plan = await asyncio.to_thread(
                 self.provider.complete,
                 SANDBOX_SYSTEM.format(name=self.name),
-                self._window()
-                + [Msg("user", f"{asker} wants this done in the shell: {task}")],
+                context + [Msg("user", f"{asker} wants this done in the shell: {task}")],
             )
         except Exception as e:  # noqa: BLE001 — surface provider failure in-room
             await self._send_typing(ws, False)
@@ -304,10 +371,11 @@ class AgentBridge(Client):
         self.transcript.append(Msg("user", f"{asker}: {question}"))
         await self._send_typing(ws, True)
         try:
+            context = await self._model_messages(question)
             reply = await asyncio.to_thread(
                 self.provider.complete,
                 self.system_prompt,
-                self._window(),
+                context,
             )
         except Exception as e:  # noqa: BLE001 — surface any provider failure in-room
             reply = f"[ai error: {e}]"
@@ -330,41 +398,55 @@ class AgentBridge(Client):
             )
             await ws.send(self.room_fernet.encrypt(announce.encode()).decode())
             self.success("agent online")
-            async for raw in ws:
-                if not self.running:
-                    break
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                mtype = data.get("type")
-                if mtype == "init":
-                    self.users = data.get("users", [])
-                    self._seed_transcript(data.get("messages", []))
-                    continue
-                if mtype == "roster":
-                    self.users = data.get("users", [])
-                    continue
-                if mtype != "message":
-                    continue
-                msg = self.decrypt_message(data.get("data", {}))
-                text = msg.get("text", "")
-                sender = msg.get("username", "?")
-                if sender == self.name:
-                    continue  # never react to our own messages
-                if text.startswith('{"_'):
-                    self._handle_control(text)  # track ACL grants; ignore other ctrl frames
-                    continue
-                question = self._addressed_question(text)
-                if question is None:
-                    # keep a short rolling transcript for context on future asks
-                    self.transcript.append(Msg("user", f"{sender}: {text}"))
-                    self.transcript = self.transcript[-(self.context_window * 2):]
-                elif question.startswith("!"):
-                    self.info(f"{sender} → /ai !sbx: {question[1:].strip()}")
-                    await self._run_in_sandbox(ws, question[1:].strip(), sender)
-                elif question.strip().lower() == "confirm":
-                    await self._confirm_pending(ws, sender)
-                else:
-                    self.info(f"{sender} → /ai: {question}")
-                    await self._answer(ws, question, sender)
+            embed_task = (
+                asyncio.create_task(self._embed_worker())
+                if self.memory is not None else None
+            )
+            try:
+                await self._serve(ws)
+            finally:
+                if embed_task is not None:
+                    embed_task.cancel()
+
+    async def _serve(self, ws) -> None:
+        async for raw in ws:
+            if not self.running:
+                break
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            mtype = data.get("type")
+            if mtype == "init":
+                self.users = data.get("users", [])
+                self._seed_transcript(data.get("messages", []))
+                continue
+            if mtype == "roster":
+                self.users = data.get("users", [])
+                continue
+            if mtype != "message":
+                continue
+            msg = self.decrypt_message(data.get("data", {}))
+            text = msg.get("text", "")
+            sender = msg.get("username", "?")
+            if sender == self.name:
+                continue  # never react to our own messages
+            if text.startswith('{"_'):
+                self._handle_control(text)  # track ACL grants; ignore other ctrl frames
+                continue
+            question = self._addressed_question(text)
+            if question is None:
+                # keep a short rolling transcript for context on future asks,
+                # and feed the line to long-term semantic memory
+                captured = Msg("user", f"{sender}: {text}")
+                self.transcript.append(captured)
+                self.transcript = self.transcript[-(self.context_window * 2):]
+                self._remember(captured)
+            elif question.startswith("!"):
+                self.info(f"{sender} → /ai !sbx: {question[1:].strip()}")
+                await self._run_in_sandbox(ws, question[1:].strip(), sender)
+            elif question.strip().lower() == "confirm":
+                await self._confirm_pending(ws, sender)
+            else:
+                self.info(f"{sender} → /ai: {question}")
+                await self._answer(ws, question, sender)

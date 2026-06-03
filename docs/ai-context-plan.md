@@ -43,12 +43,16 @@ That is a RAM-only history the agent can backfill from on join at zero new cost.
 8. **Tune Ollama `options`** — explicit `num_ctx` (so the larger window in #1/#2
    is actually honored) and bounded `num_predict`. *(implementing)*
 
-### Tier 2 — deeper context (next branch)
-3. **In-RAM semantic retrieval (RAG, no disk).** Embed each captured message
-   with the already-present `nomic-embed-text`, hold vectors in a numpy array in
-   memory; on a `/ai` question retrieve top-k by cosine and prepend to the
-   recency window. Fully ephemeral.
-4. **In-RAM hierarchical compaction.** When over budget, summarize the oldest
+### Tier 2 — deeper context
+3. **In-RAM semantic retrieval (RAG, no disk).** *(done)* Each captured message
+   is embedded with the already-present `nomic-embed-text` and held in a capped
+   in-memory `MemoryIndex` (pure-Python cosine, no numpy). On a `/ai` question
+   the agent embeds the query, retrieves top-k, drops weak/duplicate hits, and
+   prepends them as a clearly-fenced "recalled context" preamble (never system
+   role — keeps untrusted text from instructing). Embedding runs on a background
+   worker so it can't stall the recv loop; if the embedder is unreachable it
+   degrades to recency-only. Toggle with `--no-rag` / `--rag-top-k`.
+4. **In-RAM hierarchical compaction.** *(staged)* When over budget, summarize the oldest
    chunk into a single rolling `Msg("system", "earlier: …")` instead of dropping
    it — the Claude Code auto-compaction pattern, kept in RAM.
 

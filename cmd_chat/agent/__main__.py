@@ -32,7 +32,7 @@ import sys
 
 from .bridge import AgentBridge
 from .profiles import load_profiles, provider_from_profile
-from .providers import make_provider, preflight
+from .providers import OllamaEmbedder, make_provider, preflight
 
 
 def _build_provider(args, ap):
@@ -80,6 +80,14 @@ def main() -> None:
                     help="max prior messages fed to the model per reply")
     ap.add_argument("--token-budget", type=int, default=3000,
                     help="approx token cap on the context window (whichever is smaller wins)")
+    ap.add_argument("--no-rag", action="store_true",
+                    help="disable in-RAM semantic recall (recency-only context)")
+    ap.add_argument("--embed-model", default="nomic-embed-text",
+                    help="Ollama model used to embed messages for recall")
+    ap.add_argument("--embed-host", default=None,
+                    help="Ollama host for embeddings (default: chat host or $OLLAMA_HOST)")
+    ap.add_argument("--rag-top-k", type=int, default=4,
+                    help="how many recalled messages to surface per reply")
     ap.add_argument("--list-models", action="store_true",
                     help="list models the backend can serve, then exit")
     ap.add_argument("--check", action="store_true",
@@ -112,11 +120,21 @@ def main() -> None:
     if not ok:
         print(f"⚠ preflight: {msg}", file=sys.stderr)
 
+    # In-RAM semantic recall is on by default and local (Ollama embeddings),
+    # independent of which provider answers chat. Reuse the chat host if it's an
+    # Ollama provider so a single --host/profile covers both.
+    embedder = None
+    if not args.no_rag:
+        embedder = OllamaEmbedder(
+            model=args.embed_model,
+            host=args.embed_host or getattr(provider, "host", None),
+        )
+
     bridge = AgentBridge(
         args.server, args.port, name=args.name, provider=provider,
         password=args.password, insecure=args.insecure, no_tls=args.no_tls,
         system_prompt=args.system, context_window=args.context_window,
-        token_budget=args.token_budget,
+        token_budget=args.token_budget, embedder=embedder, rag_top_k=args.rag_top_k,
     )
     try:
         bridge.run()
