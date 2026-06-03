@@ -146,7 +146,7 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
     // List whatever vestments are actually installed, so new themes show up here
     // automatically (church · neon · crypt · blush · matrix · wraith · …).
     let theme_help = format!(
-        "change vestments live: {}",
+        "vestments: {} · random · save [name]",
         Theme::available().join(" · ")
     );
     vec![
@@ -208,6 +208,14 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         kv(
             "Ctrl-R  (when closed)",
             "reconnect to the house after a drop / AFK",
+        ),
+        kv(
+            "Ctrl+Alt+P  ·  /theme random",
+            "conjure a random vestment (new palette + sigil)",
+        ),
+        kv(
+            "/theme save [name]",
+            "keep the vestment you're wearing for reuse",
         ),
         kv("Ctrl-C  ·  Ctrl-Q", "quit hack-house"),
         Line::from(""),

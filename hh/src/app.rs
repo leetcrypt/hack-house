@@ -626,6 +626,17 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 app.sys("kill switch is for the sandbox owner (you don't hold the PTY)");
                             }
                         } else if k.modifiers.contains(KeyModifiers::CONTROL)
+                            && k.modifiers.contains(KeyModifiers::ALT)
+                            && matches!(k.code, KeyCode::Char('p'))
+                        {
+                            // Conjure a brand-new procedural vestment (not a bundled
+                            // preset): fresh palette + sigil, rolled from the clock.
+                            theme = Theme::random();
+                            app.sys(format!(
+                                "{} conjured vestment '{}'",
+                                theme.sigil, theme.name
+                            ));
+                        } else if k.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(k.code, KeyCode::Char('r'))
                             && !app.connected
                         {
@@ -1007,9 +1018,26 @@ fn handle_command(
         let name = rest.trim();
         if name.is_empty() {
             app.sys(format!(
-                "vestments: {} — /theme <name>",
+                "vestments: {} · random · save [name] — /theme <name>",
                 Theme::available().join(" · ")
             ));
+        } else if name == "random" {
+            // Same as Ctrl+Alt+P — roll a fresh procedural vestment.
+            *theme = Theme::random();
+            app.sys(format!("{} conjured vestment '{}'", theme.sigil, theme.name));
+        } else if name == "save" || name.starts_with("save ") {
+            // Persist the vestment you're currently wearing (e.g. a `random`
+            // roll you like) to themes/<slug>.toml so it sticks around. Bare
+            // `/theme save` reuses the theme's own generated name.
+            let want = name[4..].trim();
+            let want = if want.is_empty() { theme.name.clone() } else { want.to_string() };
+            match theme.save(&want) {
+                Ok(slug) => app.sys(format!(
+                    "{} saved vestment '{slug}' — re-don it anytime with /theme {slug}",
+                    theme.sigil
+                )),
+                Err(e) => app.err(format!("couldn't save vestment: {e}")),
+            }
         } else {
             match Theme::by_name(name) {
                 Ok(t) => {
