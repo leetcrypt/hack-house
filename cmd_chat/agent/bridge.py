@@ -232,6 +232,13 @@ class AgentBridge(Client):
         frame = json.dumps({"_ai": "typing", "name": self.name, "on": on})
         await ws.send(self.room_fernet.encrypt(frame.encode()).decode())
 
+    async def _send_stream(self, ws, text: str, done: bool) -> None:
+        """Emit an incremental reply preview. ``text`` is the reply so far
+        (cumulative); ``done`` clears the client's live bubble. A control frame —
+        never stored or shown as a permanent chat line."""
+        frame = json.dumps({"_ai": "stream", "name": self.name, "text": text, "done": done})
+        await ws.send(self.room_fernet.encrypt(frame.encode()).decode())
+
     async def _send_chat(self, ws, text: str) -> None:
         await ws.send(self.room_fernet.encrypt(text.encode()).decode())
 
@@ -385,22 +392,61 @@ class AgentBridge(Client):
             self.success(f"answered /ai {question.strip().lower()} for {asker}")
             return
         self.transcript.append(Msg("user", f"{asker}: {question}"))
+        context = await self._model_messages(question)
+        stream_fn = getattr(self.provider, "stream", None)
         await self._send_typing(ws, True)
         try:
-            context = await self._model_messages(question)
-            reply = await asyncio.to_thread(
-                self.provider.complete,
-                self.system_prompt,
-                context,
-            )
+            if stream_fn is not None:
+                reply = await self._stream_reply(ws, stream_fn, context)
+            else:
+                reply = await asyncio.to_thread(
+                    self.provider.complete, self.system_prompt, context)
         except Exception as e:  # noqa: BLE001 — surface any provider failure in-room
             reply = f"[ai error: {e}]"
         finally:
             await self._send_typing(ws, False)
+            if stream_fn is not None:
+                await self._send_stream(ws, "", True)  # clear the live preview
         reply = reply.strip() or "[empty reply]"
         self.transcript.append(Msg("assistant", reply))
         await self._send_chat(ws, reply)
         self.success(f"replied to {asker}")
+
+    async def _stream_reply(self, ws, stream_fn, context: list[Msg]) -> str:
+        """Run the provider's blocking token generator on a worker thread and
+        relay cumulative previews to the room, throttled so a fast model can't
+        flood the websocket. Returns the full reply text."""
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        done = object()
+
+        def produce():
+            try:
+                for piece in stream_fn(self.system_prompt, context):
+                    loop.call_soon_threadsafe(q.put_nowait, piece)
+            except Exception as e:  # noqa: BLE001 — relay failure to the consumer
+                loop.call_soon_threadsafe(q.put_nowait, e)
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, done)
+
+        worker = loop.run_in_executor(None, produce)
+        parts: list[str] = []
+        last_emit = 0.0
+        try:
+            while True:
+                item = await q.get()
+                if item is done:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                parts.append(item)
+                now = loop.time()
+                if now - last_emit >= 0.2:  # ~5 previews/sec max
+                    await self._send_stream(ws, "".join(parts), False)
+                    last_emit = now
+        finally:
+            await worker
+        return "".join(parts)
 
     async def run_async(self) -> None:
         self.srp_authenticate()

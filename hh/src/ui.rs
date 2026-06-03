@@ -357,7 +357,26 @@ fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
 fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let inner_h = area.height.saturating_sub(2) as usize; // rows inside the border
     let text_w = area.width.saturating_sub(2).max(1); // wrap width inside the border
-    let lines: Vec<Line> = app.lines.iter().map(|l| fmt_line(l, app, theme)).collect();
+    let mut lines: Vec<Line> = app.lines.iter().map(|l| fmt_line(l, app, theme)).collect();
+
+    // Live preview bubbles for agents currently streaming a reply, rendered
+    // below the committed history. Dim + italic so they read as in-progress;
+    // replaced by the real message once the agent posts it.
+    let mut streaming: Vec<(&String, &String)> = app.ai_stream.iter().collect();
+    streaming.sort_unstable_by_key(|(name, _)| name.as_str());
+    for (name, text) in streaming {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{name} "),
+                Style::default().fg(theme.other).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("⠿ ", Style::default().fg(theme.dim)),
+            Span::styled(
+                text.as_str(),
+                Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
 
     // Measure the TRUE wrapped height and scroll to the bottom. Selecting N
     // logical lines and letting the Paragraph top-anchor them clips any wrapped

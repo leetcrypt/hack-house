@@ -17,11 +17,12 @@ KV-cache quant) are no-ops here.
    on CPU); `token_budget` default 3000→2000 to fit. `--num-ctx`, `--num-thread`,
    `--num-predict` flags added. `num_thread` defaults to Ollama's own (= physical
    cores, 4 here); benchmark 4/6/8.
-3. **Token streaming.** *(partial — provider half done)* `OllamaProvider.stream()`
-   now yields deltas from Ollama's `stream=True` chat endpoint. Still TODO (commit 2):
-   have the agent emit `_ai:"stream"` delta frames and the Rust client render an
-   in-progress bubble. On CPU, perceived latency is TTFT — this will make a slow
-   reply feel live.
+3. **Token streaming.** *(done)* `OllamaProvider.stream()` yields deltas from
+   Ollama's `stream=True` chat endpoint; the agent relays them as throttled
+   (~5/sec) cumulative `_ai:"stream"` frames off a worker thread, and the Rust
+   client renders a dim in-progress preview bubble (cleared by a `done` frame
+   when the final, persisted message lands). On CPU, perceived latency is TTFT —
+   this makes a slow reply feel live.
 4. **Keep model warm + single-flight.** *(partial)* `keep_alive` already 30m
    (prevents mid-session reload). `OLLAMA_NUM_PARALLEL=1` is a **server-side env**
    read by `ollama serve`, not settable from the agent — set it where Ollama is

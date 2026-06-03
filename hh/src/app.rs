@@ -96,6 +96,14 @@ pub enum Net {
         name: String,
         on: bool,
     },
+    /// Incremental reply text from a streaming AI agent. `text` is the reply so
+    /// far (cumulative); `done` clears the live preview (the final, persisted
+    /// chat message arrives separately as a normal `Message`).
+    AiStream {
+        name: String,
+        text: String,
+        done: bool,
+    },
     /// A local system notice produced off-thread (e.g. async Ollama probe).
     Sys(String),
     Err(String),
@@ -141,6 +149,9 @@ pub struct App {
     pub password: String,
     /// AI agents currently generating a reply — drives the "thinking" spinner.
     pub ai_typing: std::collections::HashSet<String>,
+    /// Live, in-progress reply text per streaming agent, shown as a transient
+    /// preview bubble until the final message lands. Keyed by agent name.
+    pub ai_stream: std::collections::HashMap<String, String>,
     /// Monotonic tick counter used to animate the AI spinner.
     pub spin: usize,
     /// When set, agents we summon are auto-granted sandbox drive on each launch
@@ -173,6 +184,7 @@ impl App {
             error: None,
             password: String::new(),
             ai_typing: std::collections::HashSet::new(),
+            ai_stream: std::collections::HashMap::new(),
             spin: 0,
             agent_sbx_allow: false,
         }
@@ -238,6 +250,7 @@ impl App {
                 if let Some(p) = self.users.iter().position(|u| u.user_id == uid) {
                     let name = self.users.remove(p).username;
                     self.ai_typing.remove(&name); // a departed agent isn't thinking
+                    self.ai_stream.remove(&name); // …nor streaming a reply
                     self.sys(format!("{name} left"));
                 }
             }
@@ -246,6 +259,16 @@ impl App {
                     self.ai_typing.insert(name);
                 } else {
                     self.ai_typing.remove(&name);
+                }
+            }
+            Net::AiStream { name, text, done } => {
+                if done {
+                    self.ai_stream.remove(&name);
+                } else {
+                    // Streaming has started → drop the bare "thinking" spinner;
+                    // the live preview now signals the agent is working.
+                    self.ai_typing.remove(&name);
+                    self.ai_stream.insert(name, text);
                 }
             }
             Net::SbxStatus {

@@ -227,17 +227,24 @@ fn parse_sbx(text: &str, sender: &str) -> Option<Net> {
     }
 }
 
-/// Parse a decrypted `{"_ai":"typing",...}` frame — an AI agent signalling that
-/// it is (or has finished) generating a reply, so the UI can show a spinner.
+/// Parse a decrypted `{"_ai":...}` frame from an AI agent. `"typing"` toggles the
+/// thinking spinner; `"stream"` carries the cumulative reply text for a live
+/// preview bubble (`done` clears it once the final message is posted).
 fn parse_ai(text: &str) -> Option<Net> {
     let v: Value = serde_json::from_str(text).ok()?;
-    if v["_ai"].as_str()? != "typing" {
-        return None;
+    let name = || v["name"].as_str().unwrap_or("ai").to_string();
+    match v["_ai"].as_str()? {
+        "typing" => Some(Net::AiTyping {
+            name: name(),
+            on: v["on"].as_bool().unwrap_or(false),
+        }),
+        "stream" => Some(Net::AiStream {
+            name: name(),
+            text: v["text"].as_str().unwrap_or("").to_string(),
+            done: v["done"].as_bool().unwrap_or(false),
+        }),
+        _ => None,
     }
-    Some(Net::AiTyping {
-        name: v["name"].as_str().unwrap_or("ai").to_string(),
-        on: v["on"].as_bool().unwrap_or(false),
-    })
 }
 
 /// Parse a decrypted `{"_perm":"acl",...}` frame.
