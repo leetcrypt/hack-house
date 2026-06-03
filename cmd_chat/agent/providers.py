@@ -41,15 +41,24 @@ class OllamaProvider:
 
     name = "ollama"
 
-    def __init__(self, model: str = "llama3", host: str | None = None, timeout: int = 120):
+    def __init__(self, model: str = "llama3", host: str | None = None, timeout: int = 120,
+                 num_ctx: int = 8192, num_predict: int = 512, keep_alive: str = "30m"):
         self.model = model
         self.host = (host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
         self.timeout = timeout
+        # Honor the larger backfilled window (num_ctx) — Ollama defaults to a tiny
+        # 2048 — and bound reply length. keep_alive pins the model in VRAM so the
+        # next /ai doesn't pay a cold reload.
+        self.num_ctx = num_ctx
+        self.num_predict = num_predict
+        self.keep_alive = keep_alive
 
     def complete(self, system: str, messages: list[Msg]) -> str:
         payload = {
             "model": self.model,
             "stream": False,
+            "keep_alive": self.keep_alive,
+            "options": {"num_ctx": self.num_ctx, "num_predict": self.num_predict},
             "messages": [{"role": "system", "content": system}]
             + [{"role": m.role, "content": m.content} for m in messages],
         }
