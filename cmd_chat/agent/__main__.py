@@ -59,6 +59,43 @@ def _build_provider(args, ap):
     return make_provider(args.provider, model=args.model, **opts)
 
 
+def _apply_ollama_tuning(provider, args) -> None:
+    """Push CPU-perf flags onto an Ollama chat/code provider. No-op otherwise —
+    the knobs (num_ctx/num_thread/num_predict) only exist on OllamaProvider."""
+    if getattr(provider, "name", None) != "ollama":
+        return
+    if args.num_ctx is not None:
+        provider.num_ctx = args.num_ctx
+    if args.num_thread is not None:
+        provider.num_thread = args.num_thread
+    if args.num_predict is not None:
+        provider.num_predict = args.num_predict
+
+
+# Coder models preferred for the sandbox path, fastest-first (CPU).
+_CODER_MODELS = ("qwen2.5-coder:1.5b", "qwen2.5-coder:3b", "qwen2.5-coder")
+
+
+def _build_code_provider(provider, args):
+    """A code-specialized provider for the sandbox `!task` path. Only meaningful
+    for Ollama: use --code-model if given, else auto-select a present
+    qwen2.5-coder build. Returns None to fall back to the chat provider."""
+    if getattr(provider, "name", None) != "ollama":
+        return None
+    code_model = args.code_model
+    if code_model is None:
+        try:
+            models = set(provider.available_models())
+        except Exception:  # noqa: BLE001 — discovery down → no separate code path
+            models = set()
+        code_model = next((m for m in _CODER_MODELS if m in models), None)
+    if not code_model or code_model == provider.model:
+        return None
+    code = make_provider("ollama", model=code_model, host=provider.host)
+    _apply_ollama_tuning(code, args)
+    return code
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog="cmd_chat.agent", description="hack-house AI agent bridge (PoC)"
@@ -74,11 +111,19 @@ def main() -> None:
     ap.add_argument("--models-file", default=None,
                     help="path to models.toml (default: $HH_MODELS_FILE, ./models.toml, ~/.config/hh/models.toml)")
     ap.add_argument("--model", default=None, help="model name (provider default if omitted)")
+    ap.add_argument("--code-model", default=None,
+                    help="Ollama model for the sandbox/code path (default: auto-select qwen2.5-coder if present)")
     ap.add_argument("--base-url", default=None, help="endpoint for openai-compatible providers")
+    ap.add_argument("--num-ctx", type=int, default=None,
+                    help="Ollama context window (CPU: smaller = faster prefill; default 4096)")
+    ap.add_argument("--num-thread", type=int, default=None,
+                    help="Ollama CPU threads (default: Ollama's own ≈ physical cores; benchmark 4/6/8)")
+    ap.add_argument("--num-predict", type=int, default=None,
+                    help="Ollama max reply tokens (default 512)")
     ap.add_argument("--system", default=None, help="override the system prompt")
     ap.add_argument("--context-window", type=int, default=12,
                     help="max prior messages fed to the model per reply")
-    ap.add_argument("--token-budget", type=int, default=3000,
+    ap.add_argument("--token-budget", type=int, default=2000,
                     help="approx token cap on the context window (whichever is smaller wins)")
     ap.add_argument("--no-rag", action="store_true",
                     help="disable in-RAM semantic recall (recency-only context)")
@@ -88,6 +133,8 @@ def main() -> None:
                     help="Ollama host for embeddings (default: chat host or $OLLAMA_HOST)")
     ap.add_argument("--rag-top-k", type=int, default=4,
                     help="how many recalled messages to surface per reply")
+    ap.add_argument("--embed-dim", type=int, default=256,
+                    help="truncate embedding vectors to this many dims (MRL; 0 = full vector)")
     ap.add_argument("--list-models", action="store_true",
                     help="list models the backend can serve, then exit")
     ap.add_argument("--check", action="store_true",
@@ -97,6 +144,7 @@ def main() -> None:
     args = ap.parse_args()
 
     provider = _build_provider(args, ap)
+    _apply_ollama_tuning(provider, args)
 
     # Discovery / preflight modes never join a room.
     if args.list_models:
@@ -128,13 +176,20 @@ def main() -> None:
         embedder = OllamaEmbedder(
             model=args.embed_model,
             host=args.embed_host or getattr(provider, "host", None),
+            truncate_dim=args.embed_dim or None,
         )
+
+    # Separate coder model for the sandbox path (Ollama only); None → reuse chat.
+    code_provider = _build_code_provider(provider, args)
+    if code_provider is not None:
+        print(f"sandbox/code path → {code_provider.name}/{code_provider.model}", file=sys.stderr)
 
     bridge = AgentBridge(
         args.server, args.port, name=args.name, provider=provider,
         password=args.password, insecure=args.insecure, no_tls=args.no_tls,
         system_prompt=args.system, context_window=args.context_window,
         token_budget=args.token_budget, embedder=embedder, rag_top_k=args.rag_top_k,
+        code_provider=code_provider,
     )
     try:
         bridge.run()

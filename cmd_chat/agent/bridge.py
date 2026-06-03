@@ -37,7 +37,19 @@ SANDBOX_SYSTEM = (
     "block — no prose, no comments, no explanation. Prefer non-interactive "
     "commands. Create files with heredocs (cat > path <<'EOF' … EOF). Keep it to "
     "a handful of commands. Never include destructive commands unless the request "
-    "explicitly demands them."
+    "explicitly demands them.\n\n"
+    "Examples:\n"
+    "Request: create a hello.py that prints hello world and run it\n"
+    "```sh\n"
+    "cat > hello.py <<'EOF'\n"
+    "print(\"hello world\")\n"
+    "EOF\n"
+    "python3 hello.py\n"
+    "```\n\n"
+    "Request: show disk usage of the current directory, largest first\n"
+    "```sh\n"
+    "du -sh ./* | sort -rh\n"
+    "```"
 )
 
 # Heuristic guard for obviously dangerous commands — not exhaustive; the owner's
@@ -67,12 +79,16 @@ class AgentBridge(Client):
     def __init__(self, server: str, port: int, name: str, provider: Provider,
                  password: str | None = None, insecure: bool = False, no_tls: bool = False,
                  system_prompt: str | None = None, context_window: int = 12,
-                 token_budget: int = 3000, embedder=None, rag_top_k: int = 4,
-                 rag_min_score: float = 0.35):
+                 token_budget: int = 2000, embedder=None, rag_top_k: int = 4,
+                 rag_min_score: float = 0.35, code_provider: Provider | None = None):
         super().__init__(server, port, username=name, password=password,
                          insecure=insecure, no_tls=no_tls)
         self.name = name
         self.provider = provider
+        # Optional code-specialized provider (e.g. qwen2.5-coder) used only for
+        # the sandbox `!task` path; chat keeps the general `provider`. Falls back
+        # to the chat provider when not supplied.
+        self.code_provider = code_provider or provider
         self.system_prompt = (system_prompt or DEFAULT_SYSTEM).format(name=name)
         self.context_window = context_window
         # Soft cap (approx tokens) on how much transcript we feed the model per
@@ -330,7 +346,7 @@ class AgentBridge(Client):
         try:
             context = await self._model_messages(task)
             plan = await asyncio.to_thread(
-                self.provider.complete,
+                self.code_provider.complete,
                 SANDBOX_SYSTEM.format(name=self.name),
                 context + [Msg("user", f"{asker} wants this done in the shell: {task}")],
             )

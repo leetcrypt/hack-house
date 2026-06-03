@@ -9,6 +9,7 @@ custom one via the ``module:Class`` spec.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -42,29 +43,62 @@ class OllamaProvider:
     name = "ollama"
 
     def __init__(self, model: str = "llama3", host: str | None = None, timeout: int = 120,
-                 num_ctx: int = 8192, num_predict: int = 512, keep_alive: str = "30m"):
+                 num_ctx: int = 4096, num_predict: int = 512, num_thread: int | None = None,
+                 keep_alive: str = "30m"):
         self.model = model
         self.host = (host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
         self.timeout = timeout
-        # Honor the larger backfilled window (num_ctx) — Ollama defaults to a tiny
-        # 2048 — and bound reply length. keep_alive pins the model in VRAM so the
-        # next /ai doesn't pay a cold reload.
+        # On CPU, time-to-first-token is O(num_ctx) prefill, so keep the window
+        # modest (4096) rather than a GPU-mindset 8192. keep_alive pins the model
+        # so the next /ai doesn't pay a cold reload. num_thread defaults to
+        # Ollama's own (≈physical cores); set it explicitly to benchmark 4/6/8.
         self.num_ctx = num_ctx
         self.num_predict = num_predict
+        self.num_thread = num_thread
         self.keep_alive = keep_alive
+
+    def _options(self) -> dict:
+        opts = {"num_ctx": self.num_ctx, "num_predict": self.num_predict}
+        if self.num_thread is not None:
+            opts["num_thread"] = self.num_thread
+        return opts
 
     def complete(self, system: str, messages: list[Msg]) -> str:
         payload = {
             "model": self.model,
             "stream": False,
             "keep_alive": self.keep_alive,
-            "options": {"num_ctx": self.num_ctx, "num_predict": self.num_predict},
+            "options": self._options(),
             "messages": [{"role": "system", "content": system}]
             + [{"role": m.role, "content": m.content} for m in messages],
         }
         r = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
         r.raise_for_status()
         return (r.json().get("message", {}).get("content") or "").strip()
+
+    def stream(self, system: str, messages: list[Msg]):
+        """Yield reply text incrementally as Ollama generates it. On CPU the
+        perceived latency is TTFT, so streaming makes a slow reply feel live."""
+        payload = {
+            "model": self.model,
+            "stream": True,
+            "keep_alive": self.keep_alive,
+            "options": self._options(),
+            "messages": [{"role": "system", "content": system}]
+            + [{"role": m.role, "content": m.content} for m in messages],
+        }
+        with requests.post(f"{self.host}/api/chat", json=payload,
+                           timeout=self.timeout, stream=True) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                piece = chunk.get("message", {}).get("content")
+                if piece:
+                    yield piece
+                if chunk.get("done"):
+                    break
 
     def available_models(self) -> list[str]:
         r = requests.get(f"{self.host}/api/tags", timeout=self.timeout)
@@ -80,10 +114,15 @@ class OllamaEmbedder:
     name = "ollama-embed"
 
     def __init__(self, model: str = "nomic-embed-text", host: str | None = None,
-                 timeout: int = 60):
+                 timeout: int = 60, truncate_dim: int | None = 256):
         self.model = model
         self.host = (host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
         self.timeout = timeout
+        # nomic-embed-text is Matryoshka (MRL)-trained, so its 768-dim vector can
+        # be truncated to a shorter prefix with little quality loss — faster
+        # pure-Python cosine and less RAM. Query + stored use the same dim, so
+        # cosine stays correct. None keeps the full vector.
+        self.truncate_dim = truncate_dim
 
     def embed(self, text: str) -> list[float]:
         r = requests.post(
@@ -92,7 +131,10 @@ class OllamaEmbedder:
             timeout=self.timeout,
         )
         r.raise_for_status()
-        return r.json().get("embedding") or []
+        vec = r.json().get("embedding") or []
+        if self.truncate_dim is not None:
+            vec = vec[: self.truncate_dim]
+        return vec
 
 
 class AnthropicProvider:
