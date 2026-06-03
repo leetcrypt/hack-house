@@ -76,7 +76,10 @@ def main() -> None:
     ap.add_argument("--model", default=None, help="model name (provider default if omitted)")
     ap.add_argument("--base-url", default=None, help="endpoint for openai-compatible providers")
     ap.add_argument("--system", default=None, help="override the system prompt")
-    ap.add_argument("--context-window", type=int, default=12)
+    ap.add_argument("--context-window", type=int, default=12,
+                    help="max prior messages fed to the model per reply")
+    ap.add_argument("--token-budget", type=int, default=3000,
+                    help="approx token cap on the context window (whichever is smaller wins)")
     ap.add_argument("--list-models", action="store_true",
                     help="list models the backend can serve, then exit")
     ap.add_argument("--check", action="store_true",
@@ -113,6 +116,7 @@ def main() -> None:
         args.server, args.port, name=args.name, provider=provider,
         password=args.password, insecure=args.insecure, no_tls=args.no_tls,
         system_prompt=args.system, context_window=args.context_window,
+        token_budget=args.token_budget,
     )
     try:
         bridge.run()
