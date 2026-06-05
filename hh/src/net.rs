@@ -189,12 +189,12 @@ fn decode_msg(room: &fernet::Fernet, m: &Value, live: bool) -> Decoded {
         }
         Err(_) => ("[unreadable — wrong room password?]".to_string(), true),
     };
+    // Server-stamped ISO time "YYYY-MM-DDTHH:MM:SS…"; show just "HH:MM:SS".
+    // Slice on char boundaries (chars, not bytes): the server is untrusted in our
+    // zero-knowledge model and could send a non-ASCII timestamp, which byte
+    // slicing `stamp[11..19]` would panic on at a non-boundary.
     let stamp = m["timestamp"].as_str().unwrap_or("");
-    let ts = if stamp.len() >= 19 {
-        stamp[11..19].to_string()
-    } else {
-        String::new()
-    };
+    let ts: String = stamp.chars().skip(11).take(8).collect();
     Decoded::Chat(ChatLine {
         ts,
         username: m["username"].as_str().unwrap_or("?").to_string(),
@@ -222,6 +222,12 @@ fn parse_sbx(text: &str, sender: &str) -> Option<Net> {
         "input" => Some(Net::SbxInput {
             from: sender.to_string(),
             bytes: STANDARD.decode(v["b64"].as_str()?).ok()?,
+        }),
+        // A member opened a shared VirtualBox VM on their own machine. `by` is
+        // the server-stamped sender (trusted), not the frame's own claim.
+        "vm" => Some(Net::VmOpened {
+            by: sender.to_string(),
+            vm: v["vm"].as_str().unwrap_or("a VM").to_string(),
         }),
         _ => None,
     }
@@ -320,4 +326,77 @@ pub async fn reader(
         }
     }
     let _ = tx.send(Net::Closed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn test_room() -> fernet::Fernet {
+        fernet::Fernet::new(&fernet::Fernet::generate_key()).expect("valid key")
+    }
+
+    // A decode_msg call must never panic on a malformed timestamp. This is the
+    // concrete regression for the byte-slice `stamp[11..19]` that would panic on
+    // a non-ASCII (multibyte) timestamp from an untrusted/zero-knowledge server.
+    #[test]
+    fn decode_msg_multibyte_timestamp_does_not_panic() {
+        let room = test_room();
+        // A '✝' (3 bytes) straddling the old 11..19 byte window.
+        let m = json!({ "text": "not-real-ciphertext", "timestamp": "2026-06-04✝✝✝✝✝✝", "username": "alice" });
+        let _ = decode_msg(&room, &m, true); // must not panic
+    }
+
+    proptest! {
+        // The frame parsers consume attacker-controlled JSON (decrypted from a
+        // zero-knowledge relay) — they must classify or reject, never panic.
+        #[test]
+        fn parse_sbx_never_panics(s in ".*", sender in ".*") {
+            let _ = parse_sbx(&s, &sender);
+        }
+
+        #[test]
+        fn parse_ai_never_panics(s in ".*") {
+            let _ = parse_ai(&s);
+        }
+
+        #[test]
+        fn parse_perm_never_panics(s in ".*") {
+            let _ = parse_perm(&s);
+        }
+
+        // Well-formed JSON envelopes with arbitrary field values (the realistic
+        // shape a hostile peer would send): still no panic.
+        #[test]
+        fn parse_sbx_structured_never_panics(
+            kind in "[a-z]{0,10}", b64 in ".*", rows in any::<i64>(), cols in any::<i64>(), sender in ".*"
+        ) {
+            let frame = json!({"_sbx": kind, "b64": b64, "rows": rows, "cols": cols, "vm": b64}).to_string();
+            let _ = parse_sbx(&frame, &sender);
+        }
+
+        #[test]
+        fn parse_ai_structured_never_panics(kind in "[a-z]{0,10}", name in ".*", text in ".*", on in any::<bool>()) {
+            let frame = json!({"_ai": kind, "name": name, "text": text, "on": on, "done": on}).to_string();
+            let _ = parse_ai(&frame);
+        }
+
+        // decode_msg sees server-stamped + peer-encrypted objects; a malicious
+        // server controls timestamp/username and a peer controls the ciphertext.
+        // None of those combinations may panic the client.
+        #[test]
+        fn decode_msg_never_panics(text in ".*", ts in ".*", user in ".*", live in any::<bool>()) {
+            let room = test_room();
+            let m = json!({ "text": text, "timestamp": ts, "username": user });
+            let _ = decode_msg(&room, &m, live);
+        }
+
+        // parse_users tolerates arbitrary array shapes.
+        #[test]
+        fn parse_users_never_panics(id in ".*", name in ".*") {
+            let v = json!([{ "user_id": id, "username": name }, "garbage", 42, null]);
+            let _ = parse_users(&v);
+        }
+    }
 }

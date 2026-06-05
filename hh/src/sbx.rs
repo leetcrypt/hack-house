@@ -143,6 +143,143 @@ pub fn gui_launch(name: &str) -> Result<String> {
     Ok(format!("launched {name} (GUI)"))
 }
 
+/// A running hypervisor that holds the CPU's VT-x/VMX root mode. While one is
+/// live, VirtualBox can't boot a *hardware* VM (it aborts with
+/// `VERR_VMX_IN_VMX_ROOT_MODE`). We only mark holders we know how to stop
+/// cleanly (`stoppable`); an unrecognised qemu/kvm process is reported but never
+/// killed — the caller aborts and lets the user deal with it.
+#[derive(Clone, Debug)]
+pub struct VtxHolder {
+    /// Human label, e.g. "Docker Desktop" or "multipass VM 'molt-mania-vm'".
+    pub label: String,
+    /// "docker" | "multipass" | "unknown" — selects the stop strategy.
+    pub kind: String,
+    /// Instance name to `multipass stop`; empty for non-multipass holders.
+    pub instance: String,
+    /// Whether we know a clean, reversible way to stop it (restartable after).
+    pub stoppable: bool,
+}
+
+/// Is a KVM kernel module loaded? (Cheap early-out before scanning processes.)
+fn kvm_loaded() -> bool {
+    std::fs::read_to_string("/proc/modules")
+        .map(|s| {
+            s.lines()
+                .any(|l| l.starts_with("kvm_intel") || l.starts_with("kvm_amd"))
+        })
+        .unwrap_or(false)
+}
+
+/// Detect running KVM-accelerated hypervisors that hold VT-x and would block a
+/// VirtualBox hardware VM. Pure detection — stops nothing. Empty vec = clear.
+pub fn vtx_holders() -> Vec<VtxHolder> {
+    if !kvm_loaded() {
+        return Vec::new();
+    }
+    let out = match Command::new("ps").args(["-eo", "args="]).output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    classify_vtx_holders(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pure classifier: turn `ps -eo args=` output into the VT-x holders we know how
+/// to (or refuse to) stop. Split out from `vtx_holders` so it can be unit-tested
+/// without a live process table. Only KVM-accelerated qemu lines count; Docker
+/// Desktop collapses to a single holder; multipass is named; anything else is an
+/// unknown, non-stoppable holder (we won't kill what we can't cleanly restart).
+fn classify_vtx_holders(text: &str) -> Vec<VtxHolder> {
+    let mut holders = Vec::new();
+    let mut docker_seen = false;
+    for args in text.lines() {
+        let is_qemu = args.contains("qemu-system");
+        let uses_kvm = args.contains("--enable-kvm")
+            || args.contains("-accel kvm")
+            || args.contains("accel=kvm");
+        if !(is_qemu && uses_kvm) {
+            continue;
+        }
+        if args.contains("docker-desktop") || args.contains("/.docker/") {
+            // Docker Desktop runs one linuxkit VM; collapse to a single holder.
+            if !docker_seen {
+                docker_seen = true;
+                holders.push(VtxHolder {
+                    label: "Docker Desktop".into(),
+                    kind: "docker".into(),
+                    instance: String::new(),
+                    stoppable: true,
+                });
+            }
+        } else if let Some(name) = multipass_instance(args) {
+            holders.push(VtxHolder {
+                label: format!("multipass VM '{name}'"),
+                kind: "multipass".into(),
+                instance: name,
+                stoppable: true,
+            });
+        } else {
+            holders.push(VtxHolder {
+                label: "an unknown KVM/QEMU virtual machine".into(),
+                kind: "unknown".into(),
+                instance: String::new(),
+                stoppable: false,
+            });
+        }
+    }
+    holders
+}
+
+/// Pull a multipass instance name out of a qemu command line. Multipass keeps
+/// each disk under `.../multipassd/vault/instances/<name>/...`.
+fn multipass_instance(args: &str) -> Option<String> {
+    if !args.contains("multipass") {
+        return None;
+    }
+    let marker = "/instances/";
+    let i = args.find(marker)? + marker.len();
+    let rest = &args[i..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    let name = &rest[..end];
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Stop one VT-x holder with a clean, *reversible* command so it can be
+/// restarted later. Refuses to touch holders marked `stoppable=false`.
+pub fn stop_vtx_holder(h: &VtxHolder) -> Result<()> {
+    match h.kind.as_str() {
+        "docker" => {
+            let out = Command::new("systemctl")
+                .args(["--user", "stop", "docker-desktop"])
+                .output()
+                .context("stopping Docker Desktop")?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                anyhow::bail!(
+                    "could not stop Docker Desktop: {}",
+                    err.lines().last().unwrap_or("").trim()
+                );
+            }
+            Ok(())
+        }
+        "multipass" => {
+            let out = Command::new("multipass")
+                .args(["stop", &h.instance])
+                .output()
+                .context("stopping multipass VM")?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                anyhow::bail!(
+                    "could not stop multipass '{}': {}",
+                    h.instance,
+                    err.lines().last().unwrap_or("").trim()
+                );
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("refusing to stop {} automatically", h.label),
+    }
+}
+
 /// Which sandbox to summon. Multipass = strong isolation (default for real use),
 /// Docker = fast, Local = no isolation (dev/testing only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,7 +450,10 @@ pub fn save_state(backend: Backend, name: &str, label: &str) -> Result<String> {
                 .context("docker commit (is docker installed?)")?;
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!("docker commit failed: {}", err.lines().last().unwrap_or("").trim());
+                anyhow::bail!(
+                    "docker commit failed: {}",
+                    err.lines().last().unwrap_or("").trim()
+                );
             }
             Ok(format!("image {tag}"))
         }
@@ -324,7 +464,10 @@ pub fn save_state(backend: Backend, name: &str, label: &str) -> Result<String> {
                 .context("multipass snapshot (is multipass installed?)")?;
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!("multipass snapshot failed: {}", err.lines().last().unwrap_or("").trim());
+                anyhow::bail!(
+                    "multipass snapshot failed: {}",
+                    err.lines().last().unwrap_or("").trim()
+                );
             }
             Ok(format!("snapshot {name}.{label}"))
         }
@@ -609,6 +752,75 @@ mod tests {
             acc.contains("HELLO_PTY_42"),
             "pty output missing marker; got: {acc:?}"
         );
+    }
+
+    // --- VT-x holder classification (pure, no live process table) ------------
+
+    #[test]
+    fn multipass_instance_parsed_from_qemu_args() {
+        let args = "/usr/bin/qemu-system-x86_64 ... -drive file=/var/snap/multipass/common/data/multipassd/vault/instances/molt-mania-vm/ubuntu.img ... --enable-kvm";
+        assert_eq!(multipass_instance(args).as_deref(), Some("molt-mania-vm"));
+    }
+
+    #[test]
+    fn multipass_instance_none_without_marker() {
+        assert_eq!(multipass_instance("qemu-system-x86_64 --enable-kvm"), None);
+        // has the path marker but no multipass keyword → not a multipass holder
+        assert_eq!(multipass_instance("/instances/foo/x"), None);
+    }
+
+    #[test]
+    fn classify_ignores_non_kvm_and_non_qemu() {
+        // qemu WITHOUT kvm accel (TCG) does not hold VT-x; a random process is ignored.
+        let text = "qemu-system-x86_64 -accel tcg disk.img\n/usr/bin/firefox\nbash";
+        assert!(classify_vtx_holders(text).is_empty());
+    }
+
+    #[test]
+    fn classify_collapses_docker_to_single_stoppable_holder() {
+        // Docker Desktop spawns its linuxkit qemu (sometimes >1 matching line);
+        // we want exactly one "docker" holder, marked stoppable.
+        let text = "\
+qemu-system-x86_64 --enable-kvm -name docker-desktop ...\n\
+/Applications/Docker.app/.docker/qemu --enable-kvm ...";
+        let h = classify_vtx_holders(text);
+        assert_eq!(h.len(), 1, "docker must collapse to one holder");
+        assert_eq!(h[0].kind, "docker");
+        assert!(h[0].stoppable);
+    }
+
+    #[test]
+    fn classify_names_multipass_and_marks_stoppable() {
+        let text = "qemu-system-x86_64 --enable-kvm -drive file=/x/multipassd/vault/instances/lab-vm/disk.img";
+        let h = classify_vtx_holders(text);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].kind, "multipass");
+        assert_eq!(h[0].instance, "lab-vm");
+        assert!(h[0].stoppable);
+        assert!(h[0].label.contains("lab-vm"));
+    }
+
+    #[test]
+    fn classify_unknown_kvm_vm_is_not_stoppable() {
+        // A raw qemu+kvm VM we don't recognize: detected, but we refuse to stop
+        // it (no clean, reversible restart path) → stoppable == false.
+        let text = "qemu-system-x86_64 -enable-kvm -accel kvm -hda mystery.qcow2";
+        let h = classify_vtx_holders(text);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].kind, "unknown");
+        assert!(!h[0].stoppable);
+    }
+
+    #[test]
+    fn classify_recognizes_all_kvm_accel_spellings() {
+        for accel in ["--enable-kvm", "-accel kvm", "accel=kvm"] {
+            let text = format!("qemu-system-aarch64 {accel} -hda d.img");
+            assert_eq!(
+                classify_vtx_holders(&text).len(),
+                1,
+                "missed accel: {accel}"
+            );
+        }
     }
 }
 

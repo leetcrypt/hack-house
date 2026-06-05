@@ -9,7 +9,11 @@ on:
 jobs:
   rust:
     name: rust client (hh)
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: hh
@@ -21,10 +25,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: hh
-      - run: cargo fmt --all --check
+      # fmt is platform-independent; only run it once to avoid duplicate noise.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --verbose
       - run: cargo test --verbose
+
+  rust-coverage:
+    name: rust coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hh
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v4
+        with:
+          files: hh/lcov.info
+          flags: rust
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   python:
     name: python server
@@ -38,5 +67,63 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      - run: pip install -r requirements.txt pytest-cov
+      - run: pytest -q --cov=cmd_chat --cov-report=xml
+      - if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          flags: python
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  smoke:
+    name: headless e2e smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
       - run: pip install -r requirements.txt
-      - run: pytest -q
+      - name: install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: build client
+        run: cargo build
+        working-directory: hh
+      - name: run cross-stack smoke test
+        run: bash hh/smoke-e2e.sh
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - name: cargo audit (rust client)
+        run: cargo audit
+        working-directory: hh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip-audit (python server)
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+  secrets:
+    name: secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
