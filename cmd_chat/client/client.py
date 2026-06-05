@@ -350,9 +350,12 @@ class Client:
             self.error(f"SHA-256 mismatch! File corrupted. Expected {expected_sha[:16]}..., got {actual_sha[:16]}...")
             return
 
-        # Save file
+        # Save file. The name comes from the (untrusted) offerer, so reduce it to
+        # a bare basename — never let `../` or an absolute path escape the
+        # download dir into arbitrary file writes. Mirrors the Rust client.
         self.download_dir.mkdir(parents=True, exist_ok=True)
-        filename = meta.get("name", f"file_{transfer_id[:8]}")
+        raw_name = meta.get("name", f"file_{transfer_id[:8]}")
+        filename = Path(raw_name).name or f"file_{transfer_id[:8]}"
         save_path = self.download_dir / filename
 
         # Avoid overwriting — append number if exists
