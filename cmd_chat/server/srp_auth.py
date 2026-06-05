@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 from uuid import uuid4
@@ -7,6 +8,11 @@ import srp
 
 srp.rfc5054_enable()
 
+# Half-finished handshakes (init without a matching verify) would otherwise pile
+# up forever, letting an attacker exhaust memory. Evict any session that hasn't
+# authenticated within this many seconds whenever a new handshake begins.
+UNVERIFIED_TTL_SECONDS = 60
+
 
 @dataclass
 class SRPSession:
@@ -15,6 +21,7 @@ class SRPSession:
     svr: Optional[srp.Verifier] = None
     session_key: Optional[bytes] = None
     authenticated: bool = False
+    created_at: float = field(default_factory=time.monotonic)
 
 
 class SRPAuthManager:
@@ -25,9 +32,20 @@ class SRPAuthManager:
             b"chat", self.password, hash_alg=srp.SHA256
         )
 
+    def _evict_stale_unverified(self) -> None:
+        now = time.monotonic()
+        stale = [
+            uid
+            for uid, s in self.sessions.items()
+            if not s.authenticated and now - s.created_at > UNVERIFIED_TTL_SECONDS
+        ]
+        for uid in stale:
+            del self.sessions[uid]
+
     def init_auth(
         self, username: str, client_public: bytes
     ) -> tuple[str, bytes, bytes]:
+        self._evict_stale_unverified()
         session = SRPSession(username=username)
 
         svr = srp.Verifier(

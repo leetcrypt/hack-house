@@ -573,9 +573,27 @@ fn handle_ft(
             }
         }
         ft::Ft::Chunk { id, data } => {
+            // Enforce the declared size (clamped to MAX_SIZE) on receipt — a
+            // malicious sender can lie about `size` or just keep streaming, so
+            // never let an accepted transfer grow its buffer past the cap.
+            let mut overflow = false;
             if let Some(t) = app.transfers.get_mut(&id) {
                 if t.accepted {
-                    t.buf.extend_from_slice(&data);
+                    let cap = (t.meta.size as usize).min(ft::MAX_SIZE);
+                    if t.buf.len() + data.len() > cap {
+                        overflow = true;
+                    } else {
+                        t.buf.extend_from_slice(&data);
+                    }
+                }
+            }
+            if overflow {
+                if let Some(t) = app.transfers.remove(&id) {
+                    app.err(format!(
+                        "{} — transfer exceeds declared size (max {}), aborted",
+                        t.meta.name,
+                        ft::human((t.meta.size as usize).min(ft::MAX_SIZE))
+                    ));
                 }
             }
         }

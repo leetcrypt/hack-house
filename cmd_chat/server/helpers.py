@@ -1,3 +1,4 @@
+import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -10,9 +11,16 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# Only honor X-Forwarded-For when explicitly told we sit behind a trusted proxy
+# (TRUST_PROXY=1). Otherwise a direct client can spoof the header to forge a
+# source IP and dodge the per-IP rate limiter, so we use the real peer address.
+_TRUST_PROXY = os.environ.get("TRUST_PROXY", "").lower() in ("1", "true", "yes")
+
+
 def get_client_ip(request: Request) -> str:
-    if forwarded := request.headers.get("x-forwarded-for"):
-        return forwarded.split(",")[0].strip()
+    if _TRUST_PROXY:
+        if forwarded := request.headers.get("x-forwarded-for"):
+            return forwarded.split(",")[0].strip()
     return request.ip
 
 

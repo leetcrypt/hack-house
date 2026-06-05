@@ -319,10 +319,21 @@ class Client:
         elif ft_type == "chunk":
             if transfer_id in self.received_chunks:
                 chunk_data = base64.b64decode(ft_data.get("data", ""))
-                self.received_chunks[transfer_id].append(chunk_data)
                 meta = self.transfer_meta.get(transfer_id, {})
-                total = meta.get("size", 0)
+                total = meta.get("size", 0) or 0
+                # Enforce the declared size (clamped to MAX_FILE_SIZE) on receipt:
+                # a sender can lie about `size` or just keep streaming, so abort
+                # the moment the accumulated bytes would exceed the cap.
+                cap = min(total, MAX_FILE_SIZE) if total else MAX_FILE_SIZE
                 received = sum(len(c) for c in self.received_chunks[transfer_id])
+                if received + len(chunk_data) > cap:
+                    self.received_chunks.pop(transfer_id, None)
+                    self.transfer_meta.pop(transfer_id, None)
+                    self.console.print()
+                    self.error("Transfer exceeds declared size — aborted.")
+                    return True
+                self.received_chunks[transfer_id].append(chunk_data)
+                received += len(chunk_data)
                 pct = int(received * 100 / total) if total else 0
                 self.console.print(
                     f"\r[cyan]Receiving: {pct}% ({_human_size(received)}/{_human_size(total)})[/]",

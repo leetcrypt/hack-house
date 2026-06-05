@@ -11,6 +11,13 @@ from .models import Message, UserSession
 from .helpers import get_client_ip, send_state, utcnow
 
 
+# Hard cap on a single relayed WS frame. The largest legitimate frame is one
+# Fernet-encrypted 64 KB file chunk (~120 KB after base64 + token overhead), so
+# 256 KB leaves headroom while bounding per-message memory and the 1000-message
+# store. Oversized frames are dropped, not stored or broadcast.
+MAX_FRAME_SIZE = 256 * 1024
+
+
 def generate_ws_token(user_id: str, secret: bytes) -> str:
     return hmac.new(secret, user_id.encode(), hashlib.sha256).hexdigest()
 
@@ -152,10 +159,16 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
             if data is None:
                 break
 
+            text = str(data)
+            # Drop oversized frames before they reach the store/broadcast: this
+            # bounds memory and stops a single client from flooding the room.
+            if len(text) > MAX_FRAME_SIZE:
+                continue
+
             app.ctx.session_store.update_activity(user_id)
 
             message = Message(
-                text=str(data),
+                text=text,
                 username=session.username,
             )
             app.ctx.message_store.add(message)
