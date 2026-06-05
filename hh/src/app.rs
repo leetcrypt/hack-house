@@ -37,6 +37,18 @@ pub struct ChatLine {
     pub system: bool,
 }
 
+/// A power a user currently holds in the room. Badges stack: a user can be the
+/// `Host` *and* a `Sudoer` *and* a `Driver` at once. `Member` is the floor —
+/// returned only when none of the others apply. The order of the variants is
+/// the order badges are painted (host first).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Host,
+    Sudoer,
+    Driver,
+    Member,
+}
+
 #[derive(Clone)]
 pub struct User {
     pub user_id: String,
@@ -107,12 +119,46 @@ pub enum Net {
     /// A local system notice produced off-thread (e.g. async Ollama probe).
     Sys(String),
     Err(String),
+    /// Relayed to the room when a member opens a shared VirtualBox VM locally, so
+    /// the *other* party knows the appliance is live and can open their own copy.
+    /// `by` is the server-authenticated launcher; the receiver skips its own echo.
+    VmOpened {
+        by: String,
+        vm: String,
+    },
     Closed,
 }
 
 pub struct SbxView {
     pub parser: vt100::Parser,
     pub backend: String,
+}
+
+/// Where a staged `/sbx gui` launch is in its confirmation gauntlet. A local VM
+/// boots a real window on the user's own machine and can require stopping other
+/// hypervisors / installing VirtualBox, so each consequence gets its own
+/// explicit `/sbx gui yes`. Any `/sbx gui cancel` (or a fresh `/sbx gui <vm>`)
+/// abandons the pending launch without side effects.
+#[derive(Clone)]
+pub enum VmStage {
+    /// Gate 1 — confirm opening the VM locally at all.
+    Open,
+    /// Gate 2 — confirm STOPPING the VT-x holders that block a hardware VM.
+    CloseConflicts,
+    /// Gate 3 — confirm INSTALLING VirtualBox (it isn't present yet).
+    Install,
+}
+
+/// A `/sbx gui <vm>` launch awaiting confirmation. Detection is captured once
+/// (at stage Open) so the prompts stay consistent through the gauntlet.
+#[derive(Clone)]
+pub struct PendingVm {
+    pub vm: String,
+    pub stage: VmStage,
+    /// Hypervisors holding VT-x that must stop before a hardware VM can boot.
+    pub conflicts: Vec<sbx::VtxHolder>,
+    /// VirtualBox isn't installed; the launch must install it first.
+    pub needs_install: bool,
 }
 
 /// Display handle the summoned Python agent joins under (see `spawn_agent`).
@@ -132,6 +178,9 @@ pub struct App {
     /// Members whose VM unix account has sudo (superuser). Always includes owner.
     pub sudoers: std::collections::HashSet<String>,
     pub pending_offer: Option<ft::Offer>,
+    /// A `/sbx gui <vm>` launch waiting on its confirmation gauntlet (open →
+    /// stop-conflicts → install). None when nothing is pending.
+    pub pending_vm: Option<PendingVm>,
     transfers: HashMap<String, Transfer>,
     /// Chat scrollback: lines scrolled up from the live bottom (0 = following).
     pub chat_scroll: usize,
@@ -180,6 +229,7 @@ impl App {
             drivers: std::collections::HashSet::new(),
             sudoers: std::collections::HashSet::new(),
             pending_offer: None,
+            pending_vm: None,
             transfers: HashMap::new(),
             chat_scroll: 0,
             sbx_scroll: 0,
@@ -217,6 +267,35 @@ impl App {
     }
     pub fn can_drive(&self) -> bool {
         self.drivers.contains(&self.me)
+    }
+
+    /// The room host — whoever opened the house. The relay returns the roster in
+    /// join order (its session store is an insertion-ordered map), and every
+    /// client is served the *same* ordered roster, so "first occupant" is a
+    /// stable, consistent host across all peers without any extra protocol.
+    pub fn host(&self) -> Option<&str> {
+        self.users.first().map(|u| u.username.as_str())
+    }
+
+    /// Every role `name` currently holds, additive and in paint order. Reads the
+    /// exact same `sudoers`/`drivers` sets the broker uses to gate shell input,
+    /// so a rendered badge can never claim a power the room won't actually
+    /// enforce. Always returns at least `Member`.
+    pub fn roles_of(&self, name: &str) -> Vec<Role> {
+        let mut roles = Vec::new();
+        if self.host() == Some(name) {
+            roles.push(Role::Host);
+        }
+        if self.sudoers.contains(name) {
+            roles.push(Role::Sudoer);
+        }
+        if self.drivers.contains(name) {
+            roles.push(Role::Driver);
+        }
+        if roles.is_empty() {
+            roles.push(Role::Member);
+        }
+        roles
     }
 
     fn sys(&mut self, text: impl Into<String>) {
@@ -353,6 +432,14 @@ impl App {
             Net::Ft(_) => {} // handled in the run loop (needs out channel + disk)
             Net::Sys(t) => self.sys(t),
             Net::Err(t) => self.err(t),
+            Net::VmOpened { by, vm } => {
+                // Skip our own echo — we already saw the local "launched" line.
+                if by != self.me {
+                    self.sys(format!(
+                        "⛧ {by} opened ‘{vm}’ locally — `/sbx gui {vm}` to open your own copy"
+                    ));
+                }
+            }
             Net::Closed => {
                 self.connected = false;
                 self.sys("connection closed — press Ctrl-R to reconnect");
@@ -1015,9 +1102,8 @@ async fn writer_task(
             biased;
             // Swap in a reconnect's fresh sink before draining more frames.
             new_sink = sink_rx.recv() => {
-                match new_sink {
-                    Some(s) => sink = s,
-                    None => {}
+                if let Some(s) = new_sink {
+                    sink = s;
                 }
             }
             msg = out_rx.recv() => {
@@ -1094,13 +1180,20 @@ fn handle_command(
         } else if name == "random" {
             // Same as Ctrl+Alt+P — roll a fresh procedural vestment.
             *theme = Theme::random();
-            app.sys(format!("{} conjured vestment '{}'", theme.sigil, theme.name));
+            app.sys(format!(
+                "{} conjured vestment '{}'",
+                theme.sigil, theme.name
+            ));
         } else if name == "save" || name.starts_with("save ") {
             // Persist the vestment you're currently wearing (e.g. a `random`
             // roll you like) to themes/<slug>.toml so it sticks around. Bare
             // `/theme save` reuses the theme's own generated name.
             let want = name[4..].trim();
-            let want = if want.is_empty() { theme.name.clone() } else { want.to_string() };
+            let want = if want.is_empty() {
+                theme.name.clone()
+            } else {
+                want.to_string()
+            };
             match theme.save(&want) {
                 Ok(slug) => app.sys(format!(
                     "{} saved vestment '{slug}' — re-don it anytime with /theme {slug}",
@@ -1338,36 +1431,64 @@ fn handle_command(
             }
             Some("gui") => {
                 let gargs: Vec<&str> = p.collect();
-                let install = gargs.iter().any(|a| *a == "--install");
-                let name = gargs
-                    .iter()
-                    .copied()
-                    .find(|a| !a.starts_with('-'))
-                    .map(str::to_string);
-                match name {
-                    None => app.sys("usage: /sbx gui <vm> [--install]   (list VMs with /sbx vms)"),
-                    Some(vm) => {
-                        app.sys(format!("launching {vm} in the VirtualBox GUI…"));
-                        let tx = app_tx.clone();
-                        tokio::spawn(async move {
-                            let res = tokio::task::spawn_blocking(move || {
-                                if !sbx::vbox_installed() {
-                                    if install {
-                                        sbx::ensure_vbox_install()
-                                            .map_err(|e| format!("install failed: {e}"))?;
-                                    } else {
-                                        return Err("VirtualBox isn't installed — retry with `/sbx gui <vm> --install` (needs sudo), or run ./ensure-vbox.sh first".to_string());
-                                    }
+                let first = gargs.iter().copied().find(|a| !a.starts_with('-'));
+                let is_yes = matches!(first, Some("yes" | "y" | "go" | "confirm" | "ok"));
+                let is_no = matches!(first, Some("no" | "n" | "cancel" | "abort" | "stop"));
+                if is_no {
+                    // A `/sbx gui cancel` at any gate: drop the launch, no side
+                    // effects (nothing was stopped or installed yet).
+                    if app.pending_vm.take().is_some() {
+                        app.sys("cancelled — no VM launched, nothing stopped or installed");
+                    } else {
+                        app.sys("nothing to cancel");
+                    }
+                } else if is_yes {
+                    // Advance the gauntlet one gate.
+                    match app.pending_vm.take() {
+                        None => app.sys("no VM launch is waiting — start one with `/sbx gui <vm>`"),
+                        Some(pend) => advance_vm(pend, app, app_tx, out_tx, room),
+                    }
+                } else {
+                    // A fresh `/sbx gui <vm>`: detect locally and pose gate 1.
+                    let install_flag = gargs.contains(&"--install");
+                    match first.map(str::to_string) {
+                        None => app.sys(
+                            "usage: /sbx gui <vm> [--install]  ·  confirm with `/sbx gui yes`, abort with `/sbx gui cancel`  (list VMs: /sbx vms)",
+                        ),
+                        Some(vm) => {
+                            let installed = sbx::vbox_installed();
+                            if installed && sbx::vm_running(&vm) {
+                                app.sys(format!(
+                                    "{vm} is already running — look for its window on your desktop"
+                                ));
+                            } else {
+                                // Local boot affects the user's own machine, so
+                                // stage it behind explicit confirmation. Anyone
+                                // in the room can run this — each client opens
+                                // its own copy locally (host and guest alike).
+                                let _ = install_flag; // consent now flows through `/sbx gui yes`
+                                let conflicts = sbx::vtx_holders();
+                                let mut warn = String::new();
+                                if !conflicts.is_empty() {
+                                    warn.push_str(&format!(
+                                        " ⚠ {} other VM(s) hold VT-x and may need to stop.",
+                                        conflicts.len()
+                                    ));
                                 }
-                                sbx::gui_launch(&vm).map_err(|e| e.to_string())
-                            })
-                            .await;
-                            let _ = match res {
-                                Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
-                                Ok(Err(e)) => tx.send(Net::Err(e)),
-                                Err(e) => tx.send(Net::Err(format!("gui task: {e}"))),
-                            };
-                        });
+                                if !installed {
+                                    warn.push_str(" (VirtualBox isn't installed yet.)");
+                                }
+                                app.sys(format!(
+                                    "open ‘{vm}’ locally? a VirtualBox window will launch on YOUR machine.{warn}  →  `/sbx gui yes` to continue · `/sbx gui cancel` to abort"
+                                ));
+                                app.pending_vm = Some(PendingVm {
+                                    vm,
+                                    stage: VmStage::Open,
+                                    conflicts,
+                                    needs_install: !installed,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -1588,7 +1709,122 @@ fn local_ollama_models() -> Result<Vec<String>, String> {
 fn is_snap_label(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Advance a staged `/sbx gui` launch by one confirmation gate. Each `/sbx gui
+/// yes` calls this. Stage transitions are pure (app-thread) state changes; only
+/// the *final* gate spawns the off-thread executor that actually stops
+/// conflicts, installs, and boots the VM. A holder we can't stop cleanly aborts
+/// the whole launch here rather than killing anything.
+fn advance_vm(
+    pend: PendingVm,
+    app: &mut App,
+    app_tx: &UnboundedSender<Net>,
+    out_tx: &UnboundedSender<WsMsg>,
+    room: &Arc<fernet::Fernet>,
+) {
+    // Refuse outright if any VT-x holder is one we won't touch (e.g. a stray
+    // qemu we don't recognise). Better to make the user decide than to kill it.
+    if let Some(bad) = pend.conflicts.iter().find(|h| !h.stoppable) {
+        app.err(format!(
+            "can't free VT-x automatically — {} is running and I won't kill it. Stop it yourself, then retry `/sbx gui {}`.",
+            bad.label, pend.vm
+        ));
+        return;
+    }
+    match pend.stage {
+        VmStage::Open => {
+            if !pend.conflicts.is_empty() {
+                let names: Vec<String> = pend.conflicts.iter().map(|h| h.label.clone()).collect();
+                app.sys(format!(
+                    "⚠ second confirmation: these hold the CPU's VT-x and block a VirtualBox VM — {}. They must STOP first (reversible — restart them afterwards).  →  `/sbx gui yes` to stop them & continue · `/sbx gui cancel` to abort",
+                    names.join(", ")
+                ));
+                app.pending_vm = Some(PendingVm {
+                    stage: VmStage::CloseConflicts,
+                    ..pend
+                });
+            } else if pend.needs_install {
+                app.sys("VirtualBox isn't installed.  →  `/sbx gui yes` to install it now (needs sudo) · `/sbx gui cancel` to abort");
+                app.pending_vm = Some(PendingVm {
+                    stage: VmStage::Install,
+                    ..pend
+                });
+            } else {
+                spawn_vm_execute(pend, app, app_tx, out_tx, room);
+            }
+        }
+        VmStage::CloseConflicts => {
+            if pend.needs_install {
+                app.sys("VirtualBox isn't installed.  →  `/sbx gui yes` to install it now (needs sudo) · `/sbx gui cancel` to abort");
+                app.pending_vm = Some(PendingVm {
+                    stage: VmStage::Install,
+                    ..pend
+                });
+            } else {
+                spawn_vm_execute(pend, app, app_tx, out_tx, room);
+            }
+        }
+        VmStage::Install => spawn_vm_execute(pend, app, app_tx, out_tx, room),
+    }
+}
+
+/// Final step of the gauntlet: off-thread, stop any VT-x holders (reversibly),
+/// install VirtualBox if needed, then boot the VM's GUI. Reports through the
+/// app channel so the blocking work never stalls the TUI. On success it also
+/// broadcasts a `_sbx:vm` frame so the *other* party sees the shared appliance
+/// go live and can `/sbx gui <vm>` their own local copy — anyone in the room may
+/// do so (the per-client consent gauntlet *is* the client's permission; this is
+/// deliberately not owner-gated, unlike `/sbx save`).
+fn spawn_vm_execute(
+    pend: PendingVm,
+    app: &mut App,
+    app_tx: &UnboundedSender<Net>,
+    out_tx: &UnboundedSender<WsMsg>,
+    room: &Arc<fernet::Fernet>,
+) {
+    let PendingVm {
+        vm,
+        conflicts,
+        needs_install,
+        ..
+    } = pend;
+    if conflicts.is_empty() {
+        app.sys(format!("launching ‘{vm}’…"));
+    } else {
+        app.sys(format!(
+            "freeing VT-x ({} VM(s)) then launching ‘{vm}’…",
+            conflicts.len()
+        ));
+    }
+    let tx = app_tx.clone();
+    let out = out_tx.clone();
+    let room = room.clone();
+    let announce_vm = vm.clone();
+    tokio::spawn(async move {
+        let res = tokio::task::spawn_blocking(move || {
+            for h in &conflicts {
+                sbx::stop_vtx_holder(h).map_err(|e| format!("freeing VT-x: {e}"))?;
+            }
+            if needs_install && !sbx::vbox_installed() {
+                sbx::ensure_vbox_install().map_err(|e| format!("install failed: {e}"))?;
+            }
+            sbx::gui_launch(&vm).map_err(|e| e.to_string())
+        })
+        .await;
+        let _ = match res {
+            Ok(Ok(desc)) => {
+                // Tell the room the shared VM is live (others can open their own).
+                let frame = json!({"_sbx": "vm", "vm": announce_vm});
+                let _ = out.send(WsMsg::Text(room.encrypt(frame.to_string().as_bytes())));
+                tx.send(Net::Sys(format!("⛧ {desc}")))
+            }
+            Ok(Err(e)) => tx.send(Net::Err(e)),
+            Err(e) => tx.send(Net::Err(format!("gui task: {e}"))),
+        };
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1712,7 +1948,10 @@ fn spawn_agent(
             cmd.arg("--profile").arg(p);
         }
         None => {
-            cmd.arg("--provider").arg("ollama").arg("--model").arg(model);
+            cmd.arg("--provider")
+                .arg("ollama")
+                .arg("--model")
+                .arg(model);
         }
     }
     cmd.stdin(Stdio::null())
@@ -1733,8 +1972,131 @@ fn spawn_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::drain_ready;
+    use super::{advance_vm, drain_ready, App, Net, PendingVm, Role, User, VmStage};
+    use crate::sbx::VtxHolder;
+    use std::sync::Arc;
     use tokio::sync::mpsc::unbounded_channel;
+
+    fn holder(kind: &str, stoppable: bool) -> VtxHolder {
+        VtxHolder {
+            label: format!("{kind} VM"),
+            kind: kind.into(),
+            instance: String::new(),
+            stoppable,
+        }
+    }
+
+    fn test_room() -> Arc<fernet::Fernet> {
+        Arc::new(fernet::Fernet::new(&fernet::Fernet::generate_key()).expect("key"))
+    }
+
+    /// The consent gauntlet must walk Open → CloseConflicts when a (stoppable)
+    /// hypervisor holds VT-x, posing a SECOND confirmation rather than acting.
+    #[test]
+    fn advance_vm_open_with_conflict_asks_to_stop_it() {
+        let (app_tx, _ar) = unbounded_channel::<Net>();
+        let (out_tx, _or) = unbounded_channel();
+        let room = test_room();
+        let mut app = App::new("alice".into());
+        let pend = PendingVm {
+            vm: "WinLab".into(),
+            stage: VmStage::Open,
+            conflicts: vec![holder("multipass", true)],
+            needs_install: false,
+        };
+        advance_vm(pend, &mut app, &app_tx, &out_tx, &room);
+        let p = app.pending_vm.as_ref().expect("still pending after gate 1");
+        assert!(matches!(p.stage, VmStage::CloseConflicts));
+        assert!(app
+            .lines
+            .last()
+            .unwrap()
+            .text
+            .contains("second confirmation"));
+    }
+
+    /// Safety invariant: if ANY holder is non-stoppable (something we won't kill),
+    /// the gauntlet refuses — it surfaces an error and drops the pending launch
+    /// rather than advancing or touching the unknown process.
+    #[test]
+    fn advance_vm_refuses_when_a_holder_is_unstoppable() {
+        let (app_tx, _ar) = unbounded_channel::<Net>();
+        let (out_tx, _or) = unbounded_channel();
+        let room = test_room();
+        let mut app = App::new("alice".into());
+        let pend = PendingVm {
+            vm: "WinLab".into(),
+            stage: VmStage::Open,
+            conflicts: vec![holder("unknown", false)],
+            needs_install: false,
+        };
+        advance_vm(pend, &mut app, &app_tx, &out_tx, &room);
+        assert!(app.pending_vm.is_none(), "must not advance past a refusal");
+        assert!(app.error.is_some(), "must surface an error");
+    }
+
+    /// With no VT-x conflict but VirtualBox absent, Open → Install (gate 3).
+    #[test]
+    fn advance_vm_open_needing_install_moves_to_install_gate() {
+        let (app_tx, _ar) = unbounded_channel::<Net>();
+        let (out_tx, _or) = unbounded_channel();
+        let room = test_room();
+        let mut app = App::new("alice".into());
+        let pend = PendingVm {
+            vm: "WinLab".into(),
+            stage: VmStage::Open,
+            conflicts: vec![],
+            needs_install: true,
+        };
+        advance_vm(pend, &mut app, &app_tx, &out_tx, &room);
+        let p = app.pending_vm.as_ref().expect("pending at install gate");
+        assert!(matches!(p.stage, VmStage::Install));
+    }
+
+    /// After confirming the stop, if install is still needed the gauntlet steps
+    /// CloseConflicts → Install (it does not jump straight to launching).
+    #[test]
+    fn advance_vm_closeconflicts_needing_install_steps_to_install() {
+        let (app_tx, _ar) = unbounded_channel::<Net>();
+        let (out_tx, _or) = unbounded_channel();
+        let room = test_room();
+        let mut app = App::new("alice".into());
+        let pend = PendingVm {
+            vm: "WinLab".into(),
+            stage: VmStage::CloseConflicts,
+            conflicts: vec![holder("docker", true)],
+            needs_install: true,
+        };
+        advance_vm(pend, &mut app, &app_tx, &out_tx, &room);
+        let p = app.pending_vm.as_ref().expect("pending at install gate");
+        assert!(matches!(p.stage, VmStage::Install));
+    }
+
+    /// A `_sbx:vm` broadcast from ANOTHER member surfaces a "open your own copy"
+    /// notice to the room.
+    #[test]
+    fn vm_opened_from_peer_notifies_the_room() {
+        let mut app = App::new("alice".into());
+        app.apply(Net::VmOpened {
+            by: "bob".into(),
+            vm: "WinLab".into(),
+        });
+        let last = &app.lines.last().unwrap().text;
+        assert!(last.contains("bob") && last.contains("WinLab"));
+    }
+
+    /// ...but our OWN echo is skipped — we already printed the local "launched"
+    /// line, so we must not double-report it.
+    #[test]
+    fn vm_opened_self_echo_is_skipped() {
+        let mut app = App::new("alice".into());
+        let before = app.lines.len();
+        app.apply(Net::VmOpened {
+            by: "alice".into(),
+            vm: "WinLab".into(),
+        });
+        assert_eq!(app.lines.len(), before, "self-echo must not add a line");
+    }
 
     /// `drain_ready` pulls a bounded burst in FIFO order and stops at the cap.
     #[tokio::test]
@@ -1789,6 +2151,64 @@ mod tests {
             }
         }
         assert!(saw_chat, "chat frame must be observed");
-        assert!(turns <= 4, "chat took {turns} turns to surface (expected <= 4)");
+        assert!(
+            turns <= 4,
+            "chat took {turns} turns to surface (expected <= 4)"
+        );
+    }
+
+    fn user(name: &str) -> User {
+        User {
+            user_id: format!("id-{name}"),
+            username: name.into(),
+        }
+    }
+
+    /// The host is the first occupant of the roster, and an empty roster has no
+    /// host — so a freshly-built app (no users yet) confers the title on nobody.
+    #[test]
+    fn host_is_first_roster_member() {
+        let mut app = App::new("alice".into());
+        assert_eq!(app.host(), None, "empty roster has no host");
+        app.users = vec![user("alice"), user("bob")];
+        assert_eq!(app.host(), Some("alice"));
+        // Host follows roster order, not who `me` is.
+        app.users = vec![user("bob"), user("alice")];
+        assert_eq!(app.host(), Some("bob"));
+    }
+
+    /// The host wears the Host badge with zero sandbox activity — Option A: the
+    /// title shows the moment they're in the room, not only after a launch.
+    #[test]
+    fn host_badge_shows_without_a_sandbox() {
+        let mut app = App::new("alice".into());
+        app.users = vec![user("alice"), user("bob")];
+        assert_eq!(app.roles_of("alice"), vec![Role::Host]);
+        assert_eq!(app.roles_of("bob"), vec![Role::Member]);
+    }
+
+    /// Badges stack: a host who summoned a sandbox (sudoer) and can drive holds
+    /// all three at once, in paint order Host → Sudoer → Driver.
+    #[test]
+    fn roles_stack_additively() {
+        let mut app = App::new("alice".into());
+        app.users = vec![user("alice"), user("bob")];
+        app.sudoers.insert("alice".into());
+        app.drivers.insert("alice".into());
+        assert_eq!(
+            app.roles_of("alice"),
+            vec![Role::Host, Role::Sudoer, Role::Driver]
+        );
+    }
+
+    /// A non-host can hold powers independently of the host title: bob granted
+    /// drive shows Driver only — never Host, and not a bare Member.
+    #[test]
+    fn non_host_powers_are_independent_of_the_title() {
+        let mut app = App::new("alice".into());
+        app.users = vec![user("alice"), user("bob")];
+        app.drivers.insert("bob".into());
+        assert_eq!(app.roles_of("bob"), vec![Role::Driver]);
+        assert_eq!(app.roles_of("alice"), vec![Role::Host]);
     }
 }

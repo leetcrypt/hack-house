@@ -99,7 +99,9 @@ fn main() -> Result<()> {
                 match net::authenticate(&ip, port, &name, &password, no_tls, insecure) {
                     Ok(s) => break s,
                     Err(e) if interactive => {
-                        eprintln!("✖ {e:#}\n  that handle didn't work (taken or full?) — pick another.");
+                        eprintln!(
+                            "✖ {e:#}\n  that handle didn't work (taken or full?) — pick another."
+                        );
                         name = prompt_handle()?;
                     }
                     Err(e) => return Err(e),
@@ -168,7 +170,7 @@ fn main() -> Result<()> {
 fn prompt_handle() -> Result<String> {
     use std::io::Write;
     loop {
-        print!("⛧ choose your handle: ");
+        print!("✝ choose your handle: ");
         std::io::stdout().flush()?;
         let mut s = String::new();
         if std::io::stdin().read_line(&mut s)? == 0 {

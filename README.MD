@@ -33,11 +33,13 @@ Encrypted chat that runs in your terminal. You host the server, you control the 
 - **Zero-knowledge server** — relays only ciphertext; cannot read messages, files, or terminal output
 - **RAM only** — nothing persisted on the server; close it and history is gone
 - **Shared sandbox** — summon a disposable `local` / `docker` / `multipass` box the whole room can watch and drive
-- **Real permissions** — the sandbox owner grants/revokes *drive* (keyboard) and *sudo* (VM superuser) per user
-- **Local-first AI agent** — `/ai start` summons an in-room AI that runs against *your own* [Ollama](https://ollama.com) (no API key, nothing leaves your machine); model-agnostic, addressed-only, end-to-end encrypted like every other client
+- **Snapshot save/load** — freeze a sandbox to a named snapshot and restore it later (`/sbx save` · `/sbx load` · `/sbx snaps`)
+- **Local VirtualBox VMs** — `/sbx vms` detects VirtualBox and lists your VMs; `/sbx gui <vm>` opens a desktop VM locally for the room to gather around — per-user consent gate, with automatic resolution of VT-x conflicts (Docker Desktop / multipass)
+- **Real permissions** — the host grants/revokes *drive* (keyboard) and *sudo* (VM superuser) per user; **stacking roster badges** show exactly who holds what, both in the clergy panel and inline on every chat message
+- **Local-first AI agent** — `/ai start` summons an in-room AI that runs against *your own* [Ollama](https://ollama.com) (no API key, nothing leaves your machine); replies **stream token-by-token** with **in-RAM semantic recall** of the conversation for context; model-agnostic, addressed-only, end-to-end encrypted like every other client
 - **Encrypted file transfer** — `/send` → `/accept` with SHA-256 verification
 - **TLS** — self-signed by default, or bring your own cert; `--no-tls` for local/Tailscale use
-- **Themes** — switchable "vestments" (`church` · `neon` · `crypt`)
+- **Themes** — seven switchable "vestments" (`crypt` default · `church` · `neon` · `blush` · `matrix` · `wraith` · `goldcrypt`), plus a live randomizer
 
 ## Layout
 
@@ -157,6 +159,9 @@ Type to chat. Slash commands and keys:
 | `/ai models` | Models the active agent can serve — or, with no agent, your local Ollama tags |
 | `/sbx launch [local\|docker\|multipass] [image]` | Summon the shared sandbox |
 | `/sbx stop` | Tear down the sandbox you host |
+| `/sbx save [label]` · `/sbx load <label>` · `/sbx snaps` | Snapshot the sandbox, restore one, or list snapshots |
+| `/sbx vms` | Detect VirtualBox and list local VMs |
+| `/sbx gui <vm> [--install]` | Open a local VirtualBox desktop VM for the room (consent-gated) |
 | `/drive` · `F2` | Take the shared shell (`Esc` releases) |
 | `/grant <user>` · `/revoke <user>` | Owner: delegate/withdraw drive |
 | `/sudo <user>` · `/unsudo <user>` | Owner: delegate/withdraw VM superuser |
@@ -179,6 +184,19 @@ server only ever sees ciphertext (same trust model as chat).
 | `multipass` | full VM | `24.04` by default; strongest isolation, ~30 s to boot, the choice for real use |
 
 Tear it down with `/sbx stop` (purges the VM/container).
+
+**Snapshots.** Freeze the current sandbox to a named checkpoint with `/sbx save
+[label]`, list what you've stored with `/sbx snaps`, and restore one later with
+`/sbx load <label>` — handy for resuming a half-built environment or replaying a
+demo from a known-good state.
+
+**Local VirtualBox VMs.** Separate from the relayed sandbox, `/sbx vms` detects a
+VirtualBox install and lists your VMs, and `/sbx gui <vm>` boots one as a full
+desktop VM **on your own machine** (`--install` offers to install VirtualBox
+first if it's missing). It's not owner-gated — the per-user confirmation gate
+*is* the permission, so everyone opens their own copy. If a hardware hypervisor
+(Docker Desktop, multipass) is holding VT-x, hack-house detects the conflict and
+offers to stop it so the VM can boot.
 
 ### Driving the shell
 
@@ -204,8 +222,14 @@ Permissions are enforced at **two layers**:
    "may type" and "may run privileged commands" are independent and enforced by
    the OS itself.
 
-The roster shows each member's status: owner, sudoer (⚡), driver (◆), or
-member (•).
+The roster shows each member's status with **stacking badges**: host (the
+theme's sigil, e.g. `✝`), sudoer (⚡), driver (◆), and member (•). They're
+additive — a host who summoned a sandbox and can drive reads `✝⚡◆` — and the
+host badge appears the moment someone is first in the room, before any sandbox
+exists. The same badge is rendered inline next to the author on every chat
+message, so a message's authority is legible right in the transcript, not only
+in the side panel. Because the badges read the exact ACL the sandbox enforces,
+they can never advertise a power the room won't honour.
 
 ### Sharing files & directories
 
@@ -257,10 +281,12 @@ directly:
 
 ### Themes (vestments)
 
-Three bundled themes — `crypt` (default, neutral monochrome), `church` (neon),
-and `neon`. Switch live with `/theme <name>`, list them with bare `/theme`, or
-load your own TOML at launch with `--theme <path>` (see `hh/themes/`). Each
-theme defines its own sigil, colours, and roster width.
+Seven bundled themes — `crypt` (default, neutral monochrome, `✝` sigil),
+`church`, `neon`, `blush`, `matrix`, `wraith`, and `goldcrypt`. Switch live with
+`/theme <name>`, list them with bare `/theme`, roll a fresh randomized vestment
+with `Ctrl+Alt+P` (and save it to disk), or load your own TOML at launch with
+`--theme <path>` (see `hh/themes/`). Each theme defines its own sigil, colours,
+and roster width.
 
 ### Staying connected
 

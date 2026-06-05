@@ -77,7 +77,7 @@ impl Theme {
     pub fn random() -> Theme {
         let mut r = Rng::seeded();
         let base = r.range(0.0, 360.0); // base hue for the surface/ink family
-        // Accent sits at an analogous or complementary offset for contrast.
+                                        // Accent sits at an analogous or complementary offset for contrast.
         let accent_hue = (base + *r.pick(&[30.0, 150.0, 180.0, 210.0, 330.0_f32])) % 360.0;
 
         let bg = hsv(base, r.range(0.22, 0.5), r.range(0.06, 0.12)); // deep tinted slate
@@ -134,12 +134,15 @@ impl Theme {
     /// the file, the `name` field, and the `/theme` argument all agree.
     pub fn save(&self, name: &str) -> anyhow::Result<String> {
         let slug = slugify(name);
-        anyhow::ensure!(!slug.is_empty(), "give the vestment a name (letters/digits)");
+        anyhow::ensure!(
+            !slug.is_empty(),
+            "give the vestment a name (letters/digits)"
+        );
         let mut t = self.clone();
         t.name = slug.clone();
         let path = format!("{THEMES_DIR}/{slug}.toml");
-        let body = toml::to_string_pretty(&t)
-            .with_context(|| format!("serialize vestment '{slug}'"))?;
+        let body =
+            toml::to_string_pretty(&t).with_context(|| format!("serialize vestment '{slug}'"))?;
         std::fs::write(&path, body).with_context(|| format!("write {path}"))?;
         Ok(slug)
     }
@@ -165,18 +168,30 @@ fn slugify(name: &str) -> String {
 }
 
 /// Occult glyphs the randomizer can stamp as the title sigil.
-const SIGILS: [&str; 12] = [
-    "✝", "⛧", "☥", "†", "‡", "✟", "♰", "☩", "⸸", "⯐", "✠", "☦",
-];
+const SIGILS: [&str; 12] = ["✝", "⛧", "☥", "†", "‡", "✟", "♰", "☩", "⸸", "⯐", "✠", "☦"];
 
 /// Arcane name fragments — `<adj>-<noun>` makes a memorable vestment name.
 const NAME_ADJ: [&str; 16] = [
-    "ashen", "umbral", "votive", "hollow", "gilded", "wraith", "septic", "occult",
-    "molten", "veiled", "sallow", "rotting", "sacred", "cinder", "obsidian", "vesper",
+    "ashen", "umbral", "votive", "hollow", "gilded", "wraith", "septic", "occult", "molten",
+    "veiled", "sallow", "rotting", "sacred", "cinder", "obsidian", "vesper",
 ];
 const NAME_NOUN: [&str; 16] = [
-    "reliquary", "ossuary", "vestment", "censer", "shroud", "chancel", "crypt", "sepulcher",
-    "litany", "chalice", "rood", "narthex", "thurible", "psalter", "ossein", "vigil",
+    "reliquary",
+    "ossuary",
+    "vestment",
+    "censer",
+    "shroud",
+    "chancel",
+    "crypt",
+    "sepulcher",
+    "litany",
+    "chalice",
+    "rood",
+    "narthex",
+    "thurible",
+    "psalter",
+    "ossein",
+    "vigil",
 ];
 
 /// Convert HSV (h in degrees 0–360, s/v in 0–1) to an 8-bit-per-channel RGB
@@ -272,7 +287,11 @@ roster_width = 24
         let t = Theme::random();
         // Name is `<adj>-<noun>` and the sigil is one of the occult glyphs.
         assert!(t.name.contains('-'), "name should be adj-noun: {}", t.name);
-        assert!(SIGILS.contains(&t.sigil.as_str()), "sigil from set: {}", t.sigil);
+        assert!(
+            SIGILS.contains(&t.sigil.as_str()),
+            "sigil from set: {}",
+            t.sigil
+        );
         assert_eq!(t.roster_width, 22);
         // Surface must stay dark enough to read light ink against it.
         if let Color::Rgb(r, g, b) = t.bg {

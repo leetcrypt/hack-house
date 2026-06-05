@@ -1,6 +1,6 @@
 //! ratatui rendering — top bar, chat, roster, input.
 
-use crate::app::{App, ChatLine};
+use crate::app::{App, ChatLine, Role};
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -149,36 +149,85 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
         HelpCluster {
             title: "SANDBOX",
             items: vec![
-                kv("/sbx launch [backend]", "summon a sandbox: local | docker | multipass"),
+                kv(
+                    "/sbx launch [backend]",
+                    "summon a sandbox: local | docker | multipass",
+                ),
                 kv("/sbx stop", "tear down the sandbox (purges the VM)"),
-                kv("/sbx save [label]", "snapshot state (docker image; survives stop)"),
-                kv("/sbx load <label>", "launch a fresh sandbox from a saved snapshot"),
+                kv(
+                    "/sbx save [label]",
+                    "snapshot state (docker image; survives stop)",
+                ),
+                kv(
+                    "/sbx load <label>",
+                    "launch a fresh sandbox from a saved snapshot",
+                ),
                 kv("/sbx snaps", "list saved snapshots"),
-                kv("/sbx vms", "list local VirtualBox VMs"),
-                kv("/sbx gui <vm>", "boot a VirtualBox VM locally in its GUI"),
-                kv("/drive  ·  F2", "type into the shared shell  (Esc releases)"),
+                kv(
+                    "/drive  ·  F2",
+                    "type into the shared shell  (Esc releases)",
+                ),
+            ],
+        },
+        HelpCluster {
+            title: "VIRTUALBOX (local GUI VM)",
+            items: vec![
+                kv("/sbx vms", "detect VirtualBox + list local VMs"),
+                kv(
+                    "/sbx gui <vm> [--install]",
+                    "open a shared VM locally — host & guest each get their own copy",
+                ),
+                kv(
+                    "/sbx gui yes",
+                    "confirm a pending launch (advance the consent gate)",
+                ),
+                kv(
+                    "/sbx gui cancel",
+                    "abort a pending launch (nothing stopped or installed)",
+                ),
             ],
         },
         HelpCluster {
             title: "AI AGENTS",
             items: vec![
-                kv("/ai start [model|profile]", "spawn an agent (ollama tag or models.toml profile)"),
-                kv("/ai start <model> allow", "spawn + auto-grant the agent sandbox drive"),
+                kv(
+                    "/ai start [model|profile]",
+                    "spawn an agent (ollama tag or models.toml profile)",
+                ),
+                kv(
+                    "/ai start <model> allow",
+                    "spawn + auto-grant the agent sandbox drive",
+                ),
                 kv("/ai stop", "dismiss the agent you started"),
-                kv("/ai <question>", "ask an agent in the room (/ai <name> <q> if many)"),
-                kv("/ai <name> !<task>", "have a granted agent run a task in the sandbox"),
+                kv(
+                    "/ai <question>",
+                    "ask an agent in the room (/ai <name> <q> if many)",
+                ),
+                kv(
+                    "/ai <name> !<task>",
+                    "have a granted agent run a task in the sandbox",
+                ),
                 kv("/ai list", "list AI agents present + their provider/model"),
-                kv("/ai models", "show models the active agent's backend can serve"),
+                kv(
+                    "/ai models",
+                    "show models the active agent's backend can serve",
+                ),
             ],
         },
         HelpCluster {
             title: "PERMISSIONS (owner)",
             items: vec![
-                kv("/grant <user|agent>", "let a member OR an AI agent drive the shell"),
+                kv(
+                    "/grant <user|agent>",
+                    "let a member OR an AI agent drive the shell",
+                ),
                 kv("/revoke <user|agent>", "take back sandbox drive permission"),
                 kv("/sudo <user>", "delegate VM superuser (real sudo)"),
                 kv("/unsudo <user>", "revoke VM superuser"),
-                kv("/ai start <name> allow", "shortcut: grant the agent drive at spawn"),
+                kv(
+                    "/ai start <name> allow",
+                    "shortcut: grant the agent drive at spawn",
+                ),
             ],
         },
         HelpCluster {
@@ -193,8 +242,14 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
             title: "APPEARANCE",
             items: vec![
                 kv("/theme [name]", &theme_help),
-                kv("/theme save [name]", "keep the vestment you're wearing for reuse"),
-                kv("Ctrl+Alt+P  ·  /theme random", "conjure a random vestment (palette + sigil)"),
+                kv(
+                    "/theme save [name]",
+                    "keep the vestment you're wearing for reuse",
+                ),
+                kv(
+                    "Ctrl+Alt+P  ·  /theme random",
+                    "conjure a random vestment (palette + sigil)",
+                ),
             ],
         },
         HelpCluster {
@@ -204,19 +259,33 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                 kv("F1  ·  /help", "toggle this help"),
                 kv("Ctrl-C  (while driving)", "interrupt the running command"),
                 kv("PgUp / PgDn", "scroll chat  ·  Home/End = oldest/live"),
-                kv("PgUp / PgDn  (driving)", "scroll the sandbox terminal's scrollback"),
-                kv("Up / Down  ·  wheel", "scroll the sandbox terminal (mouse works while driving)"),
-                kv("Ctrl-R  (when closed)", "reconnect to the house after a drop / AFK"),
+                kv(
+                    "PgUp / PgDn  (driving)",
+                    "scroll the sandbox terminal's scrollback",
+                ),
+                kv(
+                    "Up / Down  ·  wheel",
+                    "scroll the sandbox terminal (mouse works while driving)",
+                ),
+                kv(
+                    "Ctrl-R  (when closed)",
+                    "reconnect to the house after a drop / AFK",
+                ),
                 kv("/pw", "show this room's password (local only)"),
                 kv("Ctrl-C  ·  Ctrl-Q", "quit hack-house"),
             ],
         },
         HelpCluster {
-            title: "ROSTER GLYPHS",
-            items: vec![kv(
-                &format!("{} owner   ⚡ sudoer", theme.sigil),
-                "◆ may drive    • member",
-            )],
+            title: "ROSTER GLYPHS (badges stack)",
+            items: vec![
+                kv(
+                    &format!("{} host", theme.sigil),
+                    "opened the house (first in the room)",
+                ),
+                kv("⚡ sudoer", "VM superuser in the sandbox"),
+                kv("◆ driver", "may drive the shell"),
+                kv("• member", "present — no extra powers"),
+            ],
         },
     ]
 }
@@ -231,7 +300,9 @@ pub fn help_cluster_count(theme: &Theme) -> usize {
 /// scroll math always matches what's painted.
 fn help_render_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
     let clusters = help_clusters(theme);
-    let acc = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+    let acc = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
     let sel = Style::default()
         .fg(theme.bg)
         .bg(theme.accent)
@@ -260,7 +331,9 @@ fn help_render_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(Span::styled(
         "  ↑/↓ select · ←/→ or Enter expand · PgUp/PgDn scroll · Esc closes",
-        Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+        Style::default()
+            .fg(theme.dim)
+            .add_modifier(Modifier::ITALIC),
     )));
     lines
 }
@@ -375,8 +448,12 @@ fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
     } else {
         theme.other
     };
+    // Author's current badge inline, so a message's authority is legible right
+    // in the transcript — not only in the clergy panel.
+    let badges = role_badges(app, &l.username, theme);
     Line::from(vec![
         Span::styled(format!("{} ", l.ts), Style::default().fg(theme.dim)),
+        Span::styled(format!("{badges} "), Style::default().fg(theme.dim)),
         Span::styled(
             l.username.clone(),
             Style::default().fg(name_color).add_modifier(Modifier::BOLD),
@@ -400,12 +477,16 @@ fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Them
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{name} "),
-                Style::default().fg(theme.other).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.other)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("⠿ ", Style::default().fg(theme.dim)),
             Span::styled(
                 text.as_str(),
-                Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme.dim)
+                    .add_modifier(Modifier::ITALIC),
             ),
         ]));
     }
@@ -436,26 +517,39 @@ fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Them
     f.render_widget(chat, area);
 }
 
+/// Glyph for a single role. The host sigil is theme-dependent (✝ for crypt, ⛧
+/// for the default), the rest are fixed.
+fn role_glyph(role: Role, theme: &Theme) -> &str {
+    match role {
+        Role::Host => theme.sigil.as_str(),
+        Role::Sudoer => "⚡",
+        Role::Driver => "◆",
+        Role::Member => "•",
+    }
+}
+
+/// The stacked badge string for `name` — e.g. `⛧⚡◆` for a host who summoned a
+/// sandbox and can drive, or a lone `•` for a plain member. Single source of
+/// truth shared by the roster and the chat author prefix so both always agree
+/// with each other and with what the broker enforces.
+fn role_badges(app: &App, name: &str, theme: &Theme) -> String {
+    app.roles_of(name)
+        .into_iter()
+        .map(|r| role_glyph(r, theme))
+        .collect()
+}
+
 fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let items: Vec<ListItem> = app
         .users
         .iter()
         .map(|u| {
             let me = u.username == app.me;
-            // <sigil> owner · ⚡ sudoer (VM superuser) · ◆ may drive · • member
-            let owner = app.owner.as_deref() == Some(u.username.as_str());
-            let mark = if owner {
-                theme.sigil.as_str()
-            } else if app.sudoers.contains(&u.username) {
-                "⚡"
-            } else if app.drivers.contains(&u.username) {
-                "◆"
-            } else {
-                "•"
-            };
+            // Stacked badges: <sigil> host · ⚡ sudoer · ◆ driver · • member.
+            let badges = role_badges(app, &u.username, theme);
             let color = if me { theme.roster_me } else { theme.other };
             ListItem::new(Line::from(Span::styled(
-                format!(" {mark} {}", u.username),
+                format!(" {badges} {}", u.username),
                 Style::default().fg(color),
             )))
         })
