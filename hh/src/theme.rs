@@ -80,7 +80,6 @@ impl Theme {
                                         // Accent sits at an analogous or complementary offset for contrast.
         let accent_hue = (base + *r.pick(&[30.0, 150.0, 180.0, 210.0, 330.0_f32])) % 360.0;
 
-        let bg = hsv(base, r.range(0.22, 0.5), r.range(0.06, 0.12)); // deep tinted slate
         let border = hsv(base, r.range(0.18, 0.42), r.range(0.40, 0.55));
         let accent = hsv(accent_hue, r.range(0.70, 1.0), r.range(0.85, 1.0));
         // Title is either the accent or a near-white tint of the base hue.
@@ -93,6 +92,18 @@ impl Theme {
         let other = hsv(base, r.range(0.14, 0.38), r.range(0.74, 0.90));
         let system = hsv(base, r.range(0.20, 0.45), r.range(0.58, 0.74));
         let dim = hsv(base, r.range(0.14, 0.34), r.range(0.50, 0.66));
+
+        // The surface is no longer rolled blind: derive it from the ink we just
+        // rolled so it's *guaranteed* legible yet as expressive as that allows.
+        // `legible_bg` walks the base-hue slate from near-black upward and keeps
+        // the lightest tint at which the primary chat ink still clears a contrast
+        // floor — so brighter palettes earn a richer, more visible background and
+        // cooler ones settle onto a deeper one, all while staying readable. Only
+        // the reliably-light inks (`me`, `other`) gate the surface: the muted or
+        // accent-tinted inks (`title` can be the accent, `system`/`dim` run dark
+        // by design) would otherwise be impossible to satisfy and collapse the
+        // background to flat black, so they ride along rather than veto the tint.
+        let bg = legible_bg(base, r.range(0.30, 0.60), &[me, other]);
 
         Theme {
             name: format!("{}-{}", r.pick(&NAME_ADJ), r.pick(&NAME_NOUN)),
@@ -214,6 +225,52 @@ fn hsv(h: f32, s: f32, v: f32) -> Color {
     Color::Rgb(to(r), to(g), to(b))
 }
 
+/// WCAG relative luminance of a colour, 0.0 (black) – 1.0 (white). Channels are
+/// linearised (sRGB → linear) before weighting, so it tracks *perceived*
+/// brightness rather than raw RGB — what we need to reason about legibility.
+fn luminance(c: Color) -> f32 {
+    let Color::Rgb(r, g, b) = c else { return 0.0 };
+    let lin = |u: u8| {
+        let s = u as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+}
+
+/// WCAG contrast ratio between two colours (1.0 = identical, 21.0 = black/white).
+/// 4.5 is the threshold for comfortable body text, 3.0 for incidental UI chrome.
+fn contrast(a: Color, b: Color) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Derive a background relationally from the inks rolled for it. Walk the surface
+/// in the given `hue`/`sat` family from near-black upward and return the
+/// *lightest* value at which every `ink` still clears the 4.5:1 body-text floor.
+/// Because contrast only falls as the surface lightens, the lightest passing
+/// value is the most expressive background that's still legible. Pass only inks
+/// that are light enough to be satisfiable on some surface (e.g. `me`/`other`):
+/// an intrinsically dark ink can never clear the floor and would collapse the
+/// result to flat black.
+fn legible_bg(hue: f32, sat: f32, ink: &[Color]) -> Color {
+    const FLOOR: f32 = 4.5;
+    let mut best = hsv(hue, sat, 0.0); // darkest, highest-contrast fallback
+    let mut v = 0.0_f32;
+    while v <= 0.45 {
+        let bg = hsv(hue, sat, v);
+        if ink.iter().all(|&c| contrast(c, bg) >= FLOOR) {
+            best = bg; // still legible at this value — keep climbing for a richer tint
+        }
+        v += 0.005;
+    }
+    best
+}
+
 /// Tiny seeded xorshift64* PRNG — enough randomness to roll a fresh palette
 /// without pulling in the `rand` crate. Seeded from the wall clock so every
 /// `Ctrl+Alt+P` conjures a different vestment.
@@ -293,13 +350,46 @@ roster_width = 24
             t.sigil
         );
         assert_eq!(t.roster_width, 22);
-        // Surface must stay dark enough to read light ink against it.
-        if let Color::Rgb(r, g, b) = t.bg {
-            let sum = r as u16 + g as u16 + b as u16;
-            assert!(sum < 200, "bg too bright: {r},{g},{b}");
-        } else {
-            panic!("random bg should be Rgb");
+        assert!(matches!(t.bg, Color::Rgb(..)), "random bg should be Rgb");
+        // The surface is derived from the inks to stay legible: it must never be
+        // brighter than the text on it, and `me` (always near-white) must clear
+        // the body-text contrast floor against it.
+        assert!(
+            luminance(t.bg) <= luminance(t.me),
+            "bg should not outshine the ink"
+        );
+        assert!(
+            contrast(t.me, t.bg) >= 4.5,
+            "your ink must stay readable on the surface: {:.2}",
+            contrast(t.me, t.bg)
+        );
+    }
+
+    #[test]
+    fn legible_bg_is_relational_and_readable() {
+        // contrast() sanity: identical = 1, black/white = 21.
+        let white = Color::Rgb(255, 255, 255);
+        let black = Color::Rgb(0, 0, 0);
+        assert!((contrast(white, white) - 1.0).abs() < 1e-3);
+        assert!((contrast(white, black) - 21.0).abs() < 0.1);
+
+        // Given bright inks, the surface stays under the 4.5 floor yet isn't
+        // forced all the way to black — it earns a visible tint.
+        let inks = [Color::Rgb(0xff, 0xff, 0xff), Color::Rgb(0xd0, 0xd0, 0xd0)];
+        let bg = legible_bg(210.0, 0.5, &inks);
+        for ink in inks {
+            assert!(contrast(ink, bg) >= 4.5, "ink unreadable: {:.2}", contrast(ink, bg));
         }
+        assert!(luminance(bg) > 0.0, "bright inks should permit a tinted, non-black bg");
+
+        // A darker ink set forces a correspondingly deeper surface — the
+        // relationship runs the right way.
+        let dim_inks = [Color::Rgb(0x88, 0x88, 0x88)];
+        let dark_bg = legible_bg(210.0, 0.5, &dim_inks);
+        assert!(
+            luminance(dark_bg) <= luminance(bg),
+            "dimmer ink should yield a darker surface"
+        );
     }
 
     #[test]
