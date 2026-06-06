@@ -63,6 +63,35 @@ class OllamaProvider:
             opts["num_thread"] = self.num_thread
         return opts
 
+    def _raise_for_status(self, r: requests.Response) -> None:
+        """Turn an Ollama HTTP error into an actionable message.
+
+        Ollama answers /api/chat with 404 + ``{"error": "model ... not found"}``
+        when the model isn't pulled on the box running this agent. Because the
+        agent talks to *its own* localhost:11434, a teammate who summoned /ai
+        without that model pulled hits this even when the host has it. The bare
+        ``raise_for_status`` only reports "404 Not Found for url", hiding the
+        cause — so name the model, the host, and the fix instead. This text is
+        what the bridge posts to the room as ``[ai error: …]``.
+        """
+        if r.ok:
+            return
+        try:
+            detail = (r.json().get("error") or "").strip()
+        except ValueError:
+            detail = (r.text or "").strip()
+        if r.status_code == 404:
+            raise RuntimeError(
+                f"model '{self.model}' isn't pulled on the ollama at {self.host} "
+                f"(the agent uses ollama on the machine that ran /ai, not the host). "
+                f"fix: `ollama pull {self.model}` there, or `/ai start <profile>` "
+                f"for a cloud model. [{detail or 'model not found'}]"
+            )
+        raise RuntimeError(
+            f"ollama at {self.host} returned {r.status_code}"
+            + (f": {detail}" if detail else "")
+        )
+
     def complete(self, system: str, messages: list[Msg]) -> str:
         payload = {
             "model": self.model,
@@ -73,7 +102,7 @@ class OllamaProvider:
             + [{"role": m.role, "content": m.content} for m in messages],
         }
         r = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
-        r.raise_for_status()
+        self._raise_for_status(r)
         return (r.json().get("message", {}).get("content") or "").strip()
 
     def stream(self, system: str, messages: list[Msg]):
@@ -89,7 +118,7 @@ class OllamaProvider:
         }
         with requests.post(f"{self.host}/api/chat", json=payload,
                            timeout=self.timeout, stream=True) as r:
-            r.raise_for_status()
+            self._raise_for_status(r)
             for line in r.iter_lines():
                 if not line:
                     continue

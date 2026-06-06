@@ -88,6 +88,31 @@ fn tar_dir(dir: &Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Tar any local path (file or directory) to bytes for injecting into a
+/// sandbox — the archive's single top-level entry is named after the path's
+/// basename, so it extracts as `<dest>/<base>`. Enforces `MAX_SIZE`. Returns
+/// `(base_name, tar_bytes)`.
+pub fn tar_path(path: &Path) -> Result<(String, Vec<u8>)> {
+    let meta = std::fs::metadata(path).with_context(|| format!("not found: {}", path.display()))?;
+    let base = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("path has no final component")?
+        .to_string();
+    let mut buf = Vec::new();
+    {
+        let mut tb = tar::Builder::new(&mut buf);
+        if meta.is_dir() {
+            tb.append_dir_all(&base, path).context("tar directory")?;
+        } else {
+            tb.append_path_with_name(path, &base).context("tar file")?;
+        }
+        tb.finish()?;
+    }
+    anyhow::ensure!(buf.len() <= MAX_SIZE, "too large ({})", human(buf.len()));
+    Ok((base, buf))
+}
+
 /// Persist received bytes under `downloads`. Directories (tar) are extracted
 /// with a guard rejecting absolute paths and `..` escapes (zip-slip).
 pub fn save(downloads: &Path, offer: &Offer, data: &[u8]) -> Result<PathBuf> {

@@ -12,7 +12,8 @@
 #   ./bootstrap-ai.sh              # baseline setup + Ollama + default model
 #   ./bootstrap-ai.sh --release    # ...and build the client in release mode
 #   ./bootstrap-ai.sh --check      # report only; install/pull nothing
-#   ./bootstrap-ai.sh --yes        # don't prompt before installing Ollama
+#   ./bootstrap-ai.sh --yes        # don't prompt before installing Ollama / pulling the model
+#   ./bootstrap-ai.sh --ai-only    # only the AI layer; skip the baseline ./bootstrap.sh
 #   ./bootstrap-ai.sh -h | --help  # this help
 #
 # environment:
@@ -28,13 +29,15 @@ INSTALLER_URL="https://ollama.com/install.sh"
 RELEASE_ARGS=()
 CHECK_ONLY=0
 ASSUME_YES=0
+AI_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --release) RELEASE_ARGS+=(--release) ;;
         --check)   CHECK_ONLY=1 ;;
         --yes|-y)  ASSUME_YES=1 ;;
+        --ai-only) AI_ONLY=1 ;;
         -h|--help|-help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "✖ unknown arg: $arg (try --release / --check / --yes / --help)" >&2; exit 2 ;;
+        *) echo "✖ unknown arg: $arg (try --release / --check / --yes / --ai-only / --help)" >&2; exit 2 ;;
     esac
 done
 
@@ -44,10 +47,14 @@ ollama_up() { curl -s --max-time 3 "$OLLAMA_HOST/api/tags" >/dev/null 2>&1; }
 # 0. Baseline setup (venv + server/agent deps + client build). The agent's own
 #    runtime deps (requests, websockets) are already in requirements.txt, so the
 #    baseline install covers them — this script adds only the model runtime.
-if [[ $CHECK_ONLY -eq 1 ]]; then
-    "$ROOT/bootstrap.sh" --check || exit $?
-else
-    "$ROOT/bootstrap.sh" "${RELEASE_ARGS[@]}" || exit $?
+#    --no-ai stops bootstrap.sh re-entering this script (it now runs the AI layer
+#    by default). --ai-only skips the baseline entirely (caller already ran it).
+if [[ $AI_ONLY -ne 1 ]]; then
+    if [[ $CHECK_ONLY -eq 1 ]]; then
+        "$ROOT/bootstrap.sh" --no-ai --check || exit $?
+    else
+        "$ROOT/bootstrap.sh" --no-ai "${RELEASE_ARGS[@]}" || exit $?
+    fi
 fi
 
 echo
@@ -95,10 +102,25 @@ if ! ollama_up; then
     echo "  ✓ daemon up"
 fi
 
-# 4. Pull the default model (idempotent).
+# 4. Pull the default model (idempotent). Pulling downloads several GB onto THIS
+#    machine, so ask first on an interactive terminal (skip with --yes) — never
+#    pull a model onto someone's box without their say-so.
 if ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -Fxq "$MODEL"; then
     echo "  ✓ model '$MODEL' already present"
 else
+    echo "  model '$MODEL' is not present — pulling it downloads several GB to THIS machine."
+    if [[ $ASSUME_YES -ne 1 ]]; then
+        if [[ -t 0 ]]; then
+            read -r -p "  pull '$MODEL' now? [y/N] " ans
+            [[ "$ans" == [yY]* ]] || { echo "  aborted — no model pulled. pull it yourself with: ollama pull $MODEL" >&2; exit 1; }
+        else
+            # No terminal to confirm on — never pull onto someone's machine
+            # unasked. Require explicit --yes (or an interactive yes) instead.
+            echo "  ✖ not pulling '$MODEL' without confirmation (no terminal to ask)." >&2
+            echo "    re-run with --yes to allow it, or pull manually: ollama pull $MODEL" >&2
+            exit 1
+        fi
+    fi
     echo "  pulling model '$MODEL' (first pull can take a while)…"
     ollama pull "$MODEL" || { echo "  ✖ failed to pull '$MODEL'" >&2; exit 1; }
     echo "  ✓ model '$MODEL' ready"

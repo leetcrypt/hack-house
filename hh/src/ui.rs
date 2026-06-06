@@ -155,8 +155,8 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                 ),
                 kv("/sbx stop", "tear down the sandbox (purges the VM)"),
                 kv(
-                    "/sbx save [label]",
-                    "snapshot state (docker image; survives stop)",
+                    "/sbx save [label] [--local]",
+                    "snapshot state (docker image; --local also writes a portable .tar)",
                 ),
                 kv(
                     "/sbx load <label>",
@@ -185,6 +185,11 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "/sbx gui cancel",
                     "abort a pending launch (nothing stopped or installed)",
                 ),
+                kv(
+                    "/sbx vmsave <vm> [label] [--local]",
+                    "snapshot a VM (--local also exports a portable .ova)",
+                ),
+                kv("/sbx vmsnaps <vm>", "list a VM's snapshots"),
             ],
         },
         HelpCluster {

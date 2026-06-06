@@ -428,6 +428,19 @@ pub fn teardown(backend: Backend, name: &str) {
 /// (`hh-snap:<label>`). Owner-side only — never pushed anywhere.
 pub const SNAP_REPO: &str = "hh-snap";
 
+/// Directory (relative to the working dir) where portable snapshot artifacts
+/// land when the saver opts into a local file copy (`/sbx save … --local`).
+/// Created on demand. These are standalone files the owner keeps — they survive
+/// even if the in-backend image/snapshot is later pruned.
+pub const SNAP_DIR: &str = "hh-snapshots";
+
+/// Ensure `hh-snapshots/` exists and return it. Blocking.
+fn snap_dir() -> Result<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(SNAP_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {SNAP_DIR}/"))?;
+    Ok(dir)
+}
+
 /// Snapshot the running sandbox's filesystem state to a named artifact on the
 /// owner's machine. Blocking — run off the UI thread.
 ///
@@ -439,8 +452,15 @@ pub const SNAP_REPO: &str = "hh-snap";
 ///   error is surfaced verbatim.
 /// - **Local:** no backing VM/container, so nothing to save.
 ///
+/// `local` adds a portable, standalone copy under `hh-snapshots/` (a file the
+/// owner fully controls) on top of the in-backend snapshot:
+/// - **Docker:** `docker save` the committed image to a `.tar`.
+/// - **Multipass:** snapshots already live on this host under multipass's own
+///   data dir; the CLI has no single-file export, so we note that and skip the
+///   extra file rather than fake one.
+///
 /// Returns a short human description of what was written on success.
-pub fn save_state(backend: Backend, name: &str, label: &str) -> Result<String> {
+pub fn save_state(backend: Backend, name: &str, label: &str, local: bool) -> Result<String> {
     match backend {
         Backend::Docker => {
             let tag = format!("{SNAP_REPO}:{label}");
@@ -454,6 +474,22 @@ pub fn save_state(backend: Backend, name: &str, label: &str) -> Result<String> {
                     "docker commit failed: {}",
                     err.lines().last().unwrap_or("").trim()
                 );
+            }
+            if local {
+                let path = snap_dir()?.join(format!("hh-snap-{label}.tar"));
+                let out = Command::new("docker")
+                    .args(["save", &tag, "-o"])
+                    .arg(&path)
+                    .output()
+                    .context("docker save")?;
+                if !out.status.success() {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    anyhow::bail!(
+                        "image {tag} committed, but local export failed: {}",
+                        err.lines().last().unwrap_or("").trim()
+                    );
+                }
+                return Ok(format!("image {tag} + local file {}", path.display()));
             }
             Ok(format!("image {tag}"))
         }
@@ -469,12 +505,87 @@ pub fn save_state(backend: Backend, name: &str, label: &str) -> Result<String> {
                     err.lines().last().unwrap_or("").trim()
                 );
             }
+            if local {
+                // multipass stores snapshots on this host already; no portable
+                // single-file export exists in the CLI, so be honest about it.
+                return Ok(format!(
+                    "snapshot {name}.{label} (already stored locally by multipass; no portable file)"
+                ));
+            }
             Ok(format!("snapshot {name}.{label}"))
         }
         Backend::Local => {
             anyhow::bail!("the local shell has no VM state to save — launch a docker or multipass sandbox first")
         }
     }
+}
+
+/// Snapshot a VirtualBox VM's state. VirtualBox isn't a brokered `Backend` (its
+/// GUI runs locally, never relayed), so it has its own save path. Blocking.
+///
+/// `VBoxManage snapshot <vm> take <label>` works whether the VM is running
+/// (live snapshot) or powered off. `local` additionally exports the whole VM to
+/// a portable `.ova` appliance under `hh-snapshots/` — the standalone artifact
+/// you'd hand to someone else (or re-import yourself) via `/sbx gui`.
+pub fn vm_save_state(vm: &str, label: &str, local: bool) -> Result<String> {
+    let out = Command::new("VBoxManage")
+        .args(["snapshot", vm, "take", label])
+        .output()
+        .context("VBoxManage snapshot take (is VirtualBox installed?)")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "VBoxManage snapshot failed: {}",
+            err.lines().last().unwrap_or("").trim()
+        );
+    }
+    if local {
+        let path = snap_dir()?.join(format!("{vm}-{label}.ova"));
+        let out = Command::new("VBoxManage")
+            .args(["export", vm, "-o"])
+            .arg(&path)
+            .output()
+            .context("VBoxManage export")?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!(
+                "snapshot '{label}' taken, but OVA export failed: {}",
+                err.lines().last().unwrap_or("").trim()
+            );
+        }
+        return Ok(format!("snapshot '{label}' + local appliance {}", path.display()));
+    }
+    Ok(format!("snapshot '{label}' of {vm}"))
+}
+
+/// Snapshot names for a VirtualBox VM (`VBoxManage snapshot <vm> list
+/// --machinereadable` → `SnapshotName*="..."` lines). Blocking. An empty list
+/// (exit 1 "does not have any snapshots") is reported as no snapshots, not an
+/// error.
+pub fn vm_snapshots(vm: &str) -> Result<Vec<String>> {
+    let out = Command::new("VBoxManage")
+        .args(["snapshot", vm, "list", "--machinereadable"])
+        .output()
+        .context("VBoxManage snapshot list (is VirtualBox installed?)")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("does not have any snapshots") {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!(
+            "VBoxManage snapshot list failed: {}",
+            err.lines().last().unwrap_or("").trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let v = l.strip_prefix("SnapshotName")?;
+            let q = v.split_once('=')?.1.trim();
+            Some(q.trim_matches('"').to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .collect())
 }
 
 /// List saved snapshot labels for a backend (Docker image tags under
@@ -635,6 +746,79 @@ pub fn set_sudo(backend: Backend, name: &str, user: &str, enable: bool) {
     } else {
         mp_revoke_sudo(name, &u);
     }
+}
+
+/// The unix user the shared shell runs as for a backend — mirrors `provision`'s
+/// return (owner on Multipass, root on Docker, none on Local) but side-effect
+/// free, so callers like file-push can resolve the destination home without
+/// threading extra state through the broker.
+pub fn run_user_for(backend: Backend, owner: &str) -> String {
+    match backend {
+        Backend::Multipass => unix_name(owner),
+        Backend::Docker => "root".to_string(),
+        Backend::Local => String::new(),
+    }
+}
+
+/// Inject a local file/dir into the running sandbox, dropping it under the
+/// shared shell user's home and leaving it owned by that user. The path is
+/// streamed in as a tar (built + size-capped by `ft::tar_path`) and unpacked by
+/// `tar` inside the container/VM — uniform for files and directories, and no
+/// shell interpolation of the path. Blocking — run off the UI thread. Returns
+/// the in-sandbox destination path on success.
+pub fn push(backend: Backend, name: &str, run_user: &str, local: &std::path::Path) -> Result<String> {
+    let (base, tar) = crate::ft::tar_path(local)?;
+    match backend {
+        Backend::Local => anyhow::bail!(
+            "local sandbox shares the host filesystem — {} is already reachable",
+            local.display()
+        ),
+        Backend::Docker => {
+            // Shell runs as root with $HOME=/root (see `prepare`'s `-w /root`).
+            let mut c = Command::new("docker");
+            c.args(["exec", "-i", name, "tar", "-C", "/root", "-xf", "-"]);
+            extract_tar(c, &tar)?;
+            Ok(format!("/root/{base}"))
+        }
+        Backend::Multipass => {
+            let home = format!("/home/{run_user}");
+            let mut c = Command::new("multipass");
+            c.args(["exec", name, "--", "sudo", "tar", "-C", &home, "-xf", "-"]);
+            extract_tar(c, &tar)?;
+            // Hand ownership to the account whose login shell the clergy share
+            // (the tar unpacked as root via sudo).
+            let owns = format!("{run_user}:{run_user}");
+            let target = format!("{home}/{base}");
+            mp(name, &["sudo", "chown", "-R", &owns, &target]);
+            Ok(target)
+        }
+    }
+}
+
+/// Feed `tar` bytes to a `tar -x` process over stdin, surfacing the extractor's
+/// own last error line on failure.
+fn extract_tar(mut cmd: Command, tar: &[u8]) -> Result<()> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .context("spawn tar extractor (is the backend CLI installed?)")?;
+    {
+        let mut si = child.stdin.take().context("tar stdin")?;
+        si.write_all(tar).context("stream tar to sandbox")?;
+    } // drop closes stdin → tar sees EOF and finishes
+    let out = child.wait_with_output().context("await tar extractor")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "extract failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .last()
+            .unwrap_or("")
+            .trim()
+    );
+    Ok(())
 }
 
 pub struct Sandbox {

@@ -374,11 +374,25 @@ impl App {
                 cols,
             } => {
                 if ready {
-                    self.sandbox = Some(SbxView {
-                        parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
-                        backend: backend.clone(),
-                    });
-                    self.sys(format!("⛧ sandbox summoned ({backend}) — F2 to drive"));
+                    // Converge on the shared shell. If we already track this
+                    // sandbox, just match its size — recreating the parser would
+                    // wipe scrollback and re-announce on every re-broadcast. The
+                    // owner re-sends `status:ready` whenever a member (re)joins, so
+                    // this MUST be idempotent for everyone already in the room; only
+                    // a genuinely new sandbox (none yet) is created and announced.
+                    match &mut self.sandbox {
+                        Some(v) => {
+                            v.parser.set_size(rows.max(1), cols.max(1));
+                            v.backend = backend.clone();
+                        }
+                        None => {
+                            self.sandbox = Some(SbxView {
+                                parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
+                                backend: backend.clone(),
+                            });
+                            self.sys(format!("⛧ sandbox summoned ({backend}) — F2 to drive"));
+                        }
+                    }
                 } else {
                     self.sandbox = None;
                     self.driving = false;
@@ -534,11 +548,14 @@ fn handle_ft(
     out: &UnboundedSender<WsMsg>,
     room: &Arc<fernet::Fernet>,
     downloads: &std::path::Path,
-) {
+) -> Option<std::path::PathBuf> {
+    // Set to the saved path when a transfer completes & verifies, so the caller
+    // can auto-bridge it into a running sandbox.
+    let mut saved = None;
     match f {
         ft::Ft::Offer(o) => {
             if o.from == app.me {
-                return; // our own offer echo
+                return None; // our own offer echo
             }
             app.sys(format!(
                 "⛧ {} offers {} ({}{}) — /accept or /reject",
@@ -604,11 +621,14 @@ fn handle_ft(
                         app.err(format!("{} — SHA-256 mismatch, discarded", t.meta.name));
                     } else {
                         match ft::save(downloads, &t.meta, &t.buf) {
-                            Ok(p) => app.sys(format!(
-                                "⛧ saved {} ({}) — verified ✓",
-                                p.display(),
-                                ft::human(t.buf.len())
-                            )),
+                            Ok(p) => {
+                                app.sys(format!(
+                                    "⛧ saved {} ({}) — verified ✓",
+                                    p.display(),
+                                    ft::human(t.buf.len())
+                                ));
+                                saved = Some(p);
+                            }
                             Err(e) => app.err(format!("save failed: {e}")),
                         }
                     }
@@ -624,6 +644,7 @@ fn handle_ft(
             }
         }
     }
+    saved
 }
 
 /// Put the terminal back the way we found it: leave raw mode, leave the
@@ -970,7 +991,42 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 }
                             }
                         }
-                        Net::Ft(f) => handle_ft(f, &mut app, &mut active_send, &out_tx, &session.room, &downloads),
+                        Net::Ft(f) => {
+                            // On a received, SHA-verified file, auto-bridge it into
+                            // a sandbox we host so the whole clergy can use it from
+                            // the shared shell. Runs off the UI thread (docker/mp
+                            // exec + tar stream) and reports back via the app channel.
+                            // A local backend already shares the host fs — nothing to do.
+                            if let Some(path) =
+                                handle_ft(f, &mut app, &mut active_send, &out_tx, &session.room, &downloads)
+                            {
+                                if let Some((be, name)) = &broker_meta {
+                                    if !matches!(be, sbx::Backend::Local) {
+                                        let (be, name) = (*be, name.clone());
+                                        let run_user = sbx::run_user_for(
+                                            be,
+                                            app.owner.as_deref().unwrap_or(app.me.as_str()),
+                                        );
+                                        let tx = app_tx.clone();
+                                        tokio::spawn(async move {
+                                            let res = tokio::task::spawn_blocking(move || {
+                                                sbx::push(be, &name, &run_user, &path)
+                                            })
+                                            .await;
+                                            let _ = match res {
+                                                Ok(Ok(dest)) => tx.send(Net::Sys(format!(
+                                                    "⛧ bridged into sandbox → {dest}"
+                                                ))),
+                                                Ok(Err(e)) => tx.send(Net::Sys(format!(
+                                                    "(received file not bridged into sandbox: {e})"
+                                                ))),
+                                                Err(e) => tx.send(Net::Err(format!("bridge task: {e}"))),
+                                            };
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         // The broker renders its sandbox locally from the PTY, so it
                         // ignores its own echoed status/data; everyone else uses them.
                         Net::SbxData(b) => {
@@ -980,12 +1036,27 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                         }
                         Net::SbxStatus { .. } if broker.is_some() => {}
                         ev @ Net::Joined(_) => {
-                            // A late joiner (e.g. a just-summoned agent) missed any
-                            // ACL broadcast sent before they connected. If we host the
-                            // sandbox, re-broadcast so their local grant state syncs —
-                            // this is what makes `/ai start <m> allow` actually reach
-                            // the agent.
+                            // Someone (re)entered and missed everything broadcast
+                            // before they connected. If we host the sandbox, replay
+                            // it so it reappears for them: `status:ready` makes the
+                            // pane show up, the screen snapshot (`_sbx:data`) paints
+                            // its current contents instead of a blank pane, and the
+                            // ACL re-broadcast re-syncs grant state (also what makes
+                            // `/ai start <m> allow` reach a freshly-joined agent).
+                            // The status/data handlers are idempotent, so members
+                            // already in the room aren't disturbed by the replay.
                             if broker.is_some() {
+                                if let (Some(v), Some((be, _))) = (&app.sandbox, &broker_meta) {
+                                    let (rows, cols) = v.parser.screen().size();
+                                    send_frame(&out_tx, &session.room, json!({
+                                        "_sbx":"status","state":"ready",
+                                        "backend": be.label(),"rows": rows,"cols": cols
+                                    }));
+                                    let snap = v.parser.screen().contents_formatted();
+                                    send_frame(&out_tx, &session.room, json!({
+                                        "_sbx":"data","b64": STANDARD.encode(&snap)
+                                    }));
+                                }
                                 broadcast_acl(&out_tx, &session.room, &app);
                             }
                             app.apply(ev);
@@ -1360,14 +1431,28 @@ fn handle_command(
                 }
             }
             Some("save") => {
-                let label = p.next().unwrap_or("snap").to_string();
+                // `--local` (alias `-l`) also writes a portable, standalone copy
+                // under hh-snapshots/ (a docker `.tar`) the saver fully owns; the
+                // default keeps just the in-backend snapshot. The label is the
+                // first non-flag arg.
+                let args: Vec<&str> = p.collect();
+                let local = args.iter().any(|a| matches!(*a, "--local" | "-l"));
+                let label = args
+                    .iter()
+                    .copied()
+                    .find(|a| !a.starts_with('-'))
+                    .unwrap_or("snap")
+                    .to_string();
                 if !is_snap_label(&label) {
                     app.sys("snapshot label must be alphanumerics, '.', '_' or '-'");
                 } else if let Some((be, name)) = broker_meta.clone() {
-                    app.sys(format!("saving sandbox state as '{label}'…"));
+                    app.sys(format!(
+                        "saving sandbox state as '{label}'{}…",
+                        if local { " (+ local copy)" } else { "" }
+                    ));
                     let (tx, lbl) = (app_tx.clone(), label.clone());
                     tokio::spawn(async move {
-                        let res = tokio::task::spawn_blocking(move || sbx::save_state(be, &name, &label)).await;
+                        let res = tokio::task::spawn_blocking(move || sbx::save_state(be, &name, &label, local)).await;
                         let _ = match res {
                             Ok(Ok(desc)) => tx.send(Net::Sys(format!(
                                 "⛧ saved sandbox → {desc} · reload with `/sbx load {lbl}`"))),
@@ -1447,6 +1532,61 @@ fn handle_command(
                     };
                 });
             }
+            Some("vmsave") => {
+                // Snapshot a local VirtualBox VM. `--local` (alias `-l`) also
+                // exports a portable `.ova` appliance under hh-snapshots/.
+                let args: Vec<&str> = p.collect();
+                let local = args.iter().any(|a| matches!(*a, "--local" | "-l"));
+                let mut pos = args.iter().copied().filter(|a| !a.starts_with('-'));
+                match pos.next() {
+                    None => app.sys(
+                        "usage: /sbx vmsave <vm> [label] [--local]  (snapshot a VirtualBox VM; list VMs with /sbx vms)",
+                    ),
+                    Some(vm) => {
+                        let label = pos.next().unwrap_or("snap").to_string();
+                        if !is_snap_label(&label) {
+                            app.sys("snapshot label must be alphanumerics, '.', '_' or '-'");
+                        } else {
+                            app.sys(format!(
+                                "snapshotting VM '{vm}' as '{label}'{}…",
+                                if local { " (+ local .ova)" } else { "" }
+                            ));
+                            let (tx, vm) = (app_tx.clone(), vm.to_string());
+                            tokio::spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    sbx::vm_save_state(&vm, &label, local)
+                                })
+                                .await;
+                                let _ = match res {
+                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ saved VM → {desc}"))),
+                                    Ok(Err(e)) => tx.send(Net::Err(format!("vmsave failed: {e}"))),
+                                    Err(e) => tx.send(Net::Err(format!("vmsave task: {e}"))),
+                                };
+                            });
+                        }
+                    }
+                }
+            }
+            Some("vmsnaps") => {
+                match p.next() {
+                    None => app.sys("usage: /sbx vmsnaps <vm>  (list a VirtualBox VM's snapshots)"),
+                    Some(vm) => {
+                        let (tx, vm) = (app_tx.clone(), vm.to_string());
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(move || sbx::vm_snapshots(&vm)).await;
+                            let _ = match res {
+                                Ok(Ok(v)) if !v.is_empty() => {
+                                    tx.send(Net::Sys(format!("VM snapshots: {}", v.join(", "))))
+                                }
+                                Ok(Ok(_)) => tx.send(Net::Sys(
+                                    "no VM snapshots yet — `/sbx vmsave <vm> [label]` to make one".into())),
+                                Ok(Err(e)) => tx.send(Net::Err(format!("vmsnaps: {e}"))),
+                                Err(e) => tx.send(Net::Err(format!("vmsnaps task: {e}"))),
+                            };
+                        });
+                    }
+                }
+            }
             Some("gui") => {
                 let gargs: Vec<&str> = p.collect();
                 let first = gargs.iter().copied().find(|a| !a.starts_with('-'));
@@ -1511,7 +1651,7 @@ fn handle_command(
                 }
             }
             _ => app.sys(
-                "usage: /sbx launch [local|docker|multipass] [image] · gui <vm> · vms · stop · save [label] · load <label> · snaps",
+                "usage: /sbx launch [local|docker|multipass] [image] · gui <vm> · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmsnaps <vm>",
             ),
         }
     } else if let Some(rest) = line.strip_prefix("/unsudo") {
