@@ -53,7 +53,7 @@ environment (override any default):
   SESSION   tmux session name      (default: hh-test)
   HOST      server bind host       (default: 127.0.0.1)
   PORT      server port            (default: 4173)
-  PW        shared room password   (default: malware-bless)
+  PW        shared room password   (default: random, openssl-generated)
   THEME     theme name             (church | neon | crypt)
 
 examples:
@@ -79,7 +79,9 @@ DEMO_WT="${HH_DEMO_WORKTREE:-/tmp/hh-demo-$DEMO_BRANCH}"
 SESSION="${SESSION:-hh-test}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-4173}"
-PW="${PW:-malware-bless}"
+# Default room password: a fresh random secret per run (openssl), not a
+# well-known hardcoded one. Set PW=... to pin a chosen/reproducible password.
+PW="${PW:-$(openssl rand -hex 12)}"
 SRV_LOG="/tmp/hh-${SESSION}-server.log"
 SRV_PIDFILE="/tmp/hh-${SESSION}-server.pid"
 THEMES_DIR="$HERE/themes"
@@ -224,6 +226,7 @@ done
 tmux select-layout -t "$SESSION" tiled >/dev/null
 
 echo "clergy: ${USERS[*]}  ·  session: $SESSION  ·  $HOST:$PORT  ·  vestments: ${THEME:-church (default)}"
+echo "room password: $PW   (share with anyone joining; pin it with PW=... to reuse)"
 echo "tear down later with:  $0 --kill"
 
 # 4. land in the clergy. From a plain shell we replace this process with `attach`.
