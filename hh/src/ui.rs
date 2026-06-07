@@ -166,6 +166,10 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "VirtualBox VM picker — local GUI (↑↓ move · Enter/Tab boot · Esc dismiss)",
                 ),
                 kv(
+                    "/sbx launch vbox new [name]",
+                    "build a FRESH Ubuntu VM from a cloud image (cloud-init installs the dev toolchain)",
+                ),
+                kv(
                     "/sbx launch vbox [gui] <vm> [yes]",
                     "boot a VirtualBox VM's GUI on YOUR machine (non-host appends yes to install/import first)",
                 ),

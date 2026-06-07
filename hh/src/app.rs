@@ -1585,16 +1585,24 @@ fn handle_command(
                     // guard. Grammar: `/sbx launch vbox [gui] <vm> [yes]`; a bare
                     // `/sbx launch vbox` opens the arrow-navigable VM picker.
                     let mut rest = pos.peekable();
-                    if rest.peek() == Some(&"gui") {
-                        rest.next(); // optional `gui` keyword (sugar)
-                    }
-                    match rest.next() {
-                        Some(vm) => {
-                            let confirmed = rest
-                                .any(|t| matches!(t, "yes" | "y" | "go" | "confirm" | "ok"));
-                            launch_vbox_gui(app, vm.to_string(), confirmed, app_tx, out_tx, room);
+                    if rest.peek() == Some(&"new") {
+                        // `/sbx launch vbox new [name]` — build a brand-new VM from
+                        // a cloud image (cloud-init toolchain), not an existing one.
+                        rest.next();
+                        let name = rest.next().unwrap_or("hh-vbox").to_string();
+                        launch_vbox_new(app, name, app.me.clone(), app_tx);
+                    } else {
+                        if rest.peek() == Some(&"gui") {
+                            rest.next(); // optional `gui` keyword (sugar)
                         }
-                        None => open_vbox_picker(app),
+                        match rest.next() {
+                            Some(vm) => {
+                                let confirmed = rest
+                                    .any(|t| matches!(t, "yes" | "y" | "go" | "confirm" | "ok"));
+                                launch_vbox_gui(app, vm.to_string(), confirmed, app_tx, out_tx, room);
+                            }
+                            None => open_vbox_picker(app),
+                        }
                     }
                 } else if app.sandbox.is_some() || broker.is_some() || *launching {
                     app.sys("a sandbox is already running");
@@ -1909,7 +1917,7 @@ fn handle_command(
                 }
             }
             _ => app.sys(
-                "usage: /sbx launch vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx gui <vm> alias · launch <docker|multipass> [image] (or local) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>",
+                "usage: /sbx launch vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx launch vbox new [name] (fresh VM) · /sbx gui <vm> alias · launch <docker|multipass> [image] (or local) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>",
             ),
         }
     } else if let Some(rest) = line.strip_prefix("/unsudo") {
@@ -2192,6 +2200,41 @@ fn open_vbox_picker(app: &mut App) {
 /// VM image — or who'd have to stop another VM first — must re-issue with a
 /// trailing `yes`, which then installs VirtualBox, imports the shared appliance,
 /// and/or frees VT-x before booting.
+/// Build + boot a brand-new VirtualBox VM from a cloud image (the only path that
+/// creates a VM from scratch — `launch_vbox_gui` opens existing ones). The heavy
+/// lifting (image download, cloud-init seed, VBox create/boot) is in
+/// scripts/vbox-new.sh; we run it off-thread and report through `app_tx` so the
+/// first-run ~600MB download never stalls the TUI.
+fn launch_vbox_new(app: &mut App, name: String, user: String, app_tx: &UnboundedSender<Net>) {
+    if !is_snap_label(&name) {
+        app.sys("VM name must be alphanumerics, '.', '_' or '-'");
+        return;
+    }
+    if !sbx::vbox_installed() {
+        app.sys("VirtualBox isn't installed — `/sbx gui <vm> --install` or run ./scripts/ensure-vbox.sh first");
+        return;
+    }
+    if sbx::vm_registered(&name) {
+        app.sys(format!(
+            "a VM named ‘{name}’ already exists — pick another name, or boot it with `/sbx gui {name}`"
+        ));
+        return;
+    }
+    app.sys(format!(
+        "building fresh VirtualBox VM ‘{name}’ (first run downloads a ~600MB Ubuntu cloud image; cloud-init installs the toolchain on boot)…"
+    ));
+    let tx = app_tx.clone();
+    tokio::spawn(async move {
+        let (n, u) = (name.clone(), user);
+        let res = tokio::task::spawn_blocking(move || sbx::vbox_new(&n, &u)).await;
+        let _ = match res {
+            Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
+            Ok(Err(e)) => tx.send(Net::Err(format!("vbox new failed: {e}"))),
+            Err(e) => tx.send(Net::Err(format!("vbox new task: {e}"))),
+        };
+    });
+}
+
 fn launch_vbox_gui(
     app: &mut App,
     vm: String,

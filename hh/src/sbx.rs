@@ -20,6 +20,8 @@ const ENSURE_VBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-v
 const SBX_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbox-bootstrap.sh");
 /// Editable package schema the bootstrap installs — vim+curl always added.
 const SBX_TOOLS_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbox-tools.json");
+/// Creates a fresh, cloud-init-provisioned Ubuntu VirtualBox VM (hh/scripts/).
+const VBOX_NEW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-new.sh");
 
 /// Is the Docker daemon accepting connections? (`docker info` succeeds.)
 pub fn docker_daemon_up() -> bool {
@@ -184,6 +186,43 @@ pub fn gui_launch(name: &str) -> Result<String> {
         );
     }
     Ok(format!("launched {name} (GUI)"))
+}
+
+/// Create + boot a *fresh* Ubuntu VirtualBox VM pre-provisioned with the dev
+/// toolchain, by driving `scripts/vbox-new.sh` (downloads a cloud image, builds
+/// a cloud-init NoCloud seed installing scripts/sandbox-tools.json, then boots
+/// the GUI). Unlike `/sbx launch vbox <vm>`, which opens an *existing* image,
+/// this builds one from scratch — the only path that doesn't need a pre-made VM.
+///
+/// Blocking and slow on first run (~600MB image download). Runs the script
+/// non-interactively (`--yes`); returns its final status line(s) — including the
+/// generated login password, which is shown exactly once.
+pub fn vbox_new(name: &str, user: &str) -> Result<String> {
+    let out = Command::new("bash")
+        .arg(VBOX_NEW)
+        .args(["--yes", "--name", name, "--user", user])
+        .output()
+        .context("running vbox-new.sh (is bash available?)")?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        anyhow::bail!(
+            "vbox-new failed: {}",
+            stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
+        );
+    }
+    // The script narrates progress on stderr. Surface the final success line and,
+    // if one was generated, the one-time login password.
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('✓'))
+        .unwrap_or("VM created")
+        .trim();
+    let pw = stderr.lines().find(|l| l.contains("login password"));
+    Ok(match pw {
+        Some(p) => format!("{last} · {}", p.trim()),
+        None => last.to_string(),
+    })
 }
 
 /// A running hypervisor that holds the CPU's VT-x/VMX root mode. While one is
