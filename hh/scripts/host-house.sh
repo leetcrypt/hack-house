@@ -51,6 +51,7 @@ environment (override any default):
   PORT      listen port         (default: 4173)
   PW        room password       (default: random, openssl-generated)
   THEME     theme name          (church | neon | crypt)
+  BRANCH    git branch to build (default: main; BRANCH= keeps current checkout)
 
 notes:
   - Two windows in one session: 'server' (host-room.sh — join banner + logs) and
@@ -77,6 +78,7 @@ PORT="${PORT:-4173}"
 PW="${PW:-$(openssl rand -hex 12)}"
 THEMES_DIR="$HERE/themes"
 THEME="${THEME:-}"
+BRANCH="${BRANCH-main}"   # default: build from main; BRANCH= keeps current checkout
 USE_TLS=0; CERT=""; KEY=""
 DO_KILL=0
 NAME=""
@@ -105,6 +107,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 NAME="${NAME:-${USER:-$(id -un)}}"
+
+# Build from a known branch (default: main) so the house never demos a stale
+# checkout. BRANCH= (empty) keeps whatever's checked out. Won't clobber dirty work.
+ensure_branch() {
+    [[ -z "$BRANCH" ]] && return 0
+    git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 0
+    local cur
+    cur="$(git -C "$ROOT" symbolic-ref --short -q HEAD || echo DETACHED)"
+    [[ "$cur" == "$BRANCH" ]] && return 0
+    if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then
+        echo "✖ on '$cur' with uncommitted changes — can't switch to '$BRANCH'." >&2
+        echo "  commit/stash first, or run with BRANCH= to build '$cur' as-is." >&2
+        exit 2
+    fi
+    echo "⛧ switching $cur → $BRANCH before build"
+    git -C "$ROOT" switch "$BRANCH" || { echo "✖ couldn't switch to '$BRANCH'" >&2; exit 2; }
+}
 
 # Stop the server on $PORT (the one holding the port), used by --kill and before
 # we (re)launch so only the room we start answers on this port.
@@ -160,8 +179,9 @@ fi
 
 is_up() { curl -s $CURLK --max-time 2 "$SCHEME://$CLIENT_HOST:$PORT/health" 2>/dev/null | grep -q '"status":"ok"'; }
 
-# 1. build the client so the GUI pane has a binary to run.
-echo "building client…"
+# 1. build the client so the GUI pane has a binary to run — from $BRANCH (main).
+ensure_branch
+echo "building client… (branch: ${BRANCH:-current checkout})"
 ( cd "$HERE" && cargo build --quiet ) || { echo "✖ build failed"; exit 1; }
 
 # 2. clear the port so only the room we start answers on it.
