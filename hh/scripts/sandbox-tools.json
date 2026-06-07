@@ -1,0 +1,28 @@
+{
+  "_comment": "Packages apt-get installs in every hack-house Docker sandbox at launch. Edit `packages` to add dev tools, then relaunch the sandbox. `vim` and `curl` are ALWAYS installed even if absent here. Names must be valid for the base image (ubuntu:24.04); unknown names are skipped, not fatal. Per-launch override: HH_SBX_PKGS=\"vim tmux\".",
+  "packages": [
+    "vim",
+    "curl",
+    "wget",
+    "ca-certificates",
+    "git",
+    "less",
+    "nano",
+    "build-essential",
+    "pkg-config",
+    "procps",
+    "iproute2",
+    "iputils-ping",
+    "net-tools",
+    "jq",
+    "unzip",
+    "zip",
+    "tree",
+    "htop",
+    "file",
+    "ripgrep",
+    "python3",
+    "python3-pip",
+    "python3-venv"
+  ]
+}

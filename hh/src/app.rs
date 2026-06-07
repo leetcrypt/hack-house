@@ -1680,27 +1680,80 @@ fn handle_command(
                 }
             }
             Some("load") => match p.next() {
-                None => app.sys("usage: /sbx load <label>  (a docker snapshot saved via /sbx save)"),
+                None => app.sys("usage: /sbx load <label>  (a docker or multipass snapshot saved via /sbx save)"),
                 Some(label) if !is_snap_label(label) => {
                     app.sys("snapshot label must be alphanumerics, '.', '_' or '-'");
                 }
                 Some(label) => {
                     if app.sandbox.is_some() || broker.is_some() || *launching {
                         app.sys("stop the current sandbox first (`/sbx stop`) before loading a snapshot");
-                    } else if !sbx::docker_daemon_up() {
-                        app.err("docker daemon is not running — `/sbx launch docker --start` once to boot it, then retry");
                     } else {
-                        let image = format!("{}:{}", sbx::SNAP_REPO, label);
+                        // A bare label is backend-ambiguous, so probe which backend
+                        // actually holds the snapshot, then restore through it:
+                        // docker reruns a committed image; multipass restores the
+                        // (stopped, preserved) instance and re-attaches its shell.
+                        let label = label.to_string();
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
                         let (rows, cols) = sbx_dims(sz.0, sz.1);
                         *launching = true;
                         let members: Vec<String> =
                             app.users.iter().map(|u| u.username.clone()).collect();
-                        app.sys(format!("loading sandbox from {image}…"));
-                        spawn_launch(
-                            sbx::Backend::Docker, image, app.me.clone(), members, rows, cols,
-                            false, pty_tx.clone(), broker_tx.clone(), app_tx.clone(),
-                        );
+                        let owner = app.me.clone();
+                        app.sys(format!("loading snapshot '{label}'…"));
+                        let (pty, btx, atx) =
+                            (pty_tx.clone(), broker_tx.clone(), app_tx.clone());
+                        tokio::spawn(async move {
+                            let (n, lbl) = (SBX_NAME.to_string(), label.clone());
+                            let kind = tokio::task::spawn_blocking(move || {
+                                sbx::locate_snapshot(&n, &lbl)
+                            })
+                            .await
+                            .unwrap_or(sbx::SnapKind::None);
+                            match kind {
+                                sbx::SnapKind::Docker => {
+                                    if !sbx::docker_daemon_up() {
+                                        let _ = atx.send(Net::Err("docker daemon is not running — `/sbx launch docker --start` once to boot it, then retry".into()));
+                                        let _ = btx.send(BrokerMsg::Failed);
+                                        return;
+                                    }
+                                    let image = format!("{}:{}", sbx::SNAP_REPO, label);
+                                    let _ = atx.send(Net::Sys(format!("loading docker sandbox from {image}…")));
+                                    spawn_launch(
+                                        sbx::Backend::Docker, image, owner, members, rows,
+                                        cols, false, pty, btx, atx,
+                                    );
+                                }
+                                sbx::SnapKind::Multipass => {
+                                    let lbl = label.clone();
+                                    let res = tokio::task::spawn_blocking(move || {
+                                        sbx::mp_restore(SBX_NAME, &lbl)
+                                    })
+                                    .await;
+                                    match res {
+                                        Ok(Ok(desc)) => {
+                                            let _ = atx.send(Net::Sys(format!("⛧ {desc} · booting…")));
+                                            spawn_launch(
+                                                sbx::Backend::Multipass,
+                                                sbx::Backend::Multipass.default_image().to_string(),
+                                                owner, members, rows, cols, false, pty, btx, atx,
+                                            );
+                                        }
+                                        Ok(Err(e)) => {
+                                            let _ = atx.send(Net::Err(format!("load failed: {e}")));
+                                            let _ = btx.send(BrokerMsg::Failed);
+                                        }
+                                        Err(e) => {
+                                            let _ = atx.send(Net::Err(format!("load task: {e}")));
+                                            let _ = btx.send(BrokerMsg::Failed);
+                                        }
+                                    }
+                                }
+                                sbx::SnapKind::None => {
+                                    let _ = atx.send(Net::Err(format!("no saved snapshot '{label}' — list with `/sbx snaps`")));
+                                    let _ = btx.send(BrokerMsg::Failed);
+                                }
+                            }
+                        });
                     }
                 }
             },
@@ -1802,6 +1855,45 @@ fn handle_command(
                     }
                 }
             }
+            Some("vmload") => {
+                // Restore a VirtualBox VM to a snapshot (inverse of /sbx vmsave)
+                // then boot its GUI locally. `<label>` picks a named snapshot;
+                // omit it to restore the VM's current snapshot.
+                let mut vpos = p.filter(|a| !a.starts_with('-'));
+                match vpos.next() {
+                    None => app.sys(
+                        "usage: /sbx vmload <vm> [label]  (restore a VirtualBox snapshot + boot; list with /sbx vmsnaps <vm>)",
+                    ),
+                    Some(vm) => {
+                        let label = vpos.next().map(str::to_string);
+                        if label.as_deref().is_some_and(|l| !is_snap_label(l)) {
+                            app.sys("snapshot label must be alphanumerics, '.', '_' or '-'");
+                        } else {
+                            app.sys(format!(
+                                "restoring VM '{vm}'{} then booting…",
+                                label
+                                    .as_deref()
+                                    .map(|l| format!(" to '{l}'"))
+                                    .unwrap_or_default()
+                            ));
+                            let (tx, vm) = (app_tx.clone(), vm.to_string());
+                            tokio::spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    let desc = sbx::vm_restore(&vm, label.as_deref())?;
+                                    let boot = sbx::gui_launch(&vm)?;
+                                    Ok::<_, anyhow::Error>(format!("{desc} · {boot}"))
+                                })
+                                .await;
+                                let _ = match res {
+                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
+                                    Ok(Err(e)) => tx.send(Net::Err(format!("vmload failed: {e}"))),
+                                    Err(e) => tx.send(Net::Err(format!("vmload task: {e}"))),
+                                };
+                            });
+                        }
+                    }
+                }
+            }
             Some("gui") => {
                 // Convenience alias for `/sbx launch vbox gui <vm> [yes]` — opens a
                 // local VirtualBox VM's GUI on your own machine. Bare `/sbx gui`
@@ -1817,7 +1909,7 @@ fn handle_command(
                 }
             }
             _ => app.sys(
-                "usage: /sbx launch vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx gui <vm> alias · launch <docker|multipass> [image] (or local) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmsnaps <vm>",
+                "usage: /sbx launch vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx gui <vm> alias · launch <docker|multipass> [image] (or local) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>",
             ),
         }
     } else if let Some(rest) = line.strip_prefix("/unsudo") {

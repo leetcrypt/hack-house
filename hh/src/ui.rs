@@ -150,53 +150,52 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
     );
     vec![
         HelpCluster {
-            title: "SANDBOX",
+            title: "VIRTUAL MACHINES",
             items: vec![
+                // ── launch (one verb per backend) ──
                 kv(
-                    "/sbx launch <docker|multipass|vbox>",
-                    "summon a sandbox on YOUR machine — docker/multipass relay a shared shell; vbox <vm> opens a local GUI (or local)",
-                ),
-                kv("/sbx stop", "tear down the sandbox (purges the VM)"),
-                kv(
-                    "/sbx save [label] [--local]",
-                    "snapshot state (docker image; --local also writes a portable .tar)",
+                    "/sbx launch docker [image]",
+                    "Linux container — shared shell relayed to the room (default ubuntu:24.04 + auto dev toolchain)",
                 ),
                 kv(
-                    "/sbx load <label>",
-                    "launch a fresh sandbox from a saved snapshot",
+                    "/sbx launch multipass [image]",
+                    "full Ubuntu VM — shared shell relayed to the room (same dev toolchain)",
                 ),
-                kv("/sbx snaps", "list saved snapshots"),
-                kv(
-                    "/drive  ·  F2",
-                    "type into the shared shell  (Esc releases)",
-                ),
-            ],
-        },
-        HelpCluster {
-            title: "VIRTUALBOX (local GUI VM)",
-            items: vec![
                 kv(
                     "/sbx launch vbox",
-                    "open the arrow-navigable VM picker (↑↓ move · Enter/Tab boot · Esc dismiss)",
+                    "VirtualBox VM picker — local GUI (↑↓ move · Enter/Tab boot · Esc dismiss)",
                 ),
                 kv(
-                    "/sbx launch vbox [gui] <vm>",
-                    "boot a VM's GUI on YOUR machine — host with the VM already imported launches instantly",
+                    "/sbx launch vbox [gui] <vm> [yes]",
+                    "boot a VirtualBox VM's GUI on YOUR machine (non-host appends yes to install/import first)",
                 ),
+                kv("/sbx launch local", "a plain shell on your own machine — no VM"),
+                kv("/sbx stop", "tear down the running sandbox (purges the VM/container)"),
+                // ── save (docker/multipass share a verb; vbox has its own) ──
                 kv(
-                    "/sbx launch vbox gui <vm> yes",
-                    "non-host opt-in: append yes to install VirtualBox and/or import the shared .ova, then boot",
+                    "/sbx save [label] [--local]",
+                    "save docker/multipass state (--local on docker also writes a portable .tar)",
                 ),
-                kv(
-                    "/sbx gui <vm> [yes]",
-                    "alias of /sbx launch vbox gui <vm> [yes]",
-                ),
-                kv("/sbx vms", "detect VirtualBox + list local VMs"),
                 kv(
                     "/sbx vmsave <vm> [label] [--local]",
-                    "snapshot a VM (--local also exports a portable .ova to /send)",
+                    "save a VirtualBox VM snapshot (--local also exports a portable .ova to /send)",
                 ),
-                kv("/sbx vmsnaps <vm>", "list a VM's snapshots"),
+                // ── load + list ──
+                kv(
+                    "/sbx load <label>",
+                    "relaunch a saved docker/multipass snapshot (auto-detects backend)",
+                ),
+                kv(
+                    "/sbx vmload <vm> [label]",
+                    "restore a VirtualBox snapshot + boot (omit label for the VM's current snapshot)",
+                ),
+                kv("/sbx snaps", "list saved docker/multipass snapshots"),
+                kv(
+                    "/sbx vms  ·  /sbx vmsnaps <vm>",
+                    "list local VirtualBox VMs · a VM's snapshots",
+                ),
+                kv("/sbx gui <vm> [yes]", "alias of /sbx launch vbox gui <vm> [yes]"),
+                kv("/drive  ·  F2", "type into the shared shell (Esc releases)"),
             ],
         },
         HelpCluster {

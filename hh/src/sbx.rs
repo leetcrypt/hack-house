@@ -16,6 +16,10 @@ use std::sync::mpsc;
 const ENSURE_DOCKER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-docker.sh");
 /// Detect-first VirtualBox installer (ships in hh/scripts/).
 const ENSURE_VBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-vbox.sh");
+/// Baseline dev-toolchain installer run inside Docker sandboxes (hh/scripts/).
+const SBX_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbox-bootstrap.sh");
+/// Editable package schema the bootstrap installs — vim+curl always added.
+const SBX_TOOLS_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbox-tools.json");
 
 /// Is the Docker daemon accepting connections? (`docker info` succeeds.)
 pub fn docker_daemon_up() -> bool {
@@ -446,8 +450,21 @@ pub fn prepare(backend: Backend, name: &str, image: &str, start_daemon: bool) ->
 pub fn teardown(backend: Backend, name: &str) {
     match backend {
         Backend::Multipass => {
+            // Multipass snapshots live *inside* the instance, so `delete --purge`
+            // would destroy any saved state. If the user has snapshots worth
+            // keeping (so `/sbx load <label>` can restore them), just *stop* the
+            // instance — it persists, powered off, ready to be restored. With no
+            // snapshots there's nothing to preserve, so purge to stay clean.
+            let has_snaps = list_snapshots(Backend::Multipass, name)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let args: &[&str] = if has_snaps {
+                &["stop", name]
+            } else {
+                &["delete", name, "--purge"]
+            };
             let _ = Command::new("multipass")
-                .args(["delete", name, "--purge"])
+                .args(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -559,6 +576,30 @@ pub fn save_state(backend: Backend, name: &str, label: &str, local: bool) -> Res
     }
 }
 
+/// Restore a Multipass instance to a saved snapshot — the load-side inverse of
+/// the multipass branch of `save_state`. `multipass restore <name>.<label>`
+/// requires the instance to exist and be **stopped**, which is exactly the
+/// state `teardown` leaves it in when snapshots are present. Blocking; the
+/// caller boots it afterwards via the normal `prepare` (existing instance →
+/// `multipass start`) path. The leading `--destructive` skips the interactive
+/// "overwrite current state?" prompt — safe here because restoring *is* the
+/// intent and any unsaved drift since the snapshot is what the user wants gone.
+pub fn mp_restore(name: &str, label: &str) -> Result<String> {
+    let target = format!("{name}.{label}");
+    let out = Command::new("multipass")
+        .args(["restore", "--destructive", &target])
+        .output()
+        .context("multipass restore (is multipass installed?)")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "multipass restore failed: {}",
+            err.lines().last().unwrap_or("").trim()
+        );
+    }
+    Ok(format!("restored multipass instance to snapshot '{label}'"))
+}
+
 /// Snapshot a VirtualBox VM's state. VirtualBox isn't a brokered `Backend` (its
 /// GUI runs locally, never relayed), so it has its own save path. Blocking.
 ///
@@ -598,6 +639,35 @@ pub fn vm_save_state(vm: &str, label: &str, local: bool) -> Result<String> {
         ));
     }
     Ok(format!("snapshot '{label}' of {vm}"))
+}
+
+/// Restore a VirtualBox VM to a snapshot — the inverse of `vm_save_state`.
+/// `label` picks a named snapshot; `None` restores the VM's *current* snapshot.
+/// VirtualBox refuses to restore a live machine, so the VM must be powered off.
+/// Blocking; the caller boots the GUI afterwards.
+pub fn vm_restore(vm: &str, label: Option<&str>) -> Result<String> {
+    if vm_running(vm) {
+        anyhow::bail!("‘{vm}’ is running — power it off first, then restore the snapshot");
+    }
+    let args: Vec<&str> = match label {
+        Some(l) => vec!["snapshot", vm, "restore", l],
+        None => vec!["snapshot", vm, "restorecurrent"],
+    };
+    let out = Command::new("VBoxManage")
+        .args(&args)
+        .output()
+        .context("VBoxManage snapshot restore (is VirtualBox installed?)")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "VBoxManage snapshot restore failed: {}",
+            err.lines().last().unwrap_or("").trim()
+        );
+    }
+    Ok(match label {
+        Some(l) => format!("restored ‘{vm}’ to snapshot '{l}'"),
+        None => format!("restored ‘{vm}’ to its current snapshot"),
+    })
 }
 
 /// Snapshot names for a VirtualBox VM (`VBoxManage snapshot <vm> list
@@ -667,6 +737,37 @@ pub fn list_snapshots(backend: Backend, name: &str) -> Result<Vec<String>> {
     }
 }
 
+/// Where a `/sbx load <label>` snapshot lives, so the loader knows which backend
+/// to restore through. A bare label is ambiguous (a docker image tag *and* a
+/// multipass snapshot could share it), so we probe and prefer whichever exists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SnapKind {
+    Docker,
+    Multipass,
+    None,
+}
+
+/// Resolve a snapshot label to the backend that holds it. Probes multipass first
+/// (its snapshots are instance-scoped and rarer), then docker's `hh-snap` repo.
+/// Blocking — run off the UI thread. A backend whose CLI is absent simply
+/// reports no match rather than erroring, so a missing multipass doesn't block a
+/// docker load and vice-versa.
+pub fn locate_snapshot(name: &str, label: &str) -> SnapKind {
+    if list_snapshots(Backend::Multipass, name)
+        .map(|s| s.iter().any(|l| l == label))
+        .unwrap_or(false)
+    {
+        return SnapKind::Multipass;
+    }
+    if list_snapshots(Backend::Docker, name)
+        .map(|s| s.iter().any(|l| l == label))
+        .unwrap_or(false)
+    {
+        return SnapKind::Docker;
+    }
+    SnapKind::None
+}
+
 /// Build the shell command for a backend, running as unix user `run_user`
 /// (empty = backend default). The container/VM is already up (see `prepare`).
 fn command_for(backend: Backend, name: &str, run_user: &str) -> CommandBuilder {
@@ -730,6 +831,74 @@ fn dk(name: &str, args: &[&str]) {
         .status();
 }
 
+#[derive(serde::Deserialize)]
+struct ToolsCfg {
+    packages: Vec<String>,
+}
+
+/// The space-joined apt package list every Docker sandbox installs at launch.
+/// Read from `scripts/sandbox-tools.json` so it's editable without code changes;
+/// `vim`+`curl` are always present, names are sanitized to a safe charset, and
+/// duplicates collapse. Missing/invalid JSON degrades gracefully to vim+curl.
+fn sandbox_pkgs() -> String {
+    let mut out: Vec<String> = vec!["vim".into(), "curl".into()];
+    if let Ok(raw) = std::fs::read_to_string(SBX_TOOLS_JSON) {
+        if let Ok(cfg) = serde_json::from_str::<ToolsCfg>(&raw) {
+            for p in cfg.packages {
+                // Keep only valid apt package-name chars so a stray edit can't
+                // smuggle shell metacharacters into the install command.
+                let p: String = p
+                    .trim()
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || "._+-".contains(*c))
+                    .collect();
+                if !p.is_empty() && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.join(" ")
+}
+
+/// Run the sandbox bootstrap inside the container, piping the script to `bash -s`
+/// on stdin (keeps it out of argv) with the resolved package list in the env.
+/// Blocking — provision() is already off the UI thread.
+fn dk_bootstrap(name: &str) {
+    let script = std::fs::read_to_string(SBX_BOOTSTRAP).unwrap_or_else(|_| {
+        // Degraded fallback if the script file is missing: still refresh the
+        // index and install whatever the env carries (at minimum vim+curl).
+        "apt-get update -qq && apt-get install -y --no-install-recommends $HH_SBX_PKGS".into()
+    });
+    let env = format!("HH_SBX_PKGS={}", sandbox_pkgs());
+    let child = Command::new("docker")
+        .args(["exec", "-i", "-e", &env, name, "bash", "-s"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut c) = child {
+        if let Some(mut stdin) = c.stdin.take() {
+            let _ = stdin.write_all(script.as_bytes());
+        }
+        let _ = c.wait();
+    }
+}
+
+/// Install the baseline dev toolchain (scripts/sandbox-tools.json; vim+curl
+/// guaranteed) inside a Multipass VM. It already ships apt + sudo with a
+/// populated index, so this is a direct install. The package list is sanitized
+/// by `sandbox_pkgs`, so interpolating it into the shell command is safe.
+/// Blocking — provision() is off the UI thread.
+fn mp_bootstrap(name: &str) {
+    let cmd = format!(
+        "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && \
+         apt-get install -y --no-install-recommends {} || true",
+        sandbox_pkgs()
+    );
+    mp(name, &["sudo", "bash", "-c", &cmd]);
+}
+
 /// Grant a Multipass user real *passwordless* sudo (group + sudoers.d drop-in)
 /// so they're a usable superuser non-interactively. `u` is already unix-safe.
 fn mp_grant_sudo(name: &str, u: &str) {
@@ -759,13 +928,16 @@ pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) 
             if !run.is_empty() {
                 mp_grant_sudo(name, &run); // owner = passwordless superuser
             }
+            mp_bootstrap(name); // same baseline dev toolchain as the docker sandbox
             run
         }
         Backend::Docker => {
-            // Refresh the apt index once so `apt-get install <pkg>` just works —
-            // base images ship without /var/lib/apt/lists, so installs otherwise
-            // fail with "Unable to locate package" until the user runs update.
-            dk(name, &["apt-get", "update"]);
+            // Install the baseline dev toolchain (editable list in
+            // scripts/sandbox-tools.json; vim+curl guaranteed) so a fresh
+            // sandbox comes up usable instead of bare. The script also refreshes
+            // the apt index (base images ship without /var/lib/apt/lists) and is
+            // idempotent + sentinel-guarded, so re-provisions stay fast.
+            dk_bootstrap(name);
             for m in members {
                 let u = unix_name(m);
                 if !u.is_empty() {
