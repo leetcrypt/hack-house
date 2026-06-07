@@ -47,6 +47,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     if app.show_help {
         draw_help(f, f.area(), app, theme);
     }
+    if app.vbox_picker.is_some() {
+        draw_vbox_picker(f, f.area(), app, theme);
+    }
     if let Some(msg) = &app.error {
         draw_error(f, f.area(), theme, msg);
     }
@@ -150,8 +153,8 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
             title: "SANDBOX",
             items: vec![
                 kv(
-                    "/sbx launch [backend]",
-                    "summon a sandbox: local | docker | multipass",
+                    "/sbx launch <docker|multipass|vbox>",
+                    "summon a sandbox on YOUR machine — docker/multipass relay a shared shell; vbox <vm> opens a local GUI (or local)",
                 ),
                 kv("/sbx stop", "tear down the sandbox (purges the VM)"),
                 kv(
@@ -172,22 +175,26 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
         HelpCluster {
             title: "VIRTUALBOX (local GUI VM)",
             items: vec![
+                kv(
+                    "/sbx launch vbox",
+                    "open the arrow-navigable VM picker (↑↓ move · Enter/Tab boot · Esc dismiss)",
+                ),
+                kv(
+                    "/sbx launch vbox [gui] <vm>",
+                    "boot a VM's GUI on YOUR machine — host with the VM already imported launches instantly",
+                ),
+                kv(
+                    "/sbx launch vbox gui <vm> yes",
+                    "non-host opt-in: append yes to install VirtualBox and/or import the shared .ova, then boot",
+                ),
+                kv(
+                    "/sbx gui <vm> [yes]",
+                    "alias of /sbx launch vbox gui <vm> [yes]",
+                ),
                 kv("/sbx vms", "detect VirtualBox + list local VMs"),
                 kv(
-                    "/sbx gui <vm> [--install]",
-                    "open a shared VM locally — host & guest each get their own copy",
-                ),
-                kv(
-                    "/sbx gui yes",
-                    "confirm a pending launch (advance the consent gate)",
-                ),
-                kv(
-                    "/sbx gui cancel",
-                    "abort a pending launch (nothing stopped or installed)",
-                ),
-                kv(
                     "/sbx vmsave <vm> [label] [--local]",
-                    "snapshot a VM (--local also exports a portable .ova)",
+                    "snapshot a VM (--local also exports a portable .ova to /send)",
                 ),
                 kv("/sbx vmsnaps <vm>", "list a VM's snapshots"),
             ],
@@ -238,8 +245,8 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
         HelpCluster {
             title: "FILES",
             items: vec![
-                kv("/send <file>", "offer a file to the room"),
-                kv("/sendd <dir>", "offer a directory (sent as a tar)"),
+                kv("/send <user> <path>", "send a file/dir directly to one member"),
+                kv("/sendroom <path>", "offer a file/dir to the whole room"),
                 kv("/accept  ·  /reject", "respond to an incoming file offer"),
             ],
         },
@@ -277,6 +284,7 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "reconnect to the house after a drop / AFK",
                 ),
                 kv("/pw", "show this room's password (local only)"),
+                kv("/clear", "wipe your chat scrollback (local only)"),
                 kv("Ctrl-C  ·  Ctrl-Q", "quit hack-house"),
             ],
         },
@@ -341,6 +349,71 @@ fn help_render_lines(app: &App, theme: &Theme) -> Vec<Line<'static>> {
             .add_modifier(Modifier::ITALIC),
     )));
     lines
+}
+
+/// Arrow-navigable VirtualBox VM picker — a small dropdown anchored just above
+/// the input box. The highlighted row is inverted (theme bg on accent); Enter or
+/// Tab boots it, Esc dismisses. Key handling lives in the run loop.
+fn draw_vbox_picker(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    let Some(picker) = &app.vbox_picker else {
+        return;
+    };
+    // Width: widest VM name (plus a little chrome), clamped to the terminal.
+    let longest = picker
+        .vms
+        .iter()
+        .map(|v| v.chars().count())
+        .max()
+        .unwrap_or(0);
+    let w = (longest as u16 + 6).clamp(24, area.width.saturating_sub(2)).max(8);
+    // Height: one row per VM + borders, capped so it never swallows the screen.
+    let max_rows = area.height.saturating_sub(6).max(1);
+    let body = (picker.vms.len() as u16).min(max_rows);
+    let h = body + 2;
+    // Anchor bottom-left, riding just above the 3-row input box.
+    let x = area.x + 1;
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(h + 3));
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+
+    // Scroll the window so the selection stays visible in tall lists.
+    let first = picker.selected.saturating_sub(body.saturating_sub(1) as usize);
+    let items: Vec<ListItem> = picker
+        .vms
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(body as usize)
+        .map(|(i, vm)| {
+            let style = if i == picker.selected {
+                Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.title)
+            };
+            let marker = if i == picker.selected { "▸ " } else { "  " };
+            ListItem::new(Line::from(Span::styled(format!("{marker}{vm}"), style)))
+        })
+        .collect();
+
+    f.render_widget(Clear, rect);
+    let list = List::new(items).style(Style::default().bg(theme.bg)).block(
+        Block::bordered()
+            .border_style(Style::default().fg(theme.accent))
+            .title(Span::styled(
+                format!(" {} pick a VM · ↑↓ ⏎ Esc ", theme.sigil),
+                Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+            )),
+    );
+    f.render_widget(list, rect);
 }
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {

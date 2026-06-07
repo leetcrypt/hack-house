@@ -108,6 +108,45 @@ pub fn list_vms() -> Result<Vec<String>> {
         .collect())
 }
 
+/// Is a VM with this name registered locally? (i.e. present in `list_vms`).
+/// Used to tell a "host" (already has the appliance imported) from someone who
+/// still needs it pulled in before `gui_launch` can find it.
+pub fn vm_registered(name: &str) -> bool {
+    list_vms()
+        .map(|vms| vms.iter().any(|v| v == name))
+        .unwrap_or(false)
+}
+
+/// Import a VirtualBox appliance (`.ova`/`.ovf`) so its VM registers locally and
+/// becomes launchable via `gui_launch`. This is how a non-host "pulls" a shared
+/// VM onto their own machine after the appliance arrives over the encrypted
+/// channel. Blocking — run off the UI thread. Returns the imported VM's name.
+pub fn import_appliance(ova: &std::path::Path) -> Result<String> {
+    let before = list_vms().unwrap_or_default();
+    let out = Command::new("VBoxManage")
+        .arg("import")
+        .arg(ova)
+        .output()
+        .context("VBoxManage import (is VirtualBox installed?)")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "VBoxManage import failed: {}",
+            err.lines().last().unwrap_or("").trim()
+        );
+    }
+    // The imported name is whatever's newly registered; fall back to the file's
+    // stem if the diff is ambiguous (e.g. a re-import of an existing name).
+    let after = list_vms().unwrap_or_default();
+    let added = after.into_iter().find(|v| !before.contains(v));
+    Ok(added.unwrap_or_else(|| {
+        ova.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported-vm")
+            .to_string()
+    }))
+}
+
 /// Is a VM currently running? (`VBoxManage list runningvms`)
 pub fn vm_running(name: &str) -> bool {
     Command::new("VBoxManage")

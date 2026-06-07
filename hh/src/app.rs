@@ -55,17 +55,22 @@ pub struct User {
     pub username: String,
 }
 
-/// An in-progress incoming transfer we accepted.
+/// An in-progress incoming transfer we accepted. Chunks stream straight to a
+/// disk-backed `Sink` (created lazily on the first chunk) so a multi-GB payload
+/// never sits in RAM.
 struct Transfer {
     meta: ft::Offer,
-    buf: Vec<u8>,
+    sink: Option<ft::Sink>,
     accepted: bool,
 }
 
-/// An outgoing transfer awaiting / serving an accept.
+/// An outgoing transfer awaiting / serving an accept. The payload is streamed
+/// from `src` on disk, not held in memory.
 struct ActiveSend {
     id: String,
-    payload: Arc<Vec<u8>>,
+    src: std::path::PathBuf,
+    /// `src` is a temp tar we built for a directory — delete it after sending.
+    temp: bool,
     sending: bool,
 }
 
@@ -119,6 +124,17 @@ pub enum Net {
     /// A local system notice produced off-thread (e.g. async Ollama probe).
     Sys(String),
     Err(String),
+    /// An outgoing `/send` finished hashing off-thread and is staged for
+    /// streaming — the run loop records it in `active_send` so a peer's `/accept`
+    /// can start the chunk stream. The offer frame is emitted by the same task.
+    SendReady {
+        id: String,
+        src: std::path::PathBuf,
+        temp: bool,
+        name: String,
+        size: u64,
+        to: Option<String>,
+    },
     /// Relayed to the room when a member opens a shared VirtualBox VM locally, so
     /// the *other* party knows the appliance is live and can open their own copy.
     /// `by` is the server-authenticated launcher; the receiver skips its own echo.
@@ -134,31 +150,13 @@ pub struct SbxView {
     pub backend: String,
 }
 
-/// Where a staged `/sbx gui` launch is in its confirmation gauntlet. A local VM
-/// boots a real window on the user's own machine and can require stopping other
-/// hypervisors / installing VirtualBox, so each consequence gets its own
-/// explicit `/sbx gui yes`. Any `/sbx gui cancel` (or a fresh `/sbx gui <vm>`)
-/// abandons the pending launch without side effects.
+/// The arrow-navigable VirtualBox VM picker, opened by a bare `/sbx launch vbox`
+/// (or `/sbx gui`). Holds the locally-registered VM names and the highlighted
+/// row; Enter/Tab fills `/sbx launch vbox gui <vm>` into the input, Esc dismisses.
 #[derive(Clone)]
-pub enum VmStage {
-    /// Gate 1 — confirm opening the VM locally at all.
-    Open,
-    /// Gate 2 — confirm STOPPING the VT-x holders that block a hardware VM.
-    CloseConflicts,
-    /// Gate 3 — confirm INSTALLING VirtualBox (it isn't present yet).
-    Install,
-}
-
-/// A `/sbx gui <vm>` launch awaiting confirmation. Detection is captured once
-/// (at stage Open) so the prompts stay consistent through the gauntlet.
-#[derive(Clone)]
-pub struct PendingVm {
-    pub vm: String,
-    pub stage: VmStage,
-    /// Hypervisors holding VT-x that must stop before a hardware VM can boot.
-    pub conflicts: Vec<sbx::VtxHolder>,
-    /// VirtualBox isn't installed; the launch must install it first.
-    pub needs_install: bool,
+pub struct VboxPicker {
+    pub vms: Vec<String>,
+    pub selected: usize,
 }
 
 pub struct App {
@@ -175,9 +173,8 @@ pub struct App {
     /// Members whose VM unix account has sudo (superuser). Always includes owner.
     pub sudoers: std::collections::HashSet<String>,
     pub pending_offer: Option<ft::Offer>,
-    /// A `/sbx gui <vm>` launch waiting on its confirmation gauntlet (open →
-    /// stop-conflicts → install). None when nothing is pending.
-    pub pending_vm: Option<PendingVm>,
+    /// Open VM picker (arrow-navigable list of local VirtualBox VMs), or None.
+    pub vbox_picker: Option<VboxPicker>,
     transfers: HashMap<String, Transfer>,
     /// Chat scrollback: lines scrolled up from the live bottom (0 = following).
     pub chat_scroll: usize,
@@ -231,7 +228,7 @@ impl App {
             drivers: std::collections::HashSet::new(),
             sudoers: std::collections::HashSet::new(),
             pending_offer: None,
-            pending_vm: None,
+            vbox_picker: None,
             transfers: HashMap::new(),
             chat_scroll: 0,
             sbx_scroll: 0,
@@ -337,7 +334,7 @@ impl App {
                 self.connected = true;
                 self.chat_scroll = 0;
                 self.sys(format!("joined as {} ⛧", self.me));
-                self.sys("/sbx launch · /drive (Esc releases) · /ai start · /ai <question> · /send <file> · /pw show password · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys("/sbx launch <docker|multipass|vbox> · /drive (Esc releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => self.push_line(l),
             Net::Roster { users, capacity } => {
@@ -447,6 +444,7 @@ impl App {
                 self.sudoers = sudo;
             }
             Net::Ft(_) => {} // handled in the run loop (needs out channel + disk)
+            Net::SendReady { .. } => {} // handled in the run loop (stages active_send)
             Net::Sys(t) => self.sys(t),
             Net::Err(t) => self.err(t),
             Net::VmOpened { by, vm } => {
@@ -510,6 +508,54 @@ fn send_frame(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, value: serde_
     let _ = out.send(WsMsg::Text(room.encrypt(value.to_string().as_bytes())));
 }
 
+/// Read `path` and broadcast a file/dir offer. `to = Some(user)` targets one
+/// member (only they're prompted); `to = None` offers to the whole room. The
+/// payload is staged in `active_send` and streamed once an /accept arrives.
+fn offer_payload(
+    app: &mut App,
+    send_seq: &mut u64,
+    out_tx: &UnboundedSender<WsMsg>,
+    room: &Arc<fernet::Fernet>,
+    app_tx: &UnboundedSender<Net>,
+    path: &str,
+    to: Option<&str>,
+) {
+    *send_seq += 1;
+    let id = format!("{}-{}", app.me, send_seq);
+    let path = path.to_string();
+    let to = to.map(str::to_string);
+    let out = out_tx.clone();
+    let room = room.clone();
+    let atx = app_tx.clone();
+    // Hashing (and tarring a directory) walks every byte — do it off the UI
+    // thread so a multi-GB payload doesn't freeze the TUI. The task stages the
+    // send via `Net::SendReady` *then* emits the offer, so a peer's `/accept`
+    // can never race ahead of `active_send`.
+    app.sys(format!("hashing {path}…"));
+    tokio::task::spawn_blocking(move || match ft::prepare_send(&path) {
+        Ok(s) => {
+            let _ = atx.send(Net::SendReady {
+                id: id.clone(),
+                src: s.src,
+                temp: s.temp,
+                name: s.name.clone(),
+                size: s.size,
+                to: to.clone(),
+            });
+            let mut frame = json!({
+                "_ft":"offer","id": id,"name": s.name,"size": s.size,"sha256": s.sha256,"dir": s.dir
+            });
+            if let Some(t) = &to {
+                frame["to"] = json!(t);
+            }
+            let _ = out.send(WsMsg::Text(room.encrypt(frame.to_string().as_bytes())));
+        }
+        Err(e) => {
+            let _ = atx.send(Net::Err(format!("send failed: {e}")));
+        }
+    });
+}
+
 fn broadcast_acl(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, app: &App) {
     let drivers: Vec<&String> = app.drivers.iter().collect();
     let sudoers: Vec<&String> = app.sudoers.iter().collect();
@@ -522,25 +568,47 @@ fn broadcast_acl(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, app: &App)
     );
 }
 
-/// Stream a payload to the clergy as `_ft` chunks (background, paced).
+/// Stream a payload from disk to the clergy as `_ft` chunks (background, paced).
+/// Reads `src` in `CHUNK` blocks so only one chunk is ever resident — a multi-GB
+/// appliance streams with flat memory. Deletes `src` afterward if it's a temp tar.
 fn spawn_send(
     id: String,
-    payload: Arc<Vec<u8>>,
+    src: std::path::PathBuf,
+    temp: bool,
     out: UnboundedSender<WsMsg>,
     room: Arc<fernet::Fernet>,
 ) {
-    tokio::spawn(async move {
-        for (seq, chunk) in payload.chunks(ft::CHUNK).enumerate() {
-            let frame = json!({"_ft":"chunk","id": id,"seq": seq,"data": STANDARD.encode(chunk)});
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut f = match std::fs::File::open(&src) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut buf = vec![0u8; ft::CHUNK];
+        let mut seq = 0usize;
+        loop {
+            let n = match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let frame =
+                json!({"_ft":"chunk","id": id,"seq": seq,"data": STANDARD.encode(&buf[..n])});
             if out
                 .send(WsMsg::Text(room.encrypt(frame.to_string().as_bytes())))
                 .is_err()
             {
-                return;
+                break;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            seq += 1;
+            std::thread::sleep(Duration::from_millis(2));
         }
-        send_frame(&out, &room, json!({"_ft":"done","id": id}));
+        let _ = out.send(WsMsg::Text(
+            room.encrypt(json!({"_ft":"done","id": id}).to_string().as_bytes()),
+        ));
+        if temp {
+            let _ = std::fs::remove_file(&src);
+        }
     });
 }
 
@@ -560,18 +628,26 @@ fn handle_ft(
             if o.from == app.me {
                 return None; // our own offer echo
             }
+            // Direct send addressed to a specific member: everyone receives the
+            // broadcast, but only the named recipient is prompted.
+            if let Some(to) = &o.to {
+                if to != &app.me {
+                    return None;
+                }
+            }
             app.sys(format!(
-                "⛧ {} offers {} ({}{}) — /accept or /reject",
+                "⛧ {} offers {} ({}{}){} — /accept or /reject",
                 o.from,
                 o.name,
                 ft::human(o.size as usize),
-                if o.dir { ", directory" } else { "" }
+                if o.dir { ", directory" } else { "" },
+                if o.to.is_some() { " directly to you" } else { "" },
             ));
             app.transfers.insert(
                 o.id.clone(),
                 Transfer {
                     meta: o.clone(),
-                    buf: Vec::new(),
+                    sink: None,
                     accepted: false,
                 },
             );
@@ -581,7 +657,7 @@ fn handle_ft(
             if let Some(a) = active.as_mut() {
                 if a.id == id && !a.sending {
                     a.sending = true;
-                    spawn_send(id, a.payload.clone(), out.clone(), room.clone());
+                    spawn_send(id, a.src.clone(), a.temp, out.clone(), room.clone());
                     app.sys("transfer accepted — sending…");
                 }
             }
@@ -589,51 +665,89 @@ fn handle_ft(
         ft::Ft::Reject(id) => {
             if active.as_ref().map(|a| a.id == id).unwrap_or(false) {
                 app.sys("transfer rejected");
-                *active = None;
+                if let Some(a) = active.take() {
+                    if a.temp {
+                        let _ = std::fs::remove_file(&a.src); // discard the temp tar
+                    }
+                }
             }
         }
         ft::Ft::Chunk { id, data } => {
-            // Enforce the declared size (clamped to MAX_SIZE) on receipt — a
-            // malicious sender can lie about `size` or just keep streaming, so
-            // never let an accepted transfer grow its buffer past the cap.
+            // Stream straight to the disk-backed sink (created lazily on the
+            // first chunk). Enforce the declared size (clamped to STREAM_MAX) on
+            // receipt — a sender can lie about `size` or just keep streaming, so
+            // never let an accepted transfer grow past the cap.
             let mut overflow = false;
+            let mut io_err: Option<String> = None;
             if let Some(t) = app.transfers.get_mut(&id) {
                 if t.accepted {
-                    let cap = (t.meta.size as usize).min(ft::MAX_SIZE);
-                    if t.buf.len() + data.len() > cap {
-                        overflow = true;
-                    } else {
-                        t.buf.extend_from_slice(&data);
+                    if t.sink.is_none() {
+                        match ft::Sink::create(downloads, &id) {
+                            Ok(s) => t.sink = Some(s),
+                            Err(e) => io_err = Some(e.to_string()),
+                        }
+                    }
+                    if let Some(s) = t.sink.as_mut() {
+                        let cap = (t.meta.size).min(ft::STREAM_MAX);
+                        if s.written() + data.len() as u64 > cap {
+                            overflow = true;
+                        } else if let Err(e) = s.write(&data) {
+                            io_err = Some(e.to_string());
+                        }
                     }
                 }
             }
             if overflow {
                 if let Some(t) = app.transfers.remove(&id) {
+                    if let Some(s) = t.sink {
+                        s.abort();
+                    }
                     app.err(format!(
                         "{} — transfer exceeds declared size (max {}), aborted",
                         t.meta.name,
-                        ft::human((t.meta.size as usize).min(ft::MAX_SIZE))
+                        ft::human((t.meta.size).min(ft::STREAM_MAX) as usize)
                     ));
+                }
+            } else if let Some(e) = io_err {
+                if let Some(t) = app.transfers.remove(&id) {
+                    if let Some(s) = t.sink {
+                        s.abort();
+                    }
+                    app.err(format!("{} — write failed: {e}", t.meta.name));
                 }
             }
         }
         ft::Ft::Done(id) => {
             if let Some(t) = app.transfers.remove(&id) {
                 if t.accepted {
-                    if ft::sha256_hex(&t.buf) != t.meta.sha256 {
-                        app.err(format!("{} — SHA-256 mismatch, discarded", t.meta.name));
-                    } else {
-                        match ft::save(downloads, &t.meta, &t.buf) {
-                            Ok(p) => {
-                                app.sys(format!(
-                                    "⛧ saved {} ({}) — verified ✓",
-                                    p.display(),
-                                    ft::human(t.buf.len())
-                                ));
-                                saved = Some(p);
+                    match t.sink {
+                        Some(s) => match s.finish() {
+                            Ok((tmp, sha)) => {
+                                if sha != t.meta.sha256 {
+                                    let _ = std::fs::remove_file(&tmp);
+                                    app.err(format!(
+                                        "{} — SHA-256 mismatch, discarded",
+                                        t.meta.name
+                                    ));
+                                } else {
+                                    match ft::commit(downloads, &t.meta, &tmp) {
+                                        Ok(p) => {
+                                            app.sys(format!(
+                                                "⛧ saved {} ({}) — verified ✓",
+                                                p.display(),
+                                                ft::human(t.meta.size as usize)
+                                            ));
+                                            saved = Some(p);
+                                        }
+                                        Err(e) => app.err(format!("save failed: {e}")),
+                                    }
+                                }
                             }
-                            Err(e) => app.err(format!("save failed: {e}")),
-                        }
+                            Err(e) => {
+                                app.err(format!("{} — finalize failed: {e}", t.meta.name))
+                            }
+                        },
+                        None => app.err(format!("{} — no data received", t.meta.name)),
                     }
                 }
             }
@@ -824,6 +938,41 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     let _ = rtx.send(r);
                                 });
                             }
+                        } else if app.vbox_picker.is_some() {
+                            // Modal VM picker (from a bare `/sbx launch vbox`): arrow
+                            // keys move the highlight, Enter/Tab boots the selected VM
+                            // on this machine (host-frictionless path; a non-host who
+                            // needs install/import is steered to re-issue with `yes`),
+                            // Esc dismisses. Intercepts keys so the list stays put.
+                            match k.code {
+                                KeyCode::Up => {
+                                    if let Some(p) = &mut app.vbox_picker {
+                                        p.selected = p.selected.saturating_sub(1);
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if let Some(p) = &mut app.vbox_picker {
+                                        p.selected =
+                                            (p.selected + 1).min(p.vms.len().saturating_sub(1));
+                                    }
+                                }
+                                KeyCode::Enter | KeyCode::Tab => {
+                                    let vm = app
+                                        .vbox_picker
+                                        .take()
+                                        .and_then(|p| p.vms.into_iter().nth(p.selected));
+                                    if let Some(vm) = vm {
+                                        launch_vbox_gui(
+                                            &mut app, vm, false, &app_tx, &out_tx, &session.room,
+                                        );
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    app.vbox_picker = None;
+                                    app.sys("⛧ picker dismissed");
+                                }
+                                _ => {} // ignore other keys so the picker stays put
+                            }
                         } else if app.show_help {
                             // tmux-style nav: up/down highlight a cluster, left/right
                             // (or Enter) collapse/expand it, PgUp/PgDn scroll the
@@ -910,7 +1059,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     let line = app.input.trim().to_string();
                                     app.input.clear();
                                     app.chat_scroll = 0; // jump back to live on send
-                                    handle_command(&line, &mut app, &mut theme, &mut active_send, &mut send_seq,
+                                    handle_command(&line, &mut app, &mut theme, &mut send_seq,
                                         &mut broker, &mut broker_meta, &mut launching, &mut announced_dims,
                                         &out_tx, &pty_tx, &broker_tx, &app_tx, &session, &term,
                                         &mut agent, &params);
@@ -1003,6 +1152,33 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             if let Some(path) =
                                 handle_ft(f, &mut app, &mut active_send, &out_tx, &session.room, &downloads)
                             {
+                                // A received VirtualBox appliance auto-imports so the VM
+                                // registers locally and the recipient can immediately
+                                // `/sbx launch vbox gui <vm>`. Off-thread (VBoxManage import
+                                // is slow); reports back via the app channel.
+                                let ext = path
+                                    .extension()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| s.to_ascii_lowercase());
+                                if matches!(ext.as_deref(), Some("ova") | Some("ovf")) {
+                                    let tx = app_tx.clone();
+                                    let ova = path.clone();
+                                    tokio::spawn(async move {
+                                        let res = tokio::task::spawn_blocking(move || {
+                                            sbx::import_appliance(&ova)
+                                        })
+                                        .await;
+                                        let _ = match res {
+                                            Ok(Ok(vm)) => tx.send(Net::Sys(format!(
+                                                "⛧ imported VM ‘{vm}’ — `/sbx launch vbox gui {vm}` to boot it"
+                                            ))),
+                                            Ok(Err(e)) => tx.send(Net::Sys(format!(
+                                                "(received .ova not auto-imported: {e})"
+                                            ))),
+                                            Err(e) => tx.send(Net::Err(format!("import task: {e}"))),
+                                        };
+                                    });
+                                }
                                 if let Some((be, name)) = &broker_meta {
                                     if !matches!(be, sbx::Backend::Local) {
                                         let (be, name) = (*be, name.clone());
@@ -1063,6 +1239,24 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 broadcast_acl(&out_tx, &session.room, &app);
                             }
                             app.apply(ev);
+                        }
+                        Net::SendReady { id, src, temp, name, size, to } => {
+                            // The off-thread hash finished and emitted the offer; record
+                            // the staged send so a peer's /accept can start streaming.
+                            active_send = Some(ActiveSend { id, src, temp, sending: false });
+                            match to {
+                                Some(t) => app.sys(format!(
+                                    "offered {} ({}) to {} — waiting for an /accept",
+                                    name,
+                                    ft::human(size as usize),
+                                    t
+                                )),
+                                None => app.sys(format!(
+                                    "offered {} ({}) to the room — waiting for an /accept",
+                                    name,
+                                    ft::human(size as usize)
+                                )),
+                            }
                         }
                         other => app.apply(other),
                     }
@@ -1236,7 +1430,6 @@ fn handle_command(
     line: &str,
     app: &mut App,
     theme: &mut Theme,
-    active_send: &mut Option<ActiveSend>,
     send_seq: &mut u64,
     broker: &mut Option<sbx::Sandbox>,
     broker_meta: &mut Option<(sbx::Backend, String)>,
@@ -1254,6 +1447,12 @@ fn handle_command(
     let room = &session.room;
     if line == "/help" || line == "/?" {
         app.open_help();
+    } else if line == "/clear" || line == "/cls" {
+        // Local-only: wipe this client's chat scrollback. Doesn't touch the
+        // room — other peers keep their own history.
+        app.lines.clear();
+        app.chat_scroll = 0;
+        app.sys("⛧ chat cleared");
     } else if line == "/pw" || line == "/password" {
         // Show the room password locally (never broadcast). Handy when the
         // server's password was autogenerated and you need to read it off / share
@@ -1317,35 +1516,34 @@ fn handle_command(
         } else {
             app.sys("you don't have drive permission — the owner can /grant you");
         }
-    } else if let Some(path) = line
-        .strip_prefix("/sendd ")
-        .or_else(|| line.strip_prefix("/send "))
-    {
-        let path = path.trim();
-        match ft::read_payload(path) {
-            Ok((name, bytes, dir)) => {
-                *send_seq += 1;
-                let id = format!("{}-{}", app.me, send_seq);
-                let (size, sha) = (bytes.len(), ft::sha256_hex(&bytes));
-                *active_send = Some(ActiveSend {
-                    id: id.clone(),
-                    payload: Arc::new(bytes),
-                    sending: false,
-                });
-                send_frame(
-                    out_tx,
-                    room,
-                    json!({
-                        "_ft":"offer","id": id,"name": name,"size": size,"sha256": sha,"dir": dir
-                    }),
-                );
-                app.sys(format!(
-                    "offered {} ({}) — waiting for an /accept",
-                    name,
-                    ft::human(size)
-                ));
+    } else if let Some(rest) = line.strip_prefix("/sendroom ") {
+        // Offer a file/dir to the whole room — anyone may /accept.
+        offer_payload(app, send_seq, out_tx, room, app_tx, rest.trim(), None);
+    } else if let Some(rest) = line.strip_prefix("/send ") {
+        // Direct send to one member: `/send <user> <path>`. Everyone receives the
+        // broadcast offer, but only <user> is prompted to /accept.
+        let rest = rest.trim();
+        match rest.split_once(char::is_whitespace) {
+            Some((who, path)) => {
+                let (who, path) = (who.trim(), path.trim());
+                if who == app.me {
+                    app.sys("can't /send to yourself — use /sendroom <path> for everyone");
+                } else if path.is_empty() {
+                    app.sys("usage: /send <user> <path>  ·  /sendroom <path> for everyone");
+                } else if !app.users.iter().any(|u| u.username == who) {
+                    let roster = app
+                        .users
+                        .iter()
+                        .map(|u| u.username.as_str())
+                        .filter(|u| *u != app.me)
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    app.err(format!("no member '{who}' in the room — try: {roster}"));
+                } else {
+                    offer_payload(app, send_seq, out_tx, room, app_tx, path, Some(who));
+                }
             }
-            Err(e) => app.err(format!("send failed: {e}")),
+            None => app.sys("usage: /send <user> <path>  ·  /sendroom <path> for everyone"),
         }
     } else if line == "/accept" {
         if let Some(o) = app.pending_offer.take() {
@@ -1369,34 +1567,45 @@ fn handle_command(
         let mut p = rest.split_whitespace();
         match p.next() {
             Some("launch") => {
-                if app.sandbox.is_some() || broker.is_some() || *launching {
+                // `--start` (alias `--start-daemon` / `-y`) opts in to booting a
+                // stopped Docker daemon; everything else is positional. The first
+                // positional selects the backend: docker | multipass | vbox |
+                // local. Each runs on the *invoker's* own machine.
+                let args: Vec<&str> = p.collect();
+                let start_daemon = args
+                    .iter()
+                    .any(|a| matches!(*a, "--start" | "--start-daemon" | "-y"));
+                let mut pos = args.iter().copied().filter(|a| !a.starts_with('-'));
+                let first = pos.next();
+                if matches!(first, Some("virtualbox") | Some("vbox")) {
+                    // VirtualBox runs locally in its own GUI — host & guest each
+                    // open their own copy, nothing is relayed. It's independent of
+                    // the shared-PTY sandbox, so it bypasses the "already running"
+                    // guard. Grammar: `/sbx launch vbox [gui] <vm> [yes]`; a bare
+                    // `/sbx launch vbox` opens the arrow-navigable VM picker.
+                    let mut rest = pos.peekable();
+                    if rest.peek() == Some(&"gui") {
+                        rest.next(); // optional `gui` keyword (sugar)
+                    }
+                    match rest.next() {
+                        Some(vm) => {
+                            let confirmed = rest
+                                .any(|t| matches!(t, "yes" | "y" | "go" | "confirm" | "ok"));
+                            launch_vbox_gui(app, vm.to_string(), confirmed, app_tx, out_tx, room);
+                        }
+                        None => open_vbox_picker(app),
+                    }
+                } else if app.sandbox.is_some() || broker.is_some() || *launching {
                     app.sys("a sandbox is already running");
                 } else {
-                    // `--start` (alias `--start-daemon` / `-y`) opts in to booting
-                    // a stopped Docker daemon; everything else is positional.
-                    let args: Vec<&str> = p.collect();
-                    let start_daemon = args
-                        .iter()
-                        .any(|a| matches!(*a, "--start" | "--start-daemon" | "-y"));
-                    // VirtualBox isn't a shared-PTY backend — a GUI VM (a Windows
-                    // guest especially) has no shell to relay. Steer to /sbx gui.
-                    let wants_vbox = args.iter().any(|a| matches!(*a, "virtualbox" | "vbox"));
-                    let mut pos = args.iter().copied().filter(|a| !a.starts_with('-'));
-                    let backend = pos
-                        .next()
+                    let backend = first
                         .and_then(sbx::Backend::parse)
                         .unwrap_or(sbx::Backend::Local);
                     let image = pos
                         .next()
                         .map(str::to_string)
                         .unwrap_or_else(|| backend.default_image().to_string());
-
-                    if wants_vbox {
-                        app.sys("VirtualBox VMs run locally in their own GUI — use `/sbx gui <vm>` (list them with `/sbx vms`)");
-                    } else if backend == sbx::Backend::Docker
-                        && !start_daemon
-                        && !sbx::docker_daemon_up()
-                    {
+                    if backend == sbx::Backend::Docker && !start_daemon && !sbx::docker_daemon_up() {
                         app.err("docker daemon is not running — retry with `/sbx launch docker --start` to boot it (sudo), or run ./scripts/ensure-docker.sh in a terminal first");
                     } else {
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
@@ -1593,70 +1802,21 @@ fn handle_command(
                 }
             }
             Some("gui") => {
-                let gargs: Vec<&str> = p.collect();
-                let first = gargs.iter().copied().find(|a| !a.starts_with('-'));
-                let is_yes = matches!(first, Some("yes" | "y" | "go" | "confirm" | "ok"));
-                let is_no = matches!(first, Some("no" | "n" | "cancel" | "abort" | "stop"));
-                if is_no {
-                    // A `/sbx gui cancel` at any gate: drop the launch, no side
-                    // effects (nothing was stopped or installed yet).
-                    if app.pending_vm.take().is_some() {
-                        app.sys("cancelled — no VM launched, nothing stopped or installed");
-                    } else {
-                        app.sys("nothing to cancel");
+                // Convenience alias for `/sbx launch vbox gui <vm> [yes]` — opens a
+                // local VirtualBox VM's GUI on your own machine. Bare `/sbx gui`
+                // opens the VM picker, same as `/sbx launch vbox`.
+                let mut gpos = p.filter(|a| !a.starts_with('-'));
+                match gpos.next() {
+                    Some(vm) => {
+                        let confirmed =
+                            gpos.any(|t| matches!(t, "yes" | "y" | "go" | "confirm" | "ok"));
+                        launch_vbox_gui(app, vm.to_string(), confirmed, app_tx, out_tx, room);
                     }
-                } else if is_yes {
-                    // Advance the gauntlet one gate.
-                    match app.pending_vm.take() {
-                        None => app.sys("no VM launch is waiting — start one with `/sbx gui <vm>`"),
-                        Some(pend) => advance_vm(pend, app, app_tx, out_tx, room),
-                    }
-                } else {
-                    // A fresh `/sbx gui <vm>`: detect locally and pose gate 1.
-                    let install_flag = gargs.contains(&"--install");
-                    match first.map(str::to_string) {
-                        None => app.sys(
-                            "usage: /sbx gui <vm> [--install]  ·  confirm with `/sbx gui yes`, abort with `/sbx gui cancel`  (list VMs: /sbx vms)",
-                        ),
-                        Some(vm) => {
-                            let installed = sbx::vbox_installed();
-                            if installed && sbx::vm_running(&vm) {
-                                app.sys(format!(
-                                    "{vm} is already running — look for its window on your desktop"
-                                ));
-                            } else {
-                                // Local boot affects the user's own machine, so
-                                // stage it behind explicit confirmation. Anyone
-                                // in the room can run this — each client opens
-                                // its own copy locally (host and guest alike).
-                                let _ = install_flag; // consent now flows through `/sbx gui yes`
-                                let conflicts = sbx::vtx_holders();
-                                let mut warn = String::new();
-                                if !conflicts.is_empty() {
-                                    warn.push_str(&format!(
-                                        " ⚠ {} other VM(s) hold VT-x and may need to stop.",
-                                        conflicts.len()
-                                    ));
-                                }
-                                if !installed {
-                                    warn.push_str(" (VirtualBox isn't installed yet.)");
-                                }
-                                app.sys(format!(
-                                    "open ‘{vm}’ locally? a VirtualBox window will launch on YOUR machine.{warn}  →  `/sbx gui yes` to continue · `/sbx gui cancel` to abort"
-                                ));
-                                app.pending_vm = Some(PendingVm {
-                                    vm,
-                                    stage: VmStage::Open,
-                                    conflicts,
-                                    needs_install: !installed,
-                                });
-                            }
-                        }
-                    }
+                    None => open_vbox_picker(app),
                 }
             }
             _ => app.sys(
-                "usage: /sbx launch [local|docker|multipass] [image] · gui <vm> · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmsnaps <vm>",
+                "usage: /sbx launch vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx gui <vm> alias · launch <docker|multipass> [image] (or local) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmsnaps <vm>",
             ),
         }
     } else if let Some(rest) = line.strip_prefix("/unsudo") {
@@ -1877,62 +2037,132 @@ fn is_snap_label(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Advance a staged `/sbx gui` launch by one confirmation gate. Each `/sbx gui
-/// yes` calls this. Stage transitions are pure (app-thread) state changes; only
-/// the *final* gate spawns the off-thread executor that actually stops
-/// conflicts, installs, and boots the VM. A holder we can't stop cleanly aborts
-/// the whole launch here rather than killing anything.
-fn advance_vm(
-    pend: PendingVm,
+/// Find a local VirtualBox appliance (`.ova`/`.ovf`) for `vm` so a non-host can
+/// import ("pull") it. Looks in `hh-snapshots/` (where `/sbx vmsave --local`
+/// writes exports) and `./downloads/` (where a /sent appliance lands). Matches
+/// on the file stem equalling, prefixing (`<vm>-…`), or containing the VM name.
+fn find_local_appliance(vm: &str) -> Option<std::path::PathBuf> {
+    let dirs = [
+        std::path::PathBuf::from(sbx::SNAP_DIR),
+        std::path::PathBuf::from("./downloads"),
+    ];
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let ext_ok = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ova") || s.eq_ignore_ascii_case("ovf"))
+                .unwrap_or(false);
+            let name_match = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s == vm || s.starts_with(&format!("{vm}-")) || s.contains(vm))
+                .unwrap_or(false);
+            if ext_ok && name_match {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Open the arrow-navigable VM picker (populated synchronously — a single
+/// `VBoxManage list vms`, same blocking style as the other vbox probes here).
+/// Empty/uninstalled cases steer the user instead of opening an empty list.
+fn open_vbox_picker(app: &mut App) {
+    if !sbx::vbox_installed() {
+        app.sys("VirtualBox isn't installed — `/sbx launch vbox gui <vm> yes` installs it, or run ./scripts/ensure-vbox.sh");
+        return;
+    }
+    match sbx::list_vms() {
+        Ok(vms) if !vms.is_empty() => {
+            app.vbox_picker = Some(VboxPicker { vms, selected: 0 });
+            app.sys("⛧ pick a VM — ↑/↓ move · Enter/Tab choose · Esc dismiss");
+        }
+        Ok(_) => app.sys(
+            "no VirtualBox VMs registered — a host can /send you a .ova, then `/sbx launch vbox gui <vm> yes` to import it",
+        ),
+        Err(e) => app.err(format!("listing VMs: {e}")),
+    }
+}
+
+/// Launch (or pull-then-launch) a local VirtualBox VM's GUI on the caller's OWN
+/// machine — nothing is relayed; every member opens their own copy. Shared by
+/// `/sbx launch vbox gui <vm>` and the `/sbx gui <vm>` alias.
+///
+/// Frictionless for a "host" who already has VirtualBox AND the VM imported with
+/// no other VM holding VT-x: it just boots. A non-host missing VirtualBox or the
+/// VM image — or who'd have to stop another VM first — must re-issue with a
+/// trailing `yes`, which then installs VirtualBox, imports the shared appliance,
+/// and/or frees VT-x before booting.
+fn launch_vbox_gui(
     app: &mut App,
+    vm: String,
+    confirmed: bool,
     app_tx: &UnboundedSender<Net>,
     out_tx: &UnboundedSender<WsMsg>,
     room: &Arc<fernet::Fernet>,
 ) {
-    // Refuse outright if any VT-x holder is one we won't touch (e.g. a stray
-    // qemu we don't recognise). Better to make the user decide than to kill it.
-    if let Some(bad) = pend.conflicts.iter().find(|h| !h.stoppable) {
-        app.err(format!(
-            "can't free VT-x automatically — {} is running and I won't kill it. Stop it yourself, then retry `/sbx gui {}`.",
-            bad.label, pend.vm
+    let installed = sbx::vbox_installed();
+    if installed && sbx::vm_running(&vm) {
+        app.sys(format!(
+            "{vm} is already running — look for its window on your desktop"
         ));
         return;
     }
-    match pend.stage {
-        VmStage::Open => {
-            if !pend.conflicts.is_empty() {
-                let names: Vec<String> = pend.conflicts.iter().map(|h| h.label.clone()).collect();
-                app.sys(format!(
-                    "⚠ second confirmation: these hold the CPU's VT-x and block a VirtualBox VM — {}. They must STOP first (reversible — restart them afterwards).  →  `/sbx gui yes` to stop them & continue · `/sbx gui cancel` to abort",
-                    names.join(", ")
-                ));
-                app.pending_vm = Some(PendingVm {
-                    stage: VmStage::CloseConflicts,
-                    ..pend
-                });
-            } else if pend.needs_install {
-                app.sys("VirtualBox isn't installed.  →  `/sbx gui yes` to install it now (needs sudo) · `/sbx gui cancel` to abort");
-                app.pending_vm = Some(PendingVm {
-                    stage: VmStage::Install,
-                    ..pend
-                });
-            } else {
-                spawn_vm_execute(pend, app, app_tx, out_tx, room);
-            }
-        }
-        VmStage::CloseConflicts => {
-            if pend.needs_install {
-                app.sys("VirtualBox isn't installed.  →  `/sbx gui yes` to install it now (needs sudo) · `/sbx gui cancel` to abort");
-                app.pending_vm = Some(PendingVm {
-                    stage: VmStage::Install,
-                    ..pend
-                });
-            } else {
-                spawn_vm_execute(pend, app, app_tx, out_tx, room);
-            }
-        }
-        VmStage::Install => spawn_vm_execute(pend, app, app_tx, out_tx, room),
+    let have_vm = installed && sbx::vm_registered(&vm);
+    let conflicts = sbx::vtx_holders();
+    let needs_install = !installed;
+    let needs_import = !have_vm;
+
+    // Host path: VirtualBox + this VM already present and nothing to stop → boot
+    // immediately, no confirmation.
+    if installed && have_vm && conflicts.is_empty() {
+        spawn_vm_execute(vm, conflicts, false, false, app, app_tx, out_tx, room);
+        return;
     }
+
+    // Otherwise a side effect is required (install / import / stop another VM).
+    // The non-host opts in with a trailing `yes`.
+    if !confirmed {
+        let mut steps: Vec<String> = Vec::new();
+        if needs_install {
+            steps.push("install VirtualBox (needs sudo)".to_string());
+        }
+        if needs_import {
+            match find_local_appliance(&vm) {
+                Some(p) => steps.push(format!("import {}", p.display())),
+                None => {
+                    app.sys(format!(
+                        "no local appliance for ‘{vm}’ yet — have the host export it (`/sbx vmsave {vm} --local`) and /send you the .ova, then `/sbx launch vbox gui {vm} yes`"
+                    ));
+                    return;
+                }
+            }
+        }
+        if !conflicts.is_empty() {
+            steps.push(format!("stop {} other VM(s) holding VT-x", conflicts.len()));
+        }
+        app.sys(format!(
+            "opening ‘{vm}’ on YOUR machine will {}.  →  `/sbx launch vbox gui {vm} yes` to proceed",
+            steps.join(", ")
+        ));
+        return;
+    }
+
+    // Confirmed. Refuse VT-x holders we can't cleanly restart rather than kill them.
+    if let Some(bad) = conflicts.iter().find(|h| !h.stoppable) {
+        app.err(format!(
+            "can't free VT-x automatically — {} is running and I won't kill it. Stop it yourself, then retry `/sbx launch vbox gui {vm} yes`.",
+            bad.label
+        ));
+        return;
+    }
+    spawn_vm_execute(vm, conflicts, needs_install, needs_import, app, app_tx, out_tx, room);
 }
 
 /// Final step of the gauntlet: off-thread, stop any VT-x holders (reversibly),
@@ -1942,19 +2172,25 @@ fn advance_vm(
 /// go live and can `/sbx gui <vm>` their own local copy — anyone in the room may
 /// do so (the per-client consent gauntlet *is* the client's permission; this is
 /// deliberately not owner-gated, unlike `/sbx save`).
+#[allow(clippy::too_many_arguments)] // launch context: vm + flags + 3 channels
 fn spawn_vm_execute(
-    pend: PendingVm,
+    vm: String,
+    conflicts: Vec<sbx::VtxHolder>,
+    needs_install: bool,
+    needs_import: bool,
     app: &mut App,
     app_tx: &UnboundedSender<Net>,
     out_tx: &UnboundedSender<WsMsg>,
     room: &Arc<fernet::Fernet>,
 ) {
-    let PendingVm {
-        vm,
-        conflicts,
-        needs_install,
-        ..
-    } = pend;
+    // Resolve the appliance path now (on the app thread) so the blocking task
+    // doesn't have to re-scan; None is fine unless an import actually proves
+    // necessary inside the task.
+    let appliance = if needs_import {
+        find_local_appliance(&vm)
+    } else {
+        None
+    };
     if conflicts.is_empty() {
         app.sys(format!("launching ‘{vm}’…"));
     } else {
@@ -1974,6 +2210,13 @@ fn spawn_vm_execute(
             }
             if needs_install && !sbx::vbox_installed() {
                 sbx::ensure_vbox_install().map_err(|e| format!("install failed: {e}"))?;
+            }
+            // Pull the shared appliance in if the VM still isn't registered.
+            if needs_import && !sbx::vm_registered(&vm) {
+                let ova = appliance.ok_or_else(|| {
+                    format!("no local .ova appliance found for ‘{vm}’ to import")
+                })?;
+                sbx::import_appliance(&ova).map_err(|e| format!("import failed: {e}"))?;
             }
             sbx::gui_launch(&vm).map_err(|e| e.to_string())
         })
@@ -2136,104 +2379,26 @@ fn spawn_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_vm, drain_ready, App, Net, PendingVm, Role, User, VmStage};
-    use crate::sbx::VtxHolder;
-    use std::sync::Arc;
+    use super::{drain_ready, App, Net, Role, User, VboxPicker};
     use tokio::sync::mpsc::unbounded_channel;
 
-    fn holder(kind: &str, stoppable: bool) -> VtxHolder {
-        VtxHolder {
-            label: format!("{kind} VM"),
-            kind: kind.into(),
-            instance: String::new(),
-            stoppable,
-        }
-    }
-
-    fn test_room() -> Arc<fernet::Fernet> {
-        Arc::new(fernet::Fernet::new(&fernet::Fernet::generate_key()).expect("key"))
-    }
-
-    /// The consent gauntlet must walk Open → CloseConflicts when a (stoppable)
-    /// hypervisor holds VT-x, posing a SECOND confirmation rather than acting.
+    /// The picker highlights the first VM and wraps a clamped selection; this is
+    /// the pure state the key handler drives with ↑/↓.
     #[test]
-    fn advance_vm_open_with_conflict_asks_to_stop_it() {
-        let (app_tx, _ar) = unbounded_channel::<Net>();
-        let (out_tx, _or) = unbounded_channel();
-        let room = test_room();
+    fn vbox_picker_selection_is_clamped() {
         let mut app = App::new("alice".into());
-        let pend = PendingVm {
-            vm: "WinLab".into(),
-            stage: VmStage::Open,
-            conflicts: vec![holder("multipass", true)],
-            needs_install: false,
-        };
-        advance_vm(pend, &mut app, &app_tx, &out_tx, &room);
-        let p = app.pending_vm.as_ref().expect("still pending after gate 1");
-        assert!(matches!(p.stage, VmStage::CloseConflicts));
-        assert!(app
-            .lines
-            .last()
-            .unwrap()
-            .text
-            .contains("second confirmation"));
-    }
-
-    /// Safety invariant: if ANY holder is non-stoppable (something we won't kill),
-    /// the gauntlet refuses — it surfaces an error and drops the pending launch
-    /// rather than advancing or touching the unknown process.
-    #[test]
-    fn advance_vm_refuses_when_a_holder_is_unstoppable() {
-        let (app_tx, _ar) = unbounded_channel::<Net>();
-        let (out_tx, _or) = unbounded_channel();
-        let room = test_room();
-        let mut app = App::new("alice".into());
-        let pend = PendingVm {
-            vm: "WinLab".into(),
-            stage: VmStage::Open,
-            conflicts: vec![holder("unknown", false)],
-            needs_install: false,
-        };
-        advance_vm(pend, &mut app, &app_tx, &out_tx, &room);
-        assert!(app.pending_vm.is_none(), "must not advance past a refusal");
-        assert!(app.error.is_some(), "must surface an error");
-    }
-
-    /// With no VT-x conflict but VirtualBox absent, Open → Install (gate 3).
-    #[test]
-    fn advance_vm_open_needing_install_moves_to_install_gate() {
-        let (app_tx, _ar) = unbounded_channel::<Net>();
-        let (out_tx, _or) = unbounded_channel();
-        let room = test_room();
-        let mut app = App::new("alice".into());
-        let pend = PendingVm {
-            vm: "WinLab".into(),
-            stage: VmStage::Open,
-            conflicts: vec![],
-            needs_install: true,
-        };
-        advance_vm(pend, &mut app, &app_tx, &out_tx, &room);
-        let p = app.pending_vm.as_ref().expect("pending at install gate");
-        assert!(matches!(p.stage, VmStage::Install));
-    }
-
-    /// After confirming the stop, if install is still needed the gauntlet steps
-    /// CloseConflicts → Install (it does not jump straight to launching).
-    #[test]
-    fn advance_vm_closeconflicts_needing_install_steps_to_install() {
-        let (app_tx, _ar) = unbounded_channel::<Net>();
-        let (out_tx, _or) = unbounded_channel();
-        let room = test_room();
-        let mut app = App::new("alice".into());
-        let pend = PendingVm {
-            vm: "WinLab".into(),
-            stage: VmStage::CloseConflicts,
-            conflicts: vec![holder("docker", true)],
-            needs_install: true,
-        };
-        advance_vm(pend, &mut app, &app_tx, &out_tx, &room);
-        let p = app.pending_vm.as_ref().expect("pending at install gate");
-        assert!(matches!(p.stage, VmStage::Install));
+        app.vbox_picker = Some(VboxPicker {
+            vms: vec!["WinLab".into(), "KaliBox".into()],
+            selected: 0,
+        });
+        let p = app.vbox_picker.as_mut().unwrap();
+        // moving up from the top stays at 0 (saturating)
+        p.selected = p.selected.saturating_sub(1);
+        assert_eq!(p.selected, 0);
+        // moving down is capped at the last index
+        p.selected = (p.selected + 1).min(p.vms.len() - 1);
+        p.selected = (p.selected + 1).min(p.vms.len() - 1);
+        assert_eq!(p.selected, 1, "selection must not run past the last VM");
     }
 
     /// A `_sbx:vm` broadcast from ANOTHER member surfaces a "open your own copy"
