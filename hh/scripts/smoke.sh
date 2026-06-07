@@ -6,6 +6,11 @@
 # Run from anywhere:  hh/scripts/smoke.sh
 set -uo pipefail
 
+# -h/--help: print the usage header above and exit.
+case "${1:-}" in
+  -h|--help|-help) sed -n '2,/^set /{/^set /d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+esac
+
 HERE="$(cd "$(dirname "$0")/.." && pwd)"   # .../hh
 ROOT="$(cd "$HERE/.." && pwd)"          # repo root
 PY="$ROOT/.venv/bin/python"

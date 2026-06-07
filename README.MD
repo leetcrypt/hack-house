@@ -50,8 +50,7 @@ Encrypted chat that runs in your terminal. You host the server, you control the 
 | `cmd_chat/agent/` | The model-agnostic AI agent bridge (joins a room as an encrypted client) |
 | `models.toml` | Named provider profiles for `/ai start <profile>` (see `docs/providers.md`) |
 | `docs/providers.md` | Connect any model — profiles, flags, discovery, bring-your-own-provider |
-| `hh/scripts/lets-hack.sh` | Spin up a local test "clergy" in tmux (server + N client panes) |
-| `hh/scripts/bootstrap-ai.sh` | Optional: install Ollama + pull a model for the local `/ai` agent |
+| `hh/scripts/` | Helper scripts — setup, hosting, sandbox provisioning, tests (see [Scripts](#scripts); each takes `-h`/`--help`) |
 | `hh/direnv-autostart/` | `cd` into a directory to auto-launch a session (direnv) |
 
 ## Quick start
@@ -169,6 +168,8 @@ Type to chat. Slash commands and keys:
 | `Ctrl+C` (while driving) | Interrupt the running command |
 | `Ctrl+R` | Reconnect after a drop |
 | `↑/↓` · `PgUp/PgDn` · mouse wheel | Scroll chat / sandbox scrollback |
+| `F4` · `F5` · click | Layout: fullscreen terminal · select a pane to resize (then arrows · `Esc`) — see [Window layout](#window-layout) |
+| `/layout save \| load \| list \| rm \| reset` | Save / recall named pane arrangements |
 
 ### The shared sandbox
 
@@ -289,12 +290,82 @@ with `Ctrl+Alt+P` (and save it to disk), or load your own TOML at launch with
 `--theme <path>` (see `hh/themes/`). Each theme defines its own sigil, colours,
 and roster width.
 
+### Window layout
+
+The chat, roster (clergy), and sandbox-terminal panes are resizable and can be
+fullscreened — live, with no restart. Resizing the terminal also re-syncs the
+shared PTY grid so everyone in the room sees the same dimensions.
+
+- **Fullscreen** — `F4` cycles the sandbox terminal fullscreen → chat
+  fullscreen → back to the split. The 3-line input bar always stays visible, so
+  `F4` always brings you back.
+- **Resize a pane** — click a pane (or press `F5` to cycle the selection:
+  terminal → chat → roster). The selected pane gets a bold accent border and an
+  `✎` marker in its title. Then:
+  - `↑` / `↓` grow / shrink the **terminal** or **chat** pane's height share
+  - `←` / `→` narrow / widen the **roster** column (down to hidden)
+  - `Esc` or `Enter` finishes editing.
+- **Presets** — save the current arrangement and recall it later:
+
+  | Command | Effect |
+  |---|---|
+  | `/layout` | Show the current arrangement + a reminder of the keys |
+  | `/layout save <name>` | Save the current split/roster to `hh/layouts/<name>.toml` |
+  | `/layout load <name>` (or `/layout <name>`) | Re-apply a saved layout |
+  | `/layout list` | List saved presets |
+  | `/layout rm <name>` | Delete a saved preset |
+  | `/layout reset` | Restore the default split |
+
 ### Staying connected
 
 If the connection drops (network blip, laptop sleep), press `Ctrl+R` to re-run
 the SRP handshake and re-attach — no restart needed. If you were hosting the
 sandbox, it's re-announced so the room re-syncs the shared shell. Chat keeps up
 to ~4000 lines of scrollback; the sandbox terminal keeps 2000.
+
+## Scripts
+
+Everything lives in `hh/scripts/`; run from the `hh/` directory. **Every script
+supports `-h` / `--help`** for full usage.
+
+**Setup**
+
+| Script | What it does |
+|---|---|
+| `bootstrap.sh` | One-shot first-run setup: checks prereqs, creates the Python venv, installs server deps, builds the Rust client (plus the AI layer unless `--no-ai`). |
+| `bootstrap-ai.sh` | Optional AI layer: runs the baseline, then installs Ollama and pulls a default local model for the `/ai` agent. |
+
+**Run a session**
+
+| Script | What it does |
+|---|---|
+| `lets-hack.sh` | Local demo/test: boots a `--no-tls` server and tiles one TUI client pane per user in tmux. |
+| `host-house.sh` | Host a real room *and* take a seat — builds the client, starts the server, and opens your own client, all in tmux. |
+| `host-room.sh` | Host the server only (no seat): mints a password, frees the port, prints the LAN/Tailscale join banner, runs in the foreground. |
+| `connect.sh` | Join a room with the password kept RAM-only (no-echo prompt). Flags: `--sync` (pull latest code before building), `--tls`, `--insecure`, `--no-build`, `-P PORT`. |
+
+**Sandbox provisioning** — driven by the client at runtime; you rarely run these by hand
+
+| Script | What it does |
+|---|---|
+| `ensure-docker.sh` | Install Docker and/or start its daemon (idempotent; `--check`/`--plan`/`--yes`). Invoked by `/sbx launch docker`. |
+| `ensure-multipass.sh` | Install Multipass. Invoked by `/sbx launch multipass`. |
+| `ensure-vbox.sh` | Install VirtualBox (warns on Secure Boot). Invoked by `/sbx launch virtualbox` and `/sbx gui`. |
+| `vbox-new.sh` | Create + boot a fresh Ubuntu VirtualBox VM via cloud-init. Invoked by `/sbx launch virtualbox`. |
+| `sandbox-bootstrap.sh` | Baseline dev-tool install piped into a Docker sandbox at provision time (package list from `sandbox-tools.json`). |
+| `sandbox-tools.json` | Editable package list consumed by `sandbox-bootstrap.sh`. |
+
+**Tests & demos** — for contributors
+
+| Script | What it does |
+|---|---|
+| `smoke-e2e.sh` | Headless CI smoke test: server + two real TUI clients in tmux; asserts SRP join, chat round-trip, `/sbx` dispatch. |
+| `smoke.sh` | Crypto smoke test: Rust unit tests → SRP self-test → live server → Rust handshake → Python decrypts the Rust-sent message. |
+| `test-features.sh` | Broad TUI regression: drives owner + member panes and scrapes the screen to assert ~13 UI features. |
+| `demo-save-load.sh` | PoC harness proving the persistent-sandbox flow (`/sbx save` → quit → `/sbx load`, code intact). |
+
+`hh/scripts/archive/` holds personal demo-*recording* scripts (`film-*.sh`) that
+depend on external video tooling — not needed to use or develop hack-house.
 
 ## Configuration
 

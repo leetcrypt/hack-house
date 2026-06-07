@@ -12,6 +12,13 @@
 #   HH_SBX_PKGS="vim tmux ripgrep" ./host-house.sh ...
 set -uo pipefail
 
+# -h/--help: print the usage header above and exit. (No effect in normal use —
+# hh pipes this to `bash -s` inside the container with no args; the flag is for
+# running it standalone to read what it does.)
+case "${1:-}" in
+  -h|--help|-help) sed -n '2,/^set /{/^set /d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+esac
+
 SENTINEL=/var/lib/hh-bootstrap.done
 [[ -f "$SENTINEL" ]] && exit 0      # this container is already provisioned
 

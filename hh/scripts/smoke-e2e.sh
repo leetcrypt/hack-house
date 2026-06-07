@@ -15,6 +15,11 @@
 # Env overrides: PY=<python> BIN=<client binary> PORT=<port> PW=<password>
 set -uo pipefail
 
+# -h/--help: print the usage header above and exit.
+case "${1:-}" in
+  -h|--help|-help) sed -n '2,/^set /{/^set /d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+esac
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Python: prefer the repo venv locally, fall back to PATH (CI installs into the
 # job's own interpreter).

@@ -14,6 +14,11 @@
 #   --keep   leave the server, container, image and tmux sessions up afterwards
 set -uo pipefail
 
+# -h/--help: print the usage header above and exit.
+case "${1:-}" in
+  -h|--help|-help) sed -n '2,/^set /{/^set /d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+esac
+
 # ---- config -----------------------------------------------------------------
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Pick a free TCP port so we never collide with a stale server from another
