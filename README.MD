@@ -149,8 +149,10 @@ Type to chat. Slash commands and keys:
 | `/help` · `F1` | Help overlay |
 | `/pw` | Show this room's password (local only — never broadcast) |
 | `/theme [name]` | Switch vestments, or list them |
-| `/send <path>` | Offer a file (or directory) to the room |
+| `/send <user> <path>` | Offer a file (or directory) directly to one member |
+| `/sendroom <path>` | Offer a file (or directory) to the whole room |
 | `/accept` · `/reject` | Respond to a pending file offer |
+| `/clear` | Wipe your chat scrollback (local only) |
 | `/ai start [model\|profile]` | Summon a local AI agent (default `ollama/qwen2.5:3b`; a bare name is a `models.toml` profile) |
 | `/ai stop` | Dismiss the agent you summoned |
 | `/ai <question>` | Ask the agent (`/ai <name> <question>` if several present) |
@@ -235,8 +237,9 @@ they can never advertise a power the room won't honour.
 
 ### Sharing files & directories
 
-`/send <path>` proposes a transfer; recipients `/accept` or `/reject`. A whole
-directory works too (it's packed before sending). Files are chunked (64 KB),
+`/send <user> <path>` proposes a transfer to one member; `/sendroom <path>`
+offers it to everyone. Recipients `/accept` or `/reject`. A whole directory
+works too (it's packed into a `.tar` before sending). Files are chunked (64 KB),
 encrypted with the room key, relayed as opaque ciphertext, and **SHA-256
 verified** on arrival before landing in `./downloads/`. Max size is 50 MB.
 
@@ -287,9 +290,9 @@ directly:
 Seven bundled themes — `crypt` (default, neutral monochrome, `✝` sigil),
 `church`, `neon`, `blush`, `matrix`, `wraith`, and `goldcrypt`. Switch live with
 `/theme <name>`, list them with bare `/theme`, roll a fresh randomized vestment
-with `Ctrl+Alt+P` (and save it to disk), or load your own TOML at launch with
-`--theme <path>` (see `hh/themes/`). Each theme defines its own sigil, colours,
-and roster width.
+with `Ctrl+Alt+P` (keep one you like with `/theme save [name]`), or load your own
+TOML at launch with `--theme <path>` (see `hh/themes/`). Each theme defines its
+own sigil, colours, and roster width.
 
 ### Window layout
 
