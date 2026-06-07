@@ -1,7 +1,6 @@
 //! ratatui rendering — top bar, chat, roster, input.
 
 use crate::app::{App, ChatLine, Role};
-use crate::layout::Zoom;
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,7 +20,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(app.layout.input_height()),
     ])
     .split(f.area());
 
@@ -51,6 +50,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     if let Some(msg) = &app.error {
         draw_error(f, f.area(), theme, msg);
     }
+    if let Some(len) = app.sudo_prompt_len() {
+        draw_sudo_prompt(f, f.area(), theme, len);
+    }
 }
 
 /// The body's pane rectangles. Any field is `None` when that pane is hidden
@@ -65,40 +67,25 @@ struct BodyAreas {
 /// honouring the sandbox presence, `Zoom`, and roster width. This is the single
 /// source of truth used by both `draw` (painting) and `pane_at` (hit-testing).
 fn body_areas(body: Rect, app: &App) -> BodyAreas {
-    // Vertical split: chat-column vs sandbox terminal.
-    let (chat_col, sbx) = if app.sandbox.is_some() {
-        match app.layout.zoom {
-            Zoom::Term => (None, Some(body)), // terminal fullscreen
-            Zoom::Chat => (Some(body), None), // chat fullscreen (terminal hidden)
-            Zoom::Normal => {
-                let pty = app.layout.pty_pct;
-                let split = Layout::vertical([
-                    Constraint::Percentage(100 - pty),
-                    Constraint::Percentage(pty),
-                ])
-                .split(body);
-                (Some(split[0]), Some(split[1]))
-            }
-        }
-    } else {
-        (Some(body), None) // no sandbox → chat owns the whole body
+    use crate::app::Pane;
+    let mut out = BodyAreas {
+        chat: None,
+        roster: None,
+        sbx: None,
     };
-
-    // Horizontal split of the chat column into chat vs roster.
-    let (chat, roster) = match chat_col {
-        Some(col) if app.layout.roster_width != 0 => {
-            let lr = Layout::horizontal([
-                Constraint::Min(1),
-                Constraint::Length(app.layout.roster_width),
-            ])
-            .split(col);
-            (Some(lr[0]), Some(lr[1]))
+    // The layout tree is the single source of truth: it honours zoom, sandbox
+    // presence and roster width, returning one rect per visible pane.
+    for (pane, rect) in app.layout.regions(body, app.sandbox.is_some()) {
+        match pane {
+            Pane::Chat => out.chat = Some(rect),
+            Pane::Roster => out.roster = Some(rect),
+            Pane::Terminal => out.sbx = Some(rect),
+            // The input bar isn't a body region (it's the frame's bottom row);
+            // `regions` never yields it, so this arm is just for exhaustiveness.
+            Pane::Input => {}
         }
-        Some(col) => (Some(col), None), // roster hidden
-        None => (None, None),
-    };
-
-    BodyAreas { chat, roster, sbx }
+    }
+    out
 }
 
 /// Hit-test a screen cell against the laid-out panes, for click-to-select in
@@ -112,16 +99,19 @@ pub fn pane_at(w: u16, h: u16, app: &App, col: u16, row: u16) -> Option<crate::a
         width: w,
         height: h,
     };
-    // Mirror draw()'s top-bar / body / input split; only the body is selectable.
+    // Mirror draw()'s top-bar / body / input split; the body panes and the input
+    // bar are selectable (the input bar grows its height when focused).
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(app.layout.input_height()),
     ])
     .split(area);
     let areas = body_areas(rows[1], app);
     let p = Position { x: col, y: row };
-    if areas.sbx.is_some_and(|r| r.contains(p)) {
+    if rows[2].contains(p) {
+        Some(Pane::Input)
+    } else if areas.sbx.is_some_and(|r| r.contains(p)) {
         Some(Pane::Terminal)
     } else if areas.roster.is_some_and(|r| r.contains(p)) {
         Some(Pane::Roster)
@@ -182,6 +172,43 @@ fn draw_error(f: &mut Frame, area: Rect, theme: &Theme, msg: &str) {
                 )),
         )
         .wrap(Wrap { trim: false });
+    f.render_widget(popup, rect);
+}
+
+/// Masked sudo-password modal (Option C). Renders one bullet per typed char —
+/// never the password itself — anchored just above the input box. The buffer it
+/// reflects lives in `app.sudo_prompt` and is never sent to chat or the PTY.
+fn draw_sudo_prompt(f: &mut Frame, area: Rect, theme: &Theme, len: usize) {
+    let dots: String = "•".repeat(len);
+    let body = format!("password: {dots}");
+    let w = area.width.saturating_sub(4).clamp(28, 56);
+    let h = 3; // one input line + its borders
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    // Hover just above the input row (bottom of the screen) so it reads as a prompt.
+    let y = area.y + area.height.saturating_sub(h + 2);
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let popup = Paragraph::new(body)
+        .style(Style::default().fg(theme.title).bg(theme.bg))
+        .block(
+            Block::bordered()
+                .border_style(
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .title(Span::styled(
+                    " 🔒 sudo · Enter launch · Esc cancel ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        );
     f.render_widget(popup, rect);
 }
 
@@ -366,13 +393,16 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                 kv("F4", "fullscreen the terminal (cycle: terminal → chat → split)"),
                 kv(
                     "click a pane  ·  F5",
-                    "select a pane to resize (✎ marks it) — F5 cycles terminal → chat → roster",
+                    "select a pane to resize (✎ marks it) — F5 cycles chat → terminal → roster → input",
                 ),
                 kv(
-                    "↑ / ↓  (terminal/chat selected)",
-                    "grow / shrink that pane's height share",
+                    "↑ / ↓",
+                    "grow / shrink height — chat ↔ terminal with a sandbox; else chat/clergy borrow from the message bar",
                 ),
-                kv("← / →  (roster selected)", "narrow / widen the roster column"),
+                kv(
+                    "← / →",
+                    "grow / shrink the selected pane's width (left column ↔ roster)",
+                ),
                 kv("Esc / Enter", "finish editing the selected pane"),
                 kv("/layout reset", "restore the default split"),
                 kv(
@@ -782,29 +812,58 @@ fn ai_thinking_title(app: &App) -> String {
 }
 
 fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
-    let input = Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme.accent)),
-        Span::styled(app.input.as_str(), Style::default().fg(theme.input)),
-    ]))
-    .block(
-        Block::bordered()
-            .border_style(Style::default().fg(if app.pending_offer.is_some() {
-                theme.accent
+    use crate::app::Pane;
+    // Char-wrap "> " + the message at the inner width so a long line flows into
+    // the (resizable) extra height. We wrap ourselves — rather than ratatui's
+    // word-wrap — so the cursor lands exactly where the text breaks.
+    let inner = area.width.saturating_sub(2).max(1) as usize;
+    let visible = area.height.saturating_sub(2).max(1) as usize;
+    let prompt = "> ";
+    let full: Vec<char> = prompt.chars().chain(app.input.chars()).collect();
+
+    let mut wrapped: Vec<Line> = Vec::new();
+    if full.is_empty() {
+        wrapped.push(Line::from(""));
+    } else {
+        for (li, chunk) in full.chunks(inner).enumerate() {
+            let s: String = chunk.iter().collect();
+            if li == 0 {
+                // Split the accented "> " prompt off the first visual line.
+                let split = prompt.len().min(s.len());
+                let (pfx, rest) = s.split_at(split);
+                wrapped.push(Line::from(vec![
+                    Span::styled(pfx.to_string(), Style::default().fg(theme.accent)),
+                    Span::styled(rest.to_string(), Style::default().fg(theme.input)),
+                ]));
             } else {
-                theme.border
-            }))
+                wrapped.push(Line::from(Span::styled(s, Style::default().fg(theme.input))));
+            }
+        }
+    }
+    // Keep the tail (where you're typing) in view when it overflows the box.
+    let skip = wrapped.len().saturating_sub(visible);
+    let shown: Vec<Line> = wrapped.into_iter().skip(skip).collect();
+
+    // Focused for resize? Accent border + ✎ marker, matching the body panes.
+    let (decor_style, decor_mark) = edit_decor(app, Pane::Input, theme, theme.border);
+    let border_style = if app.focused_pane == Some(Pane::Input) {
+        decor_style
+    } else if app.pending_offer.is_some() {
+        Style::default().fg(theme.accent)
+    } else {
+        Style::default().fg(theme.border)
+    };
+    let title_text = match &app.pending_offer {
+        Some(o) => format!(" {} incoming: {} — /accept or /reject ", theme.sigil, o.name),
+        None if app.driving => format!(" {} DRIVING the shell — Esc to release ", theme.sigil),
+        None if !app.ai_typing.is_empty() => ai_thinking_title(app),
+        None => format!("{decor_mark} message · enter send · /drive for shell · ctrl-q quit "),
+    };
+    let input = Paragraph::new(shown).block(
+        Block::bordered()
+            .border_style(border_style)
             .title(Span::styled(
-                match &app.pending_offer {
-                    Some(o) => format!(
-                        " {} incoming: {} — /accept or /reject ",
-                        theme.sigil, o.name
-                    ),
-                    None if app.driving => {
-                        format!(" {} DRIVING the shell — Esc to release ", theme.sigil)
-                    }
-                    None if !app.ai_typing.is_empty() => ai_thinking_title(app),
-                    None => " message · enter send · /drive for shell · ctrl-q quit ".to_string(),
-                },
+                title_text,
                 Style::default().fg(if app.ai_typing.is_empty() {
                     theme.title
                 } else {
@@ -814,10 +873,16 @@ fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &The
     );
     f.render_widget(input, area);
 
-    // Cursor after the "> " prompt + current input.
-    let cx = area.x + 3 + app.input.chars().count() as u16;
-    let cy = area.y + 1;
-    if cx < area.x + area.width.saturating_sub(1) {
-        f.set_cursor_position(Position::new(cx, cy));
+    // Cursor sits after the last typed char; its wrapped line/col is exact since
+    // we wrapped at `inner` ourselves. Hidden if it would land past the box tail.
+    let end = full.len();
+    let cline = end / inner;
+    let ccol = end % inner;
+    if cline >= skip {
+        let cx = area.x + 1 + ccol as u16;
+        let cy = area.y + 1 + (cline - skip) as u16;
+        if cy < area.y + area.height.saturating_sub(1) {
+            f.set_cursor_position(Position::new(cx, cy));
+        }
     }
 }

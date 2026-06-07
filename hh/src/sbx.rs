@@ -49,16 +49,81 @@ pub fn docker_daemon_up() -> bool {
         .unwrap_or(false)
 }
 
+/// Is this a Docker Desktop (Linux) install? Its engine runs in a per-user VM
+/// started by the *user* unit `docker-desktop.service` — there's no root
+/// `docker.service`, so starting the daemon needs **no sudo**. Detect it so the
+/// launch path doesn't pop a (useless, and on this box failing) sudo prompt.
+pub fn docker_desktop() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "cat", "docker-desktop.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Can we sudo *without* a password prompt right now? (`sudo -n true` succeeds
+/// when credentials are cached via a prior `sudo -v`, or NOPASSWD is configured.)
+/// The launch paths that need root check this first: a raw-mode TUI can't host
+/// sudo's interactive tty prompt, so we must never let sudo block on one.
+pub fn sudo_ready() -> bool {
+    Command::new("sudo")
+        .args(["-n", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run `ensure-docker.sh --yes` with the given extra args, optionally feeding a
+/// sudo password to the script's `sudo -S` via stdin.
+///
+/// Secret handling: the password (if any) is written to the child's stdin and
+/// then the local buffer is wiped. It only ever travels parent→child stdin; it
+/// is NEVER echoed, logged, or surfaced — sudo never prints the password, so the
+/// captured stderr (used for error messages) can't contain it. With no password
+/// we close stdin and the script uses `sudo -n` (fails fast if creds aren't
+/// cached) so it can never block on an interactive tty prompt.
+fn run_ensure_docker(extra: &[&str], password: Option<String>) -> Result<(bool, String)> {
+    let mut cmd = Command::new("bash");
+    cmd.arg(ENSURE_DOCKER).arg("--yes");
+    for a in extra {
+        cmd.arg(a);
+    }
+    if password.is_some() {
+        cmd.arg("--stdin-pass").stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("running ensure-docker.sh")?;
+    if let Some(mut pw) = password {
+        if let Some(mut stdin) = child.stdin.take() {
+            // Feed the password to the first `sudo -S`; it caches the credential
+            // so the rest of the plan authenticates without re-reading stdin.
+            let _ = writeln!(stdin, "{pw}"); // stdin drops here → EOF
+        }
+        // Best-effort wipe of our copy of the secret.
+        unsafe {
+            for b in pw.as_bytes_mut() {
+                *b = 0;
+            }
+        }
+        pw.clear();
+    }
+    let out = child.wait_with_output().context("ensure-docker.sh")?;
+    Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
+}
+
 /// Start the Docker daemon via `ensure-docker.sh --yes`, waiting until it's
-/// ready. Returns the script's last error line on failure (e.g. needs sudo).
-fn start_docker_daemon() -> Result<()> {
-    let out = Command::new("bash")
-        .arg(ENSURE_DOCKER)
-        .arg("--yes")
-        .output()
-        .context("running ensure-docker.sh")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+/// ready. With `password`, escalation goes through `sudo -S` (read from stdin);
+/// without it the script uses `sudo -n` and fails fast if creds aren't cached.
+fn start_docker_daemon(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure_docker(&[], password)?;
+    if !ok {
         let last = err
             .lines()
             .last()
@@ -71,16 +136,10 @@ fn start_docker_daemon() -> Result<()> {
 /// Install Docker via `ensure-docker.sh --install --yes` (Docker's official,
 /// GPG-verified repo), then leave the daemon started. Consent is the caller's
 /// job (they passed `install`); the script is idempotent if Docker is present.
-/// Returns the script's last error line on failure (e.g. needs sudo).
-pub fn ensure_docker_install() -> Result<()> {
-    let out = Command::new("bash")
-        .arg(ENSURE_DOCKER)
-        .arg("--install")
-        .arg("--yes")
-        .output()
-        .context("running ensure-docker.sh --install")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+/// `password` feeds `sudo -S` as above.
+pub fn ensure_docker_install(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure_docker(&["--install"], password)?;
+    if !ok {
         let last = err.lines().last().unwrap_or("could not install Docker");
         anyhow::bail!("{last}");
     }
@@ -463,7 +522,13 @@ impl Backend {
 /// One-time setup before the PTY shell is spawned. Blocking — run off the UI
 /// thread (Multipass boots a real VM, ~20-30s). Idempotent: reuses an instance
 /// that already exists.
-pub fn prepare(backend: Backend, name: &str, image: &str, start_daemon: bool) -> Result<()> {
+pub fn prepare(
+    backend: Backend,
+    name: &str,
+    image: &str,
+    start_daemon: bool,
+    password: Option<String>,
+) -> Result<()> {
     match backend {
         Backend::Local => Ok(()),
         Backend::Multipass => {
@@ -504,7 +569,7 @@ pub fn prepare(backend: Backend, name: &str, image: &str, start_daemon: bool) ->
             // `/sbx launch docker --start`).
             if !docker_daemon_up() {
                 if start_daemon {
-                    start_docker_daemon().context("starting docker daemon")?;
+                    start_docker_daemon(password).context("starting docker daemon")?;
                 } else {
                     anyhow::bail!(
                         "docker daemon is not running — retry with `/sbx launch docker --start`"

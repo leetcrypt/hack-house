@@ -296,18 +296,26 @@ own sigil, colours, and roster width.
 
 ### Window layout
 
-The chat, roster (clergy), and sandbox-terminal panes are resizable and can be
-fullscreened — live, with no restart. Resizing the terminal also re-syncs the
-shared PTY grid so everyone in the room sees the same dimensions.
+The chat, roster (clergy), sandbox-terminal, and message-input panes are
+resizable and can be fullscreened — live, with no restart. Resizing the terminal
+also re-syncs the shared PTY grid so everyone in the room sees the same
+dimensions.
 
 - **Fullscreen** — `F4` cycles the sandbox terminal fullscreen → chat
-  fullscreen → back to the split. The 3-line input bar always stays visible, so
+  fullscreen → back to the split. The input bar always stays visible, so
   `F4` always brings you back.
 - **Resize a pane** — click a pane (or press `F5` to cycle the selection:
-  terminal → chat → roster). The selected pane gets a bold accent border and an
-  `✎` marker in its title. Then:
-  - `↑` / `↓` grow / shrink the **terminal** or **chat** pane's height share
-  - `←` / `→` narrow / widen the **roster** column (down to hidden)
+  chat → terminal → roster → input). The selected pane gets a bold accent border
+  and an `✎` marker in its title. The chat/terminal/roster panes form a binary
+  split tree, so **every pane resizes on both axes** wherever a divider bounds it:
+  - `↑` / `↓` grow / shrink the selected pane's **height**. With a sandbox up,
+    chat trades against the terminal directly below it. With no sandbox, chat and
+    the clergy instead **borrow from the message bar** — `↑` grows the chat box
+    (shrinks the input), `↓` does the reverse — so vertical resize always moves
+    something. The **input bar** itself is also selectable and grows on `↑/↓`.
+  - `←` / `→` grow / shrink the selected pane's **width** (the chat/terminal
+    column trades with the roster, down to hidden). Resizing the terminal's
+    width now re-syncs the shared PTY too, not just its height.
   - `Esc` or `Enter` finishes editing.
 - **Presets** — save the current arrangement and recall it later:
 

@@ -21,6 +21,9 @@ secured_console_chat.egg-info/
 *.log
 err.log
 
+# Sandbox save/load snapshots (large runtime tarballs, not source)
+/hh/hh-snapshots/
+
 # Out-of-tree experiments (not part of hack-house)
 /experiments/
 /headroom/

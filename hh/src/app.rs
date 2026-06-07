@@ -1,7 +1,7 @@
 //! TUI application state, network event model, and the async run loop.
 
 use crate::ft;
-use crate::layout::Layout;
+use crate::layout::{Dir, Layout, Resize};
 use crate::net::{self, Session};
 use crate::sbx;
 use crate::theme::Theme;
@@ -20,6 +20,7 @@ use crossterm::terminal::{
 use futures_util::{SinkExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -162,11 +163,37 @@ pub struct VboxPicker {
 
 /// A resizable region of the window, for interactive layout editing. Selected by
 /// clicking it (or cycling with F5); once selected, arrow keys resize it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Pane {
     Chat,
     Roster,
     Terminal,
+    /// The message/compose box at the bottom. Unlike the other three it lives
+    /// outside the BSP body tree (it's the frame's fixed bottom row), so its only
+    /// adjustable axis is height — grow it to read a long/wrapped message.
+    Input,
+}
+
+/// Launch parameters captured when `/sbx launch` needs root but sudo isn't
+/// cached. Held aside while the masked password modal collects the secret; the
+/// launch fires (with the password) once it's submitted.
+pub struct PendingSudoLaunch {
+    pub backend: sbx::Backend,
+    pub image: String,
+    pub members: Vec<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub start_daemon: bool,
+    pub install_first: bool,
+}
+
+/// A local, masked sudo-password prompt. The typed password lives ONLY here —
+/// it never enters `App::input` (chat), a `ChatLine`, the PTY stream, or any
+/// outbound frame — until it's handed to `sudo -S` for the pending launch.
+/// Deliberately no `Debug` derive so the secret can't be logged by accident.
+pub struct SudoPrompt {
+    pub password: String,
+    pub pending: PendingSudoLaunch,
 }
 
 pub struct App {
@@ -228,6 +255,10 @@ pub struct App {
     /// (click it or cycle with F5), or None when not editing. When set, arrow
     /// keys resize this pane instead of scrolling.
     pub focused_pane: Option<Pane>,
+    /// Active local sudo-password prompt (None unless `/sbx launch` needs root
+    /// and creds aren't cached). While `Some`, keystrokes feed this masked
+    /// buffer instead of chat — the secret never leaves the client.
+    pub sudo_prompt: Option<SudoPrompt>,
 }
 
 impl App {
@@ -263,20 +294,32 @@ impl App {
             agent_name: None,
             layout: Layout::default(),
             focused_pane: None,
+            sudo_prompt: None,
         }
     }
 
-    /// Cycle the interactive-edit selection: Terminal → Chat → Roster → off.
-    /// Bound to F5; clicking a pane jumps straight to it instead. The Terminal
-    /// step is skipped when no sandbox is up (nothing to resize there).
+    /// Length of the in-progress sudo password (for the masked modal to render
+    /// `•`s), or `None` when no prompt is open. Exposes only the length — never
+    /// the secret itself — so `ui` can draw it without touching the bytes.
+    pub fn sudo_prompt_len(&self) -> Option<usize> {
+        self.sudo_prompt.as_ref().map(|p| p.password.chars().count())
+    }
+
+    /// Cycle the interactive-edit selection: Chat → Terminal → Roster → Input →
+    /// off. Bound to F5; clicking a pane jumps straight to it instead. The
+    /// Terminal step is skipped when no sandbox is up (nothing to resize there);
+    /// the Input bar is always a stop (height-only).
     fn cycle_focus(&mut self) {
-        let has_term = self.sandbox.is_some();
+        // Cycle over the panes the layout is actually painting (chat → terminal →
+        // roster → input), then off. Skips the terminal with no sandbox and the
+        // roster when it's hidden, so every stop is something you can resize.
+        let panes = self.layout.present_panes(self.sandbox.is_some());
         self.focused_pane = match self.focused_pane {
-            None if has_term => Some(Pane::Terminal),
-            None => Some(Pane::Chat),
-            Some(Pane::Terminal) => Some(Pane::Chat),
-            Some(Pane::Chat) => Some(Pane::Roster),
-            Some(Pane::Roster) => None,
+            None => panes.first().copied(),
+            Some(cur) => match panes.iter().position(|p| *p == cur) {
+                Some(i) => panes.get(i + 1).copied(),
+                None => panes.first().copied(),
+            },
         };
     }
 
@@ -502,6 +545,7 @@ fn pane_label(p: Pane) -> &'static str {
         Pane::Chat => "chat",
         Pane::Roster => "roster",
         Pane::Terminal => "terminal",
+        Pane::Input => "input",
     }
 }
 
@@ -514,17 +558,28 @@ fn once_or_none(names: Vec<String>) -> String {
     }
 }
 
-/// PTY grid (rows, cols) for the sandbox terminal. `pty_pct` is the terminal's
-/// share of the body height (see `layout::Layout`); it must match the split
-/// `ui::draw` paints, so they stay in lock-step via `app.layout`. Width is the
-/// full body width — the terminal pane always spans the frame, only its height
-/// changes with the split.
-fn sbx_dims(term_w: u16, term_h: u16, pty_pct: u16) -> (u16, u16) {
-    let body_h = term_h.saturating_sub(4);
-    let sbx_h = (body_h as u32 * pty_pct as u32 / 100) as u16;
+/// PTY grid (rows, cols) for the sandbox terminal, derived from the Terminal
+/// leaf's actual rectangle in the layout tree — so it tracks **both** axes (the
+/// old height-only `pty_pct` couldn't express width changes). Matches the split
+/// `ui::draw` paints, keeping the local PTY and the room in lock-step. Subtracts
+/// the pane border (2 each way) and floors at 1. Falls back to the full body
+/// when no Terminal leaf is laid out (e.g. transiently before the tree rebuilds).
+fn sbx_grid(term_w: u16, term_h: u16, layout: &Layout) -> (u16, u16) {
+    use ratatui::layout::Rect;
+    // Mirror ui::draw's frame split: 1-line top bar, body, then the input bar
+    // (now a resizable height, not a fixed 3 lines).
+    let body = Rect {
+        x: 0,
+        y: 1,
+        width: term_w,
+        height: term_h.saturating_sub(1 + layout.input_height()),
+    };
+    let r = layout
+        .rect_of(body, Pane::Terminal, true)
+        .unwrap_or(body);
     (
-        sbx_h.saturating_sub(2).max(1),
-        term_w.saturating_sub(2).max(1),
+        r.height.saturating_sub(2).max(1),
+        r.width.saturating_sub(2).max(1),
     )
 }
 
@@ -901,7 +956,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
     // Seed the roster width from the active vestment so a `--theme` with a wider
     // roster is honoured; from here on the live layout owns it (so /theme swaps
     // don't stomp a width the user has set with /layout).
-    app.layout.roster_width = theme.roster_width;
+    app.layout.set_roster_width(theme.roster_width);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
@@ -923,7 +978,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
 
         if broker.is_some() {
             if let Ok(sz) = term.size() {
-                let dims = sbx_dims(sz.width, sz.height, app.layout.effective_pty_pct());
+                let dims = sbx_grid(sz.width, sz.height, &app.layout);
                 if announced_dims != Some(dims) {
                     announced_dims = Some(dims);
                     if let Some(sb) = &broker {
@@ -953,7 +1008,58 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                         {
                             break Ok(());
                         }
-                        if k.modifiers.contains(KeyModifiers::CONTROL)
+                        // Masked sudo-password prompt (Option C). When open it
+                        // swallows EVERY keystroke so the password can never leak
+                        // into chat, the PTY, or an outbound frame — it lives only
+                        // in `app.sudo_prompt.password` until it's moved into the
+                        // launch task and fed to `sudo -S` over stdin.
+                        if app.sudo_prompt.is_some() {
+                            match k.code {
+                                KeyCode::Enter => {
+                                    // SAFETY of secrecy: `take()` moves the buffer
+                                    // out; it's never cloned into any logged/visible
+                                    // surface. The password is handed to spawn_launch
+                                    // and dropped there after stdin is fed.
+                                    let SudoPrompt { password, pending } =
+                                        app.sudo_prompt.take().unwrap();
+                                    if password.is_empty() {
+                                        app.sys("⛧ cancelled — empty password");
+                                    } else {
+                                        launching = true;
+                                        app.sys("🔒 authenticating + launching…");
+                                        spawn_launch(
+                                            pending.backend,
+                                            pending.image,
+                                            app.me.clone(),
+                                            pending.members,
+                                            pending.rows,
+                                            pending.cols,
+                                            pending.start_daemon,
+                                            pending.install_first,
+                                            Some(password),
+                                            pty_tx.clone(),
+                                            broker_tx.clone(),
+                                            app_tx.clone(),
+                                        );
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    app.sudo_prompt = None;
+                                    app.sys("⛧ sudo cancelled — launch aborted");
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(p) = app.sudo_prompt.as_mut() {
+                                        p.password.pop();
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(p) = app.sudo_prompt.as_mut() {
+                                        p.password.push(c);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else if k.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(k.code, KeyCode::Char('x'))
                             && !app.driving
                         {
@@ -1132,32 +1238,48 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             // before the driving branch but is gated on !driving so the
                             // shell still gets its keys while you hold the PTY.
                             let pane = app.focused_pane.unwrap();
-                            match (pane, k.code) {
-                                (_, KeyCode::Esc) | (_, KeyCode::Enter) => {
+                            let has_term = app.sandbox.is_some();
+                            let dir = match k.code {
+                                KeyCode::Up => Some(Dir::Up),
+                                KeyCode::Down => Some(Dir::Down),
+                                KeyCode::Left => Some(Dir::Left),
+                                KeyCode::Right => Some(Dir::Right),
+                                _ => None,
+                            };
+                            match k.code {
+                                KeyCode::Esc | KeyCode::Enter => {
                                     app.focused_pane = None;
                                     app.sys(format!("⛧ {}", app.layout.describe()));
                                 }
-                                // Terminal taller / chat shorter (and the mirror image
-                                // when the chat pane is the one selected).
-                                (Pane::Terminal, KeyCode::Up) | (Pane::Chat, KeyCode::Down) => {
-                                    app.layout.grow_pty(3);
-                                    announced_dims = None;
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                _ if dir.is_some() => {
+                                    // Every pane is resizable on both axes wherever a
+                                    // divider bounds it; resize_focused moves the right
+                                    // one (or reports NoAxisHere so we can hint).
+                                    match app.layout.resize_focused(pane, dir.unwrap(), has_term) {
+                                        Resize::Moved => {
+                                            // Any divider move can change the terminal's
+                                            // rect (height *or* width now), so force a
+                                            // PTY re-sync to rebroadcast the new grid.
+                                            announced_dims = None;
+                                            app.sys(format!("⛧ {}", app.layout.describe()));
+                                        }
+                                        Resize::NoAxisHere => {
+                                            app.sys(
+                                                "no divider on that axis here — F5 to the input bar to grow the compose box, or launch a sandbox for terminal height",
+                                            );
+                                        }
+                                    }
                                 }
-                                (Pane::Terminal, KeyCode::Down) | (Pane::Chat, KeyCode::Up) => {
-                                    app.layout.shrink_pty(3);
-                                    announced_dims = None;
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
-                                }
-                                (Pane::Roster, KeyCode::Left) => {
-                                    app.layout.roster_width =
-                                        app.layout.roster_width.saturating_sub(2);
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
-                                }
-                                (Pane::Roster, KeyCode::Right) => {
-                                    app.layout.roster_width =
-                                        (app.layout.roster_width + 2).min(Layout::MAX_ROSTER);
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                // Typing a printable char is an escape hatch: drop out
+                                // of layout-edit mode and feed the key to the compose box.
+                                // Without this, a stray click into edit mode silently
+                                // swallows every keystroke and feels like a freeze.
+                                KeyCode::Char(c)
+                                    if !k.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !k.modifiers.contains(KeyModifiers::ALT) =>
+                                {
+                                    app.focused_pane = None;
+                                    app.input.push(c);
                                 }
                                 _ => {} // ignore other keys while editing
                             }
@@ -1253,16 +1375,20 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 if !app.driving && !app.show_help && app.vbox_picker.is_none() =>
                             {
                                 if let Ok(sz) = term.size() {
-                                    if let Some(p) =
-                                        ui::pane_at(sz.width, sz.height, &app, m.column, m.row)
-                                    {
-                                        app.focused_pane = Some(p);
-                                        app.sys(format!(
-                                            "⛧ editing {} — arrows resize · Esc done",
-                                            pane_label(p)
-                                        ));
-                                    } else {
-                                        app.focused_pane = None;
+                                    match ui::pane_at(sz.width, sz.height, &app, m.column, m.row) {
+                                        // Clicking the compose box must NOT enter layout-edit
+                                        // mode — that's where you type, and locking it on a
+                                        // click is exactly the "stuck, can't type" footgun.
+                                        Some(p) if p != Pane::Input => {
+                                            app.focused_pane = Some(p);
+                                            app.sys(format!(
+                                                "⛧ editing {} — arrows resize · Esc done",
+                                                pane_label(p)
+                                            ));
+                                        }
+                                        _ => {
+                                            app.focused_pane = None;
+                                        }
                                     }
                                 }
                             }
@@ -1677,9 +1803,9 @@ fn handle_command(
                 ));
             }
             "reset" | "default" => {
-                let roster = app.layout.roster_width;
+                let roster = app.layout.roster_width();
                 app.layout = Layout::default();
-                app.layout.roster_width = roster; // keep your roster choice on reset
+                app.layout.set_roster_width(roster); // keep your roster choice on reset
                 resized = true;
                 app.sys(format!("⛧ layout reset — {}", app.layout.describe()));
             }
@@ -1861,35 +1987,64 @@ fn handle_command(
                         // it off-thread before provisioning (a fresh Docker
                         // install also leaves its daemon up).
                         let install_first = !installed;
+                        // Installing Docker needs root; booting its daemon needs
+                        // root too — *except* Docker Desktop, whose engine starts
+                        // via a per-user systemd unit with no sudo at all.
+                        let needs_sudo = install_first
+                            || (start_daemon
+                                && backend == sbx::Backend::Docker
+                                && !sbx::docker_daemon_up()
+                                && !sbx::docker_desktop());
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                        let (rows, cols) = sbx_dims(sz.0, sz.1, app.layout.effective_pty_pct());
-                        *launching = true;
+                        let (rows, cols) = sbx_grid(sz.0, sz.1, &app.layout);
                         let members: Vec<String> =
                             app.users.iter().map(|u| u.username.clone()).collect();
-                        if install_first {
-                            app.sys(format!(
-                                "installing {} (needs sudo)… then summoning the sandbox",
-                                backend.label()
-                            ));
+                        if needs_sudo && !sbx::sudo_ready() {
+                            // Root is needed but sudo isn't cached. sudo can't prompt
+                            // on the tty from inside the raw-mode TUI, so capture the
+                            // password in a masked, local-only modal and feed it to
+                            // `sudo -S`. The launch fires on submit (see the run loop).
+                            app.sudo_prompt = Some(SudoPrompt {
+                                password: String::new(),
+                                pending: PendingSudoLaunch {
+                                    backend,
+                                    image,
+                                    members,
+                                    rows,
+                                    cols,
+                                    start_daemon,
+                                    install_first,
+                                },
+                            });
+                            app.sys("🔒 sudo password needed — type it here (hidden), Enter to launch · Esc cancels. Local only: never sent to the room.");
                         } else {
-                            app.sys(format!(
-                                "summoning {} sandbox… (provisioning unix users; multipass boot ~30s)",
-                                backend.label()
-                            ));
+                            *launching = true;
+                            if install_first {
+                                app.sys(format!(
+                                    "installing {} (needs sudo)… then summoning the sandbox",
+                                    backend.label()
+                                ));
+                            } else {
+                                app.sys(format!(
+                                    "summoning {} sandbox… (provisioning unix users; multipass boot ~30s)",
+                                    backend.label()
+                                ));
+                            }
+                            spawn_launch(
+                                backend,
+                                image,
+                                app.me.clone(),
+                                members,
+                                rows,
+                                cols,
+                                start_daemon,
+                                install_first,
+                                None,
+                                pty_tx.clone(),
+                                broker_tx.clone(),
+                                app_tx.clone(),
+                            );
                         }
-                        spawn_launch(
-                            backend,
-                            image,
-                            app.me.clone(),
-                            members,
-                            rows,
-                            cols,
-                            start_daemon,
-                            install_first,
-                            pty_tx.clone(),
-                            broker_tx.clone(),
-                            app_tx.clone(),
-                        );
                     }
                 }
             }
@@ -1968,7 +2123,7 @@ fn handle_command(
                         // (stopped, preserved) instance and re-attaches its shell.
                         let label = label.to_string();
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                        let (rows, cols) = sbx_dims(sz.0, sz.1, app.layout.effective_pty_pct());
+                        let (rows, cols) = sbx_grid(sz.0, sz.1, &app.layout);
                         *launching = true;
                         let members: Vec<String> =
                             app.users.iter().map(|u| u.username.clone()).collect();
@@ -1994,7 +2149,7 @@ fn handle_command(
                                     let _ = atx.send(Net::Sys(format!("loading docker sandbox from {image}…")));
                                     spawn_launch(
                                         sbx::Backend::Docker, image, owner, members, rows,
-                                        cols, false, false, pty, btx, atx,
+                                        cols, false, false, None, pty, btx, atx,
                                     );
                                 }
                                 sbx::SnapKind::Multipass => {
@@ -2009,7 +2164,7 @@ fn handle_command(
                                             spawn_launch(
                                                 sbx::Backend::Multipass,
                                                 sbx::Backend::Multipass.default_image().to_string(),
-                                                owner, members, rows, cols, false, false, pty, btx, atx,
+                                                owner, members, rows, cols, false, false, None, pty, btx, atx,
                                             );
                                         }
                                         Ok(Err(e)) => {
@@ -2646,6 +2801,10 @@ fn spawn_launch(
     cols: u16,
     start_daemon: bool,
     install_first: bool,
+    // The sudo password captured by the in-TUI masked prompt, if escalation was
+    // needed. Local-only: it is fed to `sudo -S` via stdin inside the blocking
+    // install/prepare steps and never enters chat, the PTY, or any outbound frame.
+    password: Option<String>,
     pty_tx: UnboundedSender<Vec<u8>>,
     broker_tx: UnboundedSender<BrokerMsg>,
     app_tx: UnboundedSender<Net>,
@@ -2655,25 +2814,27 @@ fn spawn_launch(
         // opted in. Runs before provisioning; failure aborts the launch (and
         // clears the *launching guard via BrokerMsg::Failed).
         if install_first {
+            let pw = password.clone();
             let res = tokio::task::spawn_blocking(move || match backend {
-                sbx::Backend::Docker => sbx::ensure_docker_install(),
+                sbx::Backend::Docker => sbx::ensure_docker_install(pw),
                 sbx::Backend::Multipass => sbx::ensure_multipass_install(),
                 _ => Ok(()),
             })
             .await;
             if let Err(e) = res.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))) {
-                let _ = app_tx.send(Net::Err(format!("install failed: {e}")));
+                let _ = app_tx.send(Net::Err(format!("install failed: {e:#}")));
                 let _ = broker_tx.send(BrokerMsg::Failed);
                 return;
             }
         }
         let name = SBX_NAME.to_string();
         let prep = {
-            let (n, img) = (name.clone(), image.clone());
-            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon)).await
+            let (n, img, pw) = (name.clone(), image.clone(), password.clone());
+            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon, pw))
+                .await
         };
         if let Err(e) = prep.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))) {
-            let _ = app_tx.send(Net::Err(format!("sandbox prepare failed: {e}")));
+            let _ = app_tx.send(Net::Err(format!("sandbox prepare failed: {e:#}")));
             let _ = broker_tx.send(BrokerMsg::Failed);
             return;
         }
