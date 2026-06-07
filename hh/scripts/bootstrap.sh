@@ -17,10 +17,10 @@
 # It still prompts before installing/pulling on an interactive terminal — skip
 # the whole thing with --no-ai, or skip the prompts with --yes.
 #
-# After it finishes, spin up a local test session with:  cd hh && ./lets-hack.sh
+# After it finishes, spin up a local test session with:  cd hh && ./scripts/lets-hack.sh
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 VENV="$ROOT/.venv"
 HH_DIR="$ROOT/hh"
 
@@ -92,14 +92,14 @@ fi
 if [[ $DO_AI -eq 1 ]]; then
     ai_args=(--ai-only)
     [[ $ASSUME_YES -eq 1 ]] && ai_args+=(--yes)
-    "$ROOT/bootstrap-ai.sh" "${ai_args[@]}" \
+    "$ROOT/hh/scripts/bootstrap-ai.sh" "${ai_args[@]}" \
         || echo "⚠ AI layer not completed — re-run ./bootstrap-ai.sh when ready" >&2
 fi
 
 echo
 echo "ready. next steps:"
-echo "    cd hh && ./lets-hack.sh          # local test session (server + clients in tmux)"
+echo "    cd hh && ./scripts/lets-hack.sh  # local test session (server + clients in tmux)"
 echo "    # or run the server + client by hand — see README.MD"
 if [[ $DO_AI -eq 0 ]]; then
-    echo "    # AI layer skipped (--no-ai); add it later with ./bootstrap-ai.sh"
+    echo "    # AI layer skipped (--no-ai); add it later with hh/scripts/bootstrap-ai.sh"
 fi

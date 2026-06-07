@@ -63,7 +63,7 @@ the chat provider is Ollama and a `qwen2.5-coder` is present (it is — pulled).
 
 ## Execution
 
-`hh/demo-save-load.sh` drives the whole thing headlessly over tmux (per the
+`hh/scripts/demo-save-load.sh` drives the whole thing headlessly over tmux (per the
 TUI-tmux test recipe): boots the server, runs client **session A**, injects the
 beats with `send-keys`, verifies via `capture-pane` + `docker exec`, then quits
 session A and opens client **session B** to load and confirm. It is a PoC /

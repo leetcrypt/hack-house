@@ -10,12 +10,12 @@
 # Headless: drives the ratatui client over tmux send-keys, asserts via
 # capture-pane + `docker exec`. PoC/correctness first; feeds video-toolkit later.
 #
-# Usage:  hh/demo-save-load.sh [--keep]
+# Usage:  hh/scripts/demo-save-load.sh [--keep]
 #   --keep   leave the server, container, image and tmux sessions up afterwards
 set -uo pipefail
 
 # ---- config -----------------------------------------------------------------
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Pick a free TCP port so we never collide with a stale server from another
 # session (a leftover server on a fixed port answers SRP with its own password
 # → spurious 401s). Honour an explicit $PORT if the caller forces one.

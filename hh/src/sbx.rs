@@ -12,10 +12,10 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
-/// Helper that ensures the Docker daemon is running (ships beside this source).
-const ENSURE_DOCKER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/ensure-docker.sh");
-/// Detect-first VirtualBox installer (ships beside this source).
-const ENSURE_VBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/ensure-vbox.sh");
+/// Helper that ensures the Docker daemon is running (ships in hh/scripts/).
+const ENSURE_DOCKER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-docker.sh");
+/// Detect-first VirtualBox installer (ships in hh/scripts/).
+const ENSURE_VBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-vbox.sh");
 
 /// Is the Docker daemon accepting connections? (`docker info` succeeds.)
 pub fn docker_daemon_up() -> bool {

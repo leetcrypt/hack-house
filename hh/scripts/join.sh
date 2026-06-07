@@ -6,7 +6,7 @@
 # prompt — never hardcoded, so it can't drift from the room's random password.
 NAME="${1:-guest}"
 HOST="${2:-127.0.0.1}"
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 # Sync the latest code before joining, then rebuild so it takes effect. Pulls
 # are best-effort and fast-forward only: an unreachable remote or diverged

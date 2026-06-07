@@ -50,8 +50,8 @@ Encrypted chat that runs in your terminal. You host the server, you control the 
 | `cmd_chat/agent/` | The model-agnostic AI agent bridge (joins a room as an encrypted client) |
 | `models.toml` | Named provider profiles for `/ai start <profile>` (see `docs/providers.md`) |
 | `docs/providers.md` | Connect any model — profiles, flags, discovery, bring-your-own-provider |
-| `hh/lets-hack.sh` | Spin up a local test "clergy" in tmux (server + N client panes) |
-| `bootstrap-ai.sh` | Optional: install Ollama + pull a model for the local `/ai` agent |
+| `hh/scripts/lets-hack.sh` | Spin up a local test "clergy" in tmux (server + N client panes) |
+| `hh/scripts/bootstrap-ai.sh` | Optional: install Ollama + pull a model for the local `/ai` agent |
 | `hh/direnv-autostart/` | `cd` into a directory to auto-launch a session (direnv) |
 
 ## Quick start
@@ -61,42 +61,42 @@ git clone https://github.com/leetcrypt/hack-house.git
 cd hack-house
 ```
 
-### 1. One-shot setup (`bootstrap.sh`)
+### 1. One-shot setup (`hh/scripts/bootstrap.sh`)
 
 Checks prerequisites, creates the Python venv, installs the server's
 dependencies, and builds the Rust client:
 
 ```bash
-./bootstrap.sh              # venv + deps + debug build
-./bootstrap.sh --release    # release build
-./bootstrap.sh --check      # report tooling only, change nothing
+hh/scripts/bootstrap.sh              # venv + deps + debug build
+hh/scripts/bootstrap.sh --release    # release build
+hh/scripts/bootstrap.sh --check      # report tooling only, change nothing
 ```
 
 > `bootstrap.sh` does **not** touch direnv — the autostart in step 4 is a
 > separate, opt-in convenience.
 
-**Optional AI layer (`bootstrap-ai.sh`).** Want the local `/ai` agent? This runs
+**Optional AI layer (`hh/scripts/bootstrap-ai.sh`).** Want the local `/ai` agent? This runs
 the baseline setup first, then installs Ollama (if missing) and pulls a default
 model — nothing here changes the AI-free baseline above:
 
 ```bash
-./bootstrap-ai.sh                      # baseline + Ollama + qwen2.5:3b
-./bootstrap-ai.sh --check              # report only, change nothing
-HH_AI_MODEL=llama3 ./bootstrap-ai.sh   # pull a different model
+hh/scripts/bootstrap-ai.sh                      # baseline + Ollama + qwen2.5:3b
+hh/scripts/bootstrap-ai.sh --check              # report only, change nothing
+HH_AI_MODEL=llama3 hh/scripts/bootstrap-ai.sh   # pull a different model
 ```
 
-### 2. Try it in tmux (`lets-hack.sh`)
+### 2. Try it in tmux (`scripts/lets-hack.sh`)
 
 The fastest way to see it working: builds the client, boots a fresh `--no-tls`
 server on `127.0.0.1:4173`, and opens a pane per user.
 
 ```bash
 cd hh
-./lets-hack.sh                  # alice + bob, tiled in tmux
-./lets-hack.sh neo trinity      # custom users
-./lets-hack.sh --theme neon     # pick vestments
-./lets-hack.sh --reuse          # keep a live server (reconnect tests)
-./lets-hack.sh --kill           # tear it all down
+./scripts/lets-hack.sh                  # alice + bob, tiled in tmux
+./scripts/lets-hack.sh neo trinity      # custom users
+./scripts/lets-hack.sh --theme neon     # pick vestments
+./scripts/lets-hack.sh --reuse          # keep a live server (reconnect tests)
+./scripts/lets-hack.sh --kill           # tear it all down
 ```
 
 ### 3. Manual setup
@@ -180,7 +180,7 @@ server only ever sees ciphertext (same trust model as chat).
 | Backend | Isolation | Notes |
 |---|---|---|
 | `local` | none | a `bash` shell on the host — fast, for dev/testing only |
-| `docker` | container | `ubuntu:24.04` by default; `/sbx launch docker --start` boots the daemon (or run `./ensure-docker.sh`) |
+| `docker` | container | `ubuntu:24.04` by default; `/sbx launch docker --start` boots the daemon (or run `hh/scripts/ensure-docker.sh`) |
 | `multipass` | full VM | `24.04` by default; strongest isolation, ~30 s to boot, the choice for real use |
 
 Tear it down with `/sbx stop` (purges the VM/container).
@@ -247,7 +247,7 @@ when you quit). Pick a model at summon time with `/ai start <model>`.
 
 - **Runs on *your* machine.** The default provider is [Ollama](https://ollama.com)
   — a local model (default `qwen2.5:3b`), no API key, nothing leaves your host.
-  Run `./bootstrap-ai.sh` once to install it and pull the model.
+  Run `hh/scripts/bootstrap-ai.sh` once to install it and pull the model.
 - **Addressed-only.** The agent reads room traffic like any client but forwards
   to the model *only* the messages that trigger it (`/ai …`) — no passive
   surveillance, no cost or noise when idle.
@@ -301,8 +301,8 @@ to ~4000 lines of scrollback; the sandbox terminal keeps 2000.
 | Variable | Where | Effect |
 |---|---|---|
 | `CMD_CHAT_MAX_USERS` | server | Room capacity (default `4`) |
-| `PORT` · `PW` · `HOST` | `lets-hack.sh` | Override the test server's port / password / bind host |
-| `THEME` | `lets-hack.sh` | Vestments for every pane (`church` · `neon` · `crypt`) |
+| `PORT` · `PW` · `HOST` | `scripts/lets-hack.sh` | Override the test server's port / password / bind host |
+| `THEME` | `scripts/lets-hack.sh` | Vestments for every pane (`church` · `neon` · `crypt`) |
 | `HH_SESSION` · `HH_USER` | direnv autostart | tmux session name / your in-session name |
 
 ## Securing your connection

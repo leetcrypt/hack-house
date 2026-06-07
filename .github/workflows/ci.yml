@@ -97,7 +97,7 @@ jobs:
         run: cargo build
         working-directory: hh
       - name: run cross-stack smoke test
-        run: bash hh/smoke-e2e.sh
+        run: bash hh/scripts/smoke-e2e.sh
 
   audit:
     name: dependency audit

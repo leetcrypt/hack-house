@@ -19,7 +19,7 @@
 #   -P     port                                 (default: 4173, or $HH_PORT)
 #   --tls  use wss/https instead of the default plaintext-over-Tailscale
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 DEFAULT_PORT=4173
 DEFAULT_HOST=127.0.0.1

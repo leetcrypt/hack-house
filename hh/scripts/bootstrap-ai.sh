@@ -21,7 +21,7 @@
 #   OLLAMA_HOST   daemon URL      (default: http://localhost:11434)
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 MODEL="${HH_AI_MODEL:-qwen2.5:3b}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://localhost:11434}"
 INSTALLER_URL="https://ollama.com/install.sh"
@@ -51,9 +51,9 @@ ollama_up() { curl -s --max-time 3 "$OLLAMA_HOST/api/tags" >/dev/null 2>&1; }
 #    by default). --ai-only skips the baseline entirely (caller already ran it).
 if [[ $AI_ONLY -ne 1 ]]; then
     if [[ $CHECK_ONLY -eq 1 ]]; then
-        "$ROOT/bootstrap.sh" --no-ai --check || exit $?
+        "$ROOT/hh/scripts/bootstrap.sh" --no-ai --check || exit $?
     else
-        "$ROOT/bootstrap.sh" --no-ai "${RELEASE_ARGS[@]}" || exit $?
+        "$ROOT/hh/scripts/bootstrap.sh" --no-ai "${RELEASE_ARGS[@]}" || exit $?
     fi
 fi
 

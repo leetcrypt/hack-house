@@ -15,7 +15,7 @@
 # Env overrides: PY=<python> BIN=<client binary> PORT=<port> PW=<password>
 set -uo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # Python: prefer the repo venv locally, fall back to PATH (CI installs into the
 # job's own interpreter).
 if [[ -z "${PY:-}" ]]; then

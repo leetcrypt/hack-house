@@ -3,10 +3,10 @@
 # Exercises the full use-case path end to end against a live server:
 #   rust unit tests → SRP self-test → boot server → rust client handshake +
 #   round-trip → cross-language (python decrypts what the rust client sent).
-# Run from anywhere:  hh/smoke.sh
+# Run from anywhere:  hh/scripts/smoke.sh
 set -uo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"   # .../hh
+HERE="$(cd "$(dirname "$0")/.." && pwd)"   # .../hh
 ROOT="$(cd "$HERE/.." && pwd)"          # repo root
 PY="$ROOT/.venv/bin/python"
 BIN="$HERE/target/debug/hack-house"

@@ -11,13 +11,13 @@
 # stitches title→terminal→gui→result; edge-tts narration + an SRT are muxed/burned
 # on top.
 #
-# Usage:  hh/film-virtualbox.sh [--keep] [--no-render] [--no-vm]
+# Usage:  hh/scripts/film-virtualbox.sh [--keep] [--no-render] [--no-vm]
 #   --keep        leave server/sessions up; don't power off the VM
 #   --no-render   stop after the captures (skip compose)
 #   --no-vm       skip booting the VM (reuse an already-running one for GUI grab)
 set -uo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VTK="$HOME/coding/video-toolkit"
 FORGE_PY="$HOME/anaconda3/bin/python3"
 pick_port() { local p; for p in $(seq 4240 4290); do ss -ltn 2>/dev/null | grep -q ":$p " || { echo "$p"; return; }; done; echo 4173; }

@@ -14,7 +14,7 @@
 #   tmux attach -t hh-autotest
 set -uo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"   # .../hh
+HERE="$(cd "$(dirname "$0")/.." && pwd)"   # .../hh
 ROOT="$(cd "$HERE/.." && pwd)"          # repo root
 PY="$ROOT/.venv/bin/python"
 BIN="$HERE/target/debug/hack-house"

@@ -12,13 +12,13 @@
 # session; `asciinema rec` runs in its own detached session that `tmux attach`es
 # to the inner one, so it mirrors exactly what we drive with send-keys.
 #
-# Usage:  hh/film-save-load.sh [--keep] [--no-render]
+# Usage:  hh/scripts/film-save-load.sh [--keep] [--no-render]
 #   --keep        leave server/sessions/container/image up afterwards
 #   --no-render   stop after writing the .cast (skip the mp4 render)
 set -uo pipefail
 
 # ---- config -----------------------------------------------------------------
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 pick_port() { local p; for p in $(seq 4200 4280); do ss -ltn 2>/dev/null | grep -q ":$p " || { echo "$p"; return; }; done; echo 4173; }
 PORT="${PORT:-$(pick_port)}"
 PW="${PW:-malware-bless}"

@@ -1397,7 +1397,7 @@ fn handle_command(
                         && !start_daemon
                         && !sbx::docker_daemon_up()
                     {
-                        app.err("docker daemon is not running — retry with `/sbx launch docker --start` to boot it (sudo), or run ./ensure-docker.sh in a terminal first");
+                        app.err("docker daemon is not running — retry with `/sbx launch docker --start` to boot it (sudo), or run ./scripts/ensure-docker.sh in a terminal first");
                     } else {
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
                         let (rows, cols) = sbx_dims(sz.0, sz.1);
@@ -1518,7 +1518,7 @@ fn handle_command(
                 tokio::spawn(async move {
                     let res = tokio::task::spawn_blocking(|| {
                         let ver = sbx::vbox_version().ok_or_else(|| {
-                            "VirtualBox isn't installed — install it with `/sbx gui <vm> --install`, or run ./ensure-vbox.sh".to_string()
+                            "VirtualBox isn't installed — install it with `/sbx gui <vm> --install`, or run ./scripts/ensure-vbox.sh".to_string()
                         })?;
                         let vms = sbx::list_vms().map_err(|e| e.to_string())?;
                         Ok::<_, String>((ver, vms))
@@ -1821,10 +1821,10 @@ fn handle_command(
                         ms.join(", ")
                     ),
                     Ok(_) => "ollama is reachable but has no models pulled — \
-                              `ollama pull qwen2.5:3b` or run ./bootstrap-ai.sh"
+                              `ollama pull qwen2.5:3b` or run ./scripts/bootstrap-ai.sh"
                         .to_string(),
                     Err(_) => "ollama not reachable at localhost:11434 — run \
-                               ./bootstrap-ai.sh, or `/ai start <profile>` for a cloud model"
+                               ./scripts/bootstrap-ai.sh, or `/ai start <profile>` for a cloud model"
                         .to_string(),
                 };
                 let _ = tx.send(Net::Sys(msg));

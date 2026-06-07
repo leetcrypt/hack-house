@@ -87,7 +87,7 @@ documented fallback for images without sshd.
 
 Each headless VM needs a unique host loopback port for its SSH forward. Reuse the
 free-port discovery already used by the save/load PoC (see
-`docs/demo-save-load-poc.md` / `hh/demo-save-load.sh`) so two sandboxes on one
+`docs/demo-save-load-poc.md` / `hh/scripts/demo-save-load.sh`) so two sandboxes on one
 host don't collide. The owner is the only one who ever connects to it
 (`127.0.0.1:<port>`), so it never leaves the host.
 
@@ -146,7 +146,7 @@ desktop" become two ends of one workflow.
 
 ## 4. Installation handling — `ensure-vbox.sh` (detect first)
 
-Mirror `hh/ensure-docker.sh` exactly in spirit: **a backend never installs
+Mirror `hh/scripts/ensure-docker.sh` exactly in spirit: **a backend never installs
 anything silently.**
 
 ### 4.1 Detection (always first, zero side effects)
@@ -166,7 +166,7 @@ loud with the remedy**, exactly like the Docker daemon message at `app.rs:1206`:
 
 ### 4.2 The installer script
 
-`hh/ensure-vbox.sh`, invoked as `bash ensure-vbox.sh --yes` only when the user
+`hh/scripts/ensure-vbox.sh`, invoked as `bash ensure-vbox.sh --yes` only when the user
 passed `--install` (matching how `prepare` shells `ensure-docker.sh --yes` at
 `sbx.rs:31`). It:
 
@@ -229,7 +229,7 @@ sudo delegation, and save/load machinery are all backend-agnostic already.
 |---|---|
 | `hh/src/sbx.rs` | `Backend::VirtualBox` variant; arms in `parse`/`label`/`default_image`/`prepare`/`command_for`/`provision`/`set_sudo`/`save_state`/`list_snapshots`/`teardown`; `vbox_installed()`, `vbx()` SSH helper; `export_ova()` + `open_local()` (Mode B, local-only). |
 | `hh/src/app.rs` | accept `virtualbox`/`vbox` in `/sbx launch`; generalize `/sbx load` off hardcoded Docker (`:1282`) to the broker backend; new `/sbx export`, `/sbx open`, `/sbx gui` arms; extend usage string (`:1309`); install-missing error mirroring `:1206`. |
-| `hh/ensure-vbox.sh` (new) | detect-first installer, per `§4`. |
+| `hh/scripts/ensure-vbox.sh` (new) | detect-first installer, per `§4`. |
 | `hh/src/ui.rs` | add the three new commands to the clustered help menu. |
 | `README.MD` | backend table (`:175`) gains a `virtualbox` row; a short "share a VM, run it locally" subsection. |
 | `models.toml` / docs | none. |

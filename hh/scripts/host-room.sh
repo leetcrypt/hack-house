@@ -54,7 +54,7 @@ examples:
 EOF
 }
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # repo root (where this lives)
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # repo root
 PY="$ROOT/.venv/bin/python"
 [[ -x "$PY" ]] || PY="$(command -v python3 || command -v python)"
 
