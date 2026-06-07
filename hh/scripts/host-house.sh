@@ -25,7 +25,7 @@ usage() {
 host-house.sh — host a room + open your GUI seat, all in one tmux session
 
 usage:
-  ./host-house.sh [NAME] [PORT] [--host ADDR] [--theme NAME]
+  ./host-house.sh [NAME] [PORT] [--user NAME] [--host ADDR] [--theme NAME]
   ./host-house.sh --tls --cert CERT --key KEY [NAME] [PORT]
   ./host-house.sh --kill
   ./host-house.sh -h | --help
@@ -35,6 +35,7 @@ arguments:
   PORT            listen port (positional)       (default: 4173)
 
 flags:
+  --user NAME     your seat in the room (alias: --name; overrides positional NAME)
   --host ADDR     server bind address            (default: 0.0.0.0 — all NICs)
   --port PORT     listen port                    (default: 4173)
   --password PW   room password                  (default: random; or PW=…)
@@ -88,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help|-help) usage; exit 0 ;;
         --kill)       DO_KILL=1; shift ;;
+        --user|--name)     NAME="$2"; shift 2 ;;
+        --user=*|--name=*) NAME="${1#*=}"; shift ;;
         --host)       HOST="$2"; shift 2 ;;
         --host=*)     HOST="${1#--host=}"; shift ;;
         --port)       PORT="$2"; shift 2 ;;

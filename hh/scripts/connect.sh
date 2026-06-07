@@ -13,11 +13,12 @@
 # so it is briefly visible in the process list (ps) to other *local* users for
 # the lifetime of the session. Nothing is ever written to disk.
 #
-# Usage: ./connect.sh [NAME] [HOST] [-p PASSWORD] [-P PORT] [--tls] [--insecure]
-#   NAME   display handle; omit to be prompted for one on join
-#   HOST   server IP/host                       (default: 127.0.0.1)
-#   -P     port                                 (default: 4173, or $HH_PORT)
-#   --tls  use wss/https instead of the default plaintext-over-Tailscale
+# Usage: ./connect.sh [NAME] [HOST] [-p PASSWORD] [-P PORT] [--tls] [--insecure] [--no-build]
+#   NAME       display handle; omit to be prompted for one on join
+#   HOST       server IP/host                   (default: 127.0.0.1)
+#   -P         port                             (default: 4173, or $HH_PORT)
+#   --tls      use wss/https instead of the default plaintext-over-Tailscale
+#   --no-build run the prebuilt binary as-is (skip the fresh debug rebuild)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -30,6 +31,7 @@ PORT="${HH_PORT:-$DEFAULT_PORT}"
 PASSWORD="${HH_PASSWORD:-}"
 NO_TLS=1        # rooms run --no-tls over Tailscale/LAN by default
 INSECURE=0
+NO_BUILD=0      # rebuild a fresh debug binary first so the UI is never stale
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     -P|--port)     PORT="$2";     shift 2 ;;
     --tls)         NO_TLS=0;      shift ;;
     --insecure)    INSECURE=1;    shift ;;
+    --no-build)    NO_BUILD=1;    shift ;;
     -h|--help)     sed -n '2,/^set /{/^set /d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
     -*)            echo "✖ unknown option: $1" >&2; exit 2 ;;
     *)
@@ -56,9 +59,19 @@ if [[ -z "$PASSWORD" ]]; then
 fi
 [[ -n "$PASSWORD" ]] || { echo "✖ a password is required" >&2; exit 1; }
 
-BIN=./target/release/hack-house
-[[ -x "$BIN" ]] || BIN=./target/debug/hack-house
-[[ -x "$BIN" ]] || { echo "✖ no hack-house binary — run: cargo build --release" >&2; exit 1; }
+# Build a fresh debug binary so the UI always matches the current source — an
+# incremental build is ~instant when nothing changed. --no-build skips this and
+# runs a prebuilt binary as-is (handy for remote joiners without a toolchain),
+# preferring release, then debug.
+if [[ "$NO_BUILD" -eq 0 ]]; then
+  echo "⛧ building client (use --no-build to skip)…" >&2
+  cargo build --quiet || { echo "✖ build failed" >&2; exit 1; }
+  BIN=./target/debug/hack-house
+else
+  BIN=./target/release/hack-house
+  [[ -x "$BIN" ]] || BIN=./target/debug/hack-house
+fi
+[[ -x "$BIN" ]] || { echo "✖ no hack-house binary — run: cargo build" >&2; exit 1; }
 
 args=(connect "$HOST" "$PORT")
 [[ -n "$NAME" ]] && args+=("$NAME")          # omit → client prompts for a handle

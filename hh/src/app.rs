@@ -1014,8 +1014,9 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 KeyCode::PageDown => app.help_scroll = (app.help_scroll + 10).min(max),
                                 KeyCode::Home => app.help_scroll = 0,
                                 KeyCode::End => app.help_scroll = max,
-                                KeyCode::Esc => {
-                                    app.show_help = false; // Esc dismisses the overlay
+                                KeyCode::Esc | KeyCode::F(1) => {
+                                    // Esc dismisses; F1 toggles the overlay back shut
+                                    app.show_help = false;
                                     app.help_scroll = 0;
                                 }
                                 _ => {} // ignore other keys so the menu stays put
