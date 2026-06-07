@@ -161,9 +161,6 @@ pub struct PendingVm {
     pub needs_install: bool,
 }
 
-/// Display handle the summoned Python agent joins under (see `spawn_agent`).
-const AGENT_NAME: &str = "oracle";
-
 pub struct App {
     pub me: String,
     pub lines: Vec<ChatLine>,
@@ -212,6 +209,11 @@ pub struct App {
     /// (`/ai start <name> allow`). Re-applied in the broker Ready handler, since
     /// launching a sandbox resets the ACL back to just the owner.
     pub agent_sbx_allow: bool,
+    /// Display name the summoned agent joined under — derived from its model or
+    /// profile at `/ai start` (e.g. "qwen2.5:3b", model name + parameter size).
+    /// Tracked so the broker Ready handler can re-grant its drive and `/ai stop`
+    /// can revoke the right ACL entry.
+    pub agent_name: Option<String>,
 }
 
 impl App {
@@ -244,6 +246,7 @@ impl App {
             ai_stream: std::collections::HashMap::new(),
             spin: 0,
             agent_sbx_allow: false,
+            agent_name: None,
         }
     }
 
@@ -1085,7 +1088,9 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                         app.sudoers.insert(app.me.clone()); // owner = superuser
                         if app.agent_sbx_allow {
                             // Re-apply a `/ai start … allow` grant the launch reset.
-                            app.drivers.insert(AGENT_NAME.to_string());
+                            if let Some(n) = &app.agent_name {
+                                app.drivers.insert(n.clone());
+                            }
                         }
                         send_frame(&out_tx, &session.room, json!({
                             "_sbx":"status","state":"ready","backend": backend.label(), "rows": rows, "cols": cols
@@ -1722,7 +1727,10 @@ fn handle_command(
             app.sys("⛧ dismissed the AI agent");
             // Drop any sandbox drive the agent held so a dead handle can't act.
             app.agent_sbx_allow = false;
-            let revoked = app.drivers.remove(AGENT_NAME) | app.sudoers.remove(AGENT_NAME);
+            let revoked = app
+                .agent_name
+                .take()
+                .is_some_and(|n| app.drivers.remove(&n) | app.sudoers.remove(&n));
             if revoked && app.sandbox.is_some() {
                 broadcast_acl(out_tx, room, app);
             }
@@ -1749,12 +1757,6 @@ fn handle_command(
                 Some(head) if head.is_empty() || head.ends_with(' ') => (head.trim(), true),
                 _ => (raw, false),
             };
-            // Tolerate a leading agent-name token (`/ai start oracle allow`):
-            // there's only one agent, so treat it as addressing, not a profile.
-            let raw = match raw.strip_prefix(AGENT_NAME) {
-                Some(rest) if rest.is_empty() || rest.starts_with(' ') => rest.trim(),
-                _ => raw,
-            };
             // A bare name (no ':' tag, no '/' path) is a models.toml profile;
             // anything else is treated as a literal Ollama model tag.
             let (profile, model): (Option<&str>, &str) = if raw.is_empty() {
@@ -1764,10 +1766,14 @@ fn handle_command(
             } else {
                 (Some(raw), raw)
             };
-            let name = AGENT_NAME;
+            // Name the agent after what it runs, for clarity in the roster: a
+            // profile keeps its label; a direct Ollama model uses its tag
+            // (e.g. "qwen2.5:3b" — model name + parameter size).
+            let name = profile.unwrap_or(model);
             match spawn_agent(params, &app.password, name, profile, model) {
                 Ok(child) => {
                     *agent = Some(child);
+                    app.agent_name = Some(name.to_string());
                     app.agent_sbx_allow = grant_sbx;
                     let desc = match profile {
                         Some(p) => format!("profile {p}"),

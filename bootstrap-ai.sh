@@ -129,6 +129,6 @@ fi
 echo
 echo "AI ready. start a local agent against a running room with:"
 echo "    .venv/bin/python -m cmd_chat.agent <host> <port> \\"
-echo "        --name oracle --password <room-pw> --provider ollama --model $MODEL --no-tls"
+echo "        --password <room-pw> --provider ollama --model $MODEL --no-tls"
 echo
 echo "tip: pick a different model with  HH_AI_MODEL=llama3 ./bootstrap-ai.sh"

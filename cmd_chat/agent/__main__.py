@@ -2,8 +2,8 @@
 
 Examples
 --------
-    # local Ollama (default, recommended)
-    python -m cmd_chat.agent 127.0.0.1 3000 --name oracle \
+    # local Ollama (default, recommended) — joins as "qwen2.5:3b"
+    python -m cmd_chat.agent 127.0.0.1 3000 \
         --password hunter2 --model qwen2.5:3b --no-tls
 
     # cloud, opt-in
@@ -102,7 +102,8 @@ def main() -> None:
     )
     ap.add_argument("server", nargs="?", help="room host (omit with --list-models/--check)")
     ap.add_argument("port", type=int, nargs="?", help="room port")
-    ap.add_argument("--name", default="oracle", help="agent's room display name")
+    ap.add_argument("--name", default=None,
+                    help="agent's room display name (default: the model tag, e.g. qwen2.5:3b)")
     ap.add_argument("--password", default=None, help="room password")
     ap.add_argument("--provider", default="ollama",
                     help="ollama | anthropic | openai | module:Class")
@@ -184,8 +185,11 @@ def main() -> None:
     if code_provider is not None:
         print(f"sandbox/code path → {code_provider.name}/{code_provider.model}", file=sys.stderr)
 
+    # Default the room handle to the model tag (model name + parameter size,
+    # e.g. "qwen2.5:3b") so the roster shows what's actually answering.
+    name = args.name or provider.model
     bridge = AgentBridge(
-        args.server, args.port, name=args.name, provider=provider,
+        args.server, args.port, name=name, provider=provider,
         password=args.password, insecure=args.insecure, no_tls=args.no_tls,
         system_prompt=args.system, context_window=args.context_window,
         token_budget=args.token_budget, embedder=embedder, rag_top_k=args.rag_top_k,

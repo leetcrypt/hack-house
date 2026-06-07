@@ -34,10 +34,10 @@ the chat provider is Ollama and a `qwen2.5-coder` is present (it is — pulled).
 
 1. **Title card** — "Ephemeral by default. Persistent on demand."
 2. **Summon** — alice: `/sbx launch docker` → "summoned" sandbox bubble.
-3. **Spawn the coder** — alice: `/ai start` → `oracle online — ollama/qwen2.5:3b`
+3. **Spawn the coder** — alice: `/ai start` → `qwen2.5:3b (ai) online — ollama/qwen2.5:3b`
    (the coder model rides along for `!task`).
 4. **Build, by the fast model** — alice:
-   `/ai oracle !write /root/fib.py that prints the first 10 Fibonacci numbers, then run it`
+   `/ai qwen2.5:3b !write /root/fib.py that prints the first 10 Fibonacci numbers, then run it`
    → agent drives the shared shell; `fib.py` is written and executed; the
    sandbox pane shows the Fibonacci output.
 5. **Freeze it** — alice: `/sbx save buildbox` →
@@ -74,7 +74,7 @@ render.
 
 - TUI doesn't bind Ctrl-U (it inserts a literal `u`); clear input with `BSpace`.
   Send text with `send-keys -l "<text>"` then a separate `Enter`; don't race renders.
-- Agent name is hardcoded `oracle`; only one `/ai start` per room.
+- Agent joins under its model tag (e.g. `qwen2.5:3b`); only one `/ai start` per client.
 - Keep `!task` phrasing single-line; the agent's drive output lands in the sandbox
   pane, not chat.
 - `/sbx load` refuses if a sandbox is already running — stop first.

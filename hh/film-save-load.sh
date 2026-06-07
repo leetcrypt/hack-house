@@ -147,9 +147,9 @@ wait_for 'summoned|sandbox|ready|online' 60 >/dev/null
 sleep 1.5
 
 # ---- 5. spawn fast qwen agent (auto-grant drive) ---------------------------
-step "spawn oracle (auto-grant sandbox drive)"
+step "spawn agent (auto-grant sandbox drive)"
 say "/ai start $CODER allow"
-wait_for 'oracle|online|ollama|qwen' 45 && ok "oracle online" || note "no online line yet"
+wait_for 'online|ollama|qwen' 45 && ok "agent online" || note "no online line yet"
 sleep 1.5
 
 # ---- 6. the fast model builds code in the sandbox --------------------------
@@ -157,7 +157,7 @@ sleep 1.5
 # through the PTY. Validate-by-running; retry once; abort before save if it
 # still fails (no silent fallback in a film).
 step "fast qwen writes /root/fib.py and runs it"
-TASK="/ai oracle !create /root/fib.py with exactly two lines and nothing else: line 1 is  nums = [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]  and line 2 is  print(*nums)  then run it with: python3 /root/fib.py"
+TASK="/ai $CODER !create /root/fib.py with exactly two lines and nothing else: line 1 is  nums = [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]  and line 2 is  print(*nums)  then run it with: python3 /root/fib.py"
 BUILT=0
 for attempt in 1 2; do
   note "build attempt $attempt"

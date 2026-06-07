@@ -567,7 +567,8 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
     f.render_widget(roster, area);
 }
 
-/// Animated "⠋ oracle is thinking…" title shown while AI agents generate a reply.
+/// Animated "⠋ <agent> is thinking…" title shown while AI agents generate a
+/// reply. The name(s) come from `app.ai_typing`, i.e. each agent's own handle.
 fn ai_thinking_title(app: &App) -> String {
     const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let glyph = FRAMES[(app.spin / 2) % FRAMES.len()];

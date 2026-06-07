@@ -275,7 +275,8 @@ directly:
 
 ```bash
 .venv/bin/python -m cmd_chat.agent <server_ip> <port> \
-    --name oracle --password <room-pw> --provider ollama --model qwen2.5:3b
+    --password <room-pw> --provider ollama --model qwen2.5:3b
+# joins as its model tag ("qwen2.5:3b") unless you override with --name
 # cloud (opt-in): --provider anthropic --model claude-opus-4-6   (needs ANTHROPIC_API_KEY)
 ```
 

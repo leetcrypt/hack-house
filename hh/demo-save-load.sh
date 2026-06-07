@@ -2,8 +2,8 @@
 # demo-save-load.sh — PoC harness for the "persistent sandbox" video beat.
 #
 # Flow (see docs/demo-save-load-poc.md):
-#   session A: /sbx launch docker → /ai start → /grant oracle →
-#              /ai oracle !build fib.py & run it  →  /sbx save buildbox  → quit
+#   session A: /sbx launch docker → /ai start → /grant qwen2.5:3b →
+#              /ai qwen2.5:3b !build fib.py & run it  →  /sbx save buildbox  → quit
 #   prove:     container purged on quit, but hh-snap:buildbox image survives
 #   session B: fresh client → /sbx load buildbox → the model's code is intact
 #
@@ -131,17 +131,17 @@ wait_for "$A_SESS" 'summoned|sandbox|ready|online' 60 >/dev/null
 snap_evid "$A_SESS" 02-sandbox
 
 # ---- 4. spawn the coder agent + grant drive --------------------------------
-step "spawn oracle (qwen2.5:3b chat, qwen2.5-coder:1.5b for !task)"
+step "spawn agent (qwen2.5:3b chat, qwen2.5-coder:1.5b for !task)"
 say "$A_SESS" "/ai start"
-wait_for "$A_SESS" 'oracle|online|ollama' 45 && ok "oracle announced" \
-  || note "no 'online' line yet - agent log: ${TMPDIR:-/tmp}/hh-agent-oracle.log"
-say "$A_SESS" "/grant oracle"
+wait_for "$A_SESS" 'online|ollama|qwen' 45 && ok "agent announced" \
+  || note "no 'online' line yet - agent log: ${TMPDIR:-/tmp}/hh-agent-qwen2.5:3b.log"
+say "$A_SESS" "/grant qwen2.5:3b"
 sleep 1
 snap_evid "$A_SESS" 03-agent
 
 # ---- 5. fast model builds code in the sandbox ------------------------------
 step "fast qwen builds /root/fib.py in the sandbox"
-say "$A_SESS" "/ai oracle !create /root/fib.py that prints the first 10 fibonacci numbers space-separated on one line, then run it with python3"
+say "$A_SESS" "/ai qwen2.5:3b !create /root/fib.py that prints the first 10 fibonacci numbers space-separated on one line, then run it with python3"
 # Give the CPU coder model room to think, then poll for the file.
 WT=150 wait_cmd docker exec "$CTR" test -s /root/fib.py
 NEED='0 1 1 2 3 5 8 13 21 34'
