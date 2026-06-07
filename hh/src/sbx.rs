@@ -762,6 +762,10 @@ pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) 
             run
         }
         Backend::Docker => {
+            // Refresh the apt index once so `apt-get install <pkg>` just works —
+            // base images ship without /var/lib/apt/lists, so installs otherwise
+            // fail with "Unable to locate package" until the user runs update.
+            dk(name, &["apt-get", "update"]);
             for m in members {
                 let u = unix_name(m);
                 if !u.is_empty() {
