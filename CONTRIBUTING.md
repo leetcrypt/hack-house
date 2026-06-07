@@ -20,8 +20,8 @@ We welcome contributions of all types, including:
 
 ## 📦 Getting Started
 
-1. **Fork the repository** on GitHub.
+1. **Fork the repository** on the Gitea instance (`git.churchofmalware.org`).
 2. **Clone your fork** locally:
    ```bash
-   git clone https://github.com/leetcrypt/hack-house.git
+   git clone https://git.churchofmalware.org/trilltechnician/hack-house.git
    cd hack-house

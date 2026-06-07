@@ -56,7 +56,7 @@ Encrypted chat that runs in your terminal. You host the server, you control the 
 ## Quick start
 
 ```bash
-git clone https://github.com/leetcrypt/hack-house.git
+git clone https://git.churchofmalware.org/trilltechnician/hack-house.git
 cd hack-house
 ```
 
@@ -156,10 +156,11 @@ Type to chat. Slash commands and keys:
 | `/ai <question>` | Ask the agent (`/ai <name> <question>` if several present) |
 | `/ai list` | List the agents present (or hint to `/ai start` if none) |
 | `/ai models` | Models the active agent can serve — or, with no agent, your local Ollama tags |
-| `/sbx launch [local\|docker\|multipass] [image]` | Summon the shared sandbox |
+| `/sbx launch [local\|docker\|multipass] [image] [install]` | Summon the shared sandbox (`install` fetches a missing backend; `--start` boots a stopped Docker daemon) |
 | `/sbx stop` | Tear down the sandbox you host |
 | `/sbx save [label]` · `/sbx load <label>` · `/sbx snaps` | Snapshot the sandbox, restore one, or list snapshots |
 | `/sbx vms` | Detect VirtualBox and list local VMs |
+| `/sbx launch vbox [new [name]]` | Open the local VirtualBox VM picker, or build a fresh VM via cloud-init |
 | `/sbx gui <vm> [--install]` | Open a local VirtualBox desktop VM for the room (consent-gated) |
 | `/drive` · `F2` | Take the shared shell (`Esc` releases) |
 | `/grant <user>` · `/revoke <user>` | Owner: delegate/withdraw drive |
