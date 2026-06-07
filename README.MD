@@ -60,6 +60,17 @@ git clone https://git.churchofmalware.org/trilltechnician/hack-house.git
 cd hack-house
 ```
 
+> **Private beta.** The repo is private for now, so an anonymous clone returns
+> *Not found*. Until it's public, clone with your Gitea credentials:
+>
+> ```bash
+> # Personal access token (Gitea → Settings → Applications → Generate Token)
+> git clone https://<user>:<token>@git.churchofmalware.org/trilltechnician/hack-house.git
+>
+> # …or SSH (add your key under Gitea → Settings → SSH Keys)
+> git clone git@git.churchofmalware.org:trilltechnician/hack-house.git
+> ```
+
 ### 1. One-shot setup (`hh/scripts/bootstrap.sh`)
 
 Checks prerequisites, creates the Python venv, installs the server's
