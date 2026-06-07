@@ -24,19 +24,20 @@ def get_client_ip(request: Request) -> str:
     return request.ip
 
 
-async def send_state(ws: Websocket, app: Sanic) -> None:
+def state_frame(app: Sanic) -> str:
+    """Build the per-client `init` snapshot (message backlog + roster) as a JSON
+    string. Returned (not sent) so it can be enqueued as the connection's first
+    outbound frame, guaranteeing it precedes any later broadcast."""
     messages = app.ctx.message_store.get_all()
     users = app.ctx.session_store.get_all()
-    await ws.send(
-        json.dumps(
-            {
-                "type": "init",
-                "messages": [asdict(m) for m in messages],
-                "users": [
-                    {"user_id": u.user_id, "username": u.username} for u in users
-                ],
-            }
-        )
+    return json.dumps(
+        {
+            "type": "init",
+            "messages": [asdict(m) for m in messages],
+            "users": [
+                {"user_id": u.user_id, "username": u.username} for u in users
+            ],
+        }
     )
 
 

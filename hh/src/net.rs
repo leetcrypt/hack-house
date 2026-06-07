@@ -113,6 +113,15 @@ pub async fn connect(session: &Session) -> Result<Ws> {
     let (ws, _) = tokio_tungstenite::connect_async(&session.ws_url)
         .await
         .context("websocket connect")?;
+    // Disable Nagle's algorithm. Sandbox PTY echo, keystrokes, and chat are all
+    // small frames; Nagle holds a small segment waiting for more data until the
+    // prior one is ACKed, and paired with delayed-ACK (~40 ms) — amplified by
+    // Tailscale's RTT — that is a classic cause of "type, pause, then a burst"
+    // lag for the non-host viewer. The default (and Tailscale) path is plaintext
+    // ws, a `Plain` TcpStream, so set TCP_NODELAY there.
+    if let MaybeTlsStream::Plain(s) = ws.get_ref() {
+        let _ = s.set_nodelay(true);
+    }
     Ok(ws)
 }
 

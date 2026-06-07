@@ -378,9 +378,16 @@ roster_width = 24
         let inks = [Color::Rgb(0xff, 0xff, 0xff), Color::Rgb(0xd0, 0xd0, 0xd0)];
         let bg = legible_bg(210.0, 0.5, &inks);
         for ink in inks {
-            assert!(contrast(ink, bg) >= 4.5, "ink unreadable: {:.2}", contrast(ink, bg));
+            assert!(
+                contrast(ink, bg) >= 4.5,
+                "ink unreadable: {:.2}",
+                contrast(ink, bg)
+            );
         }
-        assert!(luminance(bg) > 0.0, "bright inks should permit a tinted, non-black bg");
+        assert!(
+            luminance(bg) > 0.0,
+            "bright inks should permit a tinted, non-black bg"
+        );
 
         // A darker ink set forces a correspondingly deeper surface — the
         // relationship runs the right way.

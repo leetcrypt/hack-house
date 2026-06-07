@@ -2,13 +2,27 @@ import hashlib
 import hmac
 import json
 import base64
+import socket
 from dataclasses import asdict
 
 from sanic import Sanic, Request, response, Websocket
 from sanic.response import HTTPResponse, json as json_response
 
 from .models import Message, UserSession
-from .helpers import get_client_ip, send_state, utcnow
+from .helpers import get_client_ip, state_frame, utcnow
+
+
+def _disable_nagle(ws: Websocket) -> None:
+    """Set TCP_NODELAY on a websocket's underlying socket. Small interactive
+    frames (PTY echo, keystrokes, chat) must not wait on Nagle coalescing +
+    delayed-ACK before reaching a viewer. Best-effort: any transport without a
+    raw socket (or where the option can't be set) is simply left as-is."""
+    try:
+        sock = ws.io_proto.transport.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
 
 
 # Hard cap on a single relayed WS frame. The largest legitimate frame is one
@@ -137,11 +151,12 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
         return
 
     manager = app.ctx.connection_manager
-    await manager.connect(user_id, ws)
+    _disable_nagle(ws)
+    # Enqueue this client's init snapshot as its first outbound frame, then
+    # register it so broadcasts can target it — guaranteeing init arrives first.
+    await manager.connect(user_id, ws, initial=state_frame(app))
 
     try:
-        await send_state(ws, app)
-
         # Announce arrival to everyone already present, then a fresh roster.
         await manager.broadcast(
             json.dumps(

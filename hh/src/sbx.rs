@@ -553,7 +553,10 @@ pub fn vm_save_state(vm: &str, label: &str, local: bool) -> Result<String> {
                 err.lines().last().unwrap_or("").trim()
             );
         }
-        return Ok(format!("snapshot '{label}' + local appliance {}", path.display()));
+        return Ok(format!(
+            "snapshot '{label}' + local appliance {}",
+            path.display()
+        ));
     }
     Ok(format!("snapshot '{label}' of {vm}"))
 }
@@ -766,7 +769,12 @@ pub fn run_user_for(backend: Backend, owner: &str) -> String {
 /// `tar` inside the container/VM — uniform for files and directories, and no
 /// shell interpolation of the path. Blocking — run off the UI thread. Returns
 /// the in-sandbox destination path on success.
-pub fn push(backend: Backend, name: &str, run_user: &str, local: &std::path::Path) -> Result<String> {
+pub fn push(
+    backend: Backend,
+    name: &str,
+    run_user: &str,
+    local: &std::path::Path,
+) -> Result<String> {
     let (base, tar) = crate::ft::tar_path(local)?;
     match backend {
         Backend::Local => anyhow::bail!(
