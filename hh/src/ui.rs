@@ -199,7 +199,7 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "list local VirtualBox VMs · a VM's snapshots",
                 ),
                 kv("/sbx gui <vm> [yes]", "alias of /sbx launch vbox gui <vm> [yes]"),
-                kv("/drive  ·  F2", "type into the shared shell (Esc releases)"),
+                kv("/drive  ·  F2", "type into the shared shell (F2 releases; Esc reaches vim)"),
             ],
         },
         HelpCluster {
@@ -273,6 +273,10 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                 kv("Enter", "send chat message"),
                 kv("F1  ·  /help", "toggle this help"),
                 kv("Ctrl-C  (while driving)", "interrupt the running command"),
+                kv(
+                    "Ctrl-X  (owner, not driving)",
+                    "kill switch — revoke all drive + interrupt the shell (while driving it reaches the shell, e.g. nano)",
+                ),
                 kv("PgUp / PgDn", "scroll chat  ·  Home/End = oldest/live"),
                 kv(
                     "PgUp / PgDn  (driving)",

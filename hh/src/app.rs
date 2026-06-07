@@ -334,7 +334,7 @@ impl App {
                 self.connected = true;
                 self.chat_scroll = 0;
                 self.sys(format!("joined as {} ⛧", self.me));
-                self.sys("/sbx launch <docker|multipass|vbox> · /drive (Esc releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys("/sbx launch <docker|multipass|vbox> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => self.push_line(l),
             Net::Roster { users, capacity } => {
@@ -495,6 +495,9 @@ fn key_to_pty(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Tab => Some(vec![b'\t']),
+        // Esc must reach the shell (vim/less/etc. depend on it). Drive is released
+        // with F2, not Esc, so this never collides with leaving the shell.
+        KeyCode::Esc => Some(vec![0x1b]),
         KeyCode::Up => Some(b"\x1b[A".to_vec()),
         KeyCode::Down => Some(b"\x1b[B".to_vec()),
         KeyCode::Right => Some(b"\x1b[C".to_vec()),
@@ -892,11 +895,15 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                         }
                         if k.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(k.code, KeyCode::Char('x'))
+                            && !app.driving
                         {
                             // Panic kill switch (sandbox owner): revoke every
                             // non-owner driver, interrupt whatever is running in
                             // the PTY, and re-broadcast the locked-down ACL. Cuts a
-                            // runaway agent (or human) off mid-command.
+                            // runaway agent (or human) off mid-command. Gated on
+                            // `!app.driving` so that while YOU hold the shell, Ctrl-X
+                            // reaches the PTY instead (nano's quit; key_to_pty sends
+                            // 0x18) — release with F2 first to arm the kill switch.
                             if let Some(sb) = &mut broker {
                                 let owner = app.me.clone();
                                 app.drivers.retain(|u| *u == owner);
@@ -1037,9 +1044,11 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 app.sys("you don't have drive permission — the owner can /grant you");
                             }
                         } else if app.driving {
-                            if k.code == KeyCode::Esc {
-                                app.driving = false;
-                            } else if k.code == KeyCode::PageUp {
+                            // Esc is NOT a release key here — vim & friends need it,
+                            // so it's forwarded to the PTY like any other key (see
+                            // key_to_pty). Press F2 (handled above) to release the
+                            // shell back to chat.
+                            if k.code == KeyCode::PageUp {
                                 // Scroll the shared shell's scrollback without releasing the
                                 // drive: PgUp/PgDn aren't forwarded to the PTY anyway.
                                 app.sbx_scroll = (app.sbx_scroll + sbx_page(&app)).min(2000);
@@ -1513,7 +1522,7 @@ fn handle_command(
             app.sys("no sandbox running — /sbx launch first");
         } else if app.can_drive() {
             app.driving = true;
-            app.sys("⛧ drive mode ON — type into the shell · press Esc to release");
+            app.sys("⛧ drive mode ON — type into the shell (Esc reaches vim etc.) · press F2 to release");
         } else {
             app.sys("you don't have drive permission — the owner can /grant you");
         }
