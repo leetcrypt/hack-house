@@ -589,6 +589,16 @@ pub fn save_state(backend: Backend, name: &str, label: &str, local: bool) -> Res
             Ok(format!("image {tag}"))
         }
         Backend::Multipass => {
+            // Multipass only snapshots a *stopped* instance (unlike docker, which
+            // commits a live container). Power it off first — the caller has
+            // already torn down the shared shell, so this is the save *and* stop.
+            // The instance stays registered (we don't purge), so `/sbx load` can
+            // restore the snapshot later.
+            let _ = Command::new("multipass")
+                .args(["stop", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
             let out = Command::new("multipass")
                 .args(["snapshot", name, "--name", label])
                 .output()

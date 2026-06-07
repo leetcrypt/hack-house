@@ -1673,6 +1673,20 @@ fn handle_command(
                         "saving sandbox state as '{label}'{}…",
                         if local { " (+ local copy)" } else { "" }
                     ));
+                    // Docker commits a *live* container, so its save is non-
+                    // disruptive. Multipass can only snapshot a powered-off
+                    // instance, so saving it necessarily stops the shared shell —
+                    // tear the live session down (same as `/sbx stop`, but WITHOUT
+                    // purging: the instance must survive so the snapshot does too).
+                    if be == sbx::Backend::Multipass {
+                        if let Some(mut sb) = broker.take() {
+                            sb.stop();
+                        }
+                        broker_meta.take();
+                        *announced_dims = None;
+                        send_frame(out_tx, room, json!({"_sbx":"status","state":"stopped"}));
+                        app.sys("multipass must power off to snapshot — stopping the shared shell, then saving (reload it with `/sbx load`)");
+                    }
                     let (tx, lbl) = (app_tx.clone(), label.clone());
                     tokio::spawn(async move {
                         let res = tokio::task::spawn_blocking(move || sbx::save_state(be, &name, &label, local)).await;
