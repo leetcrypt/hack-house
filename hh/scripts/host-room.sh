@@ -103,6 +103,22 @@ else
     PROTO="http"; CLIENT_FLAG="--no-tls"
 fi
 
+# Free the port if a stale listener is squatting on it (e.g. a server left over
+# from a previous run), so the bind can't fail with "address already in use".
+# We only target processes LISTENing on this TCP port, then escalate to -9.
+free_port() {
+    local port="$1" pids
+    pids="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null || true)"
+    [[ -z "$pids" ]] && pids="$(fuser "$port/tcp" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' || true)"
+    [[ -z "$pids" ]] && return 0
+    echo "⚠ port $port already in use by PID(s): $(echo "$pids" | tr '\n' ' ')— killing" >&2
+    kill $pids 2>/dev/null || true
+    sleep 0.5
+    pids="$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null || true)"
+    [[ -n "$pids" ]] && { echo "  still alive — SIGKILL" >&2; kill -9 $pids 2>/dev/null || true; }
+}
+free_port "$PORT"
+
 # Sanity-check deps so failures are an actionable hint, not a stack trace.
 if ! "$PY" -c "import sanic" >/dev/null 2>&1; then
     echo "✖ Python deps missing (sanic not importable with $PY)." >&2

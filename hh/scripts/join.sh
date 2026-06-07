@@ -12,10 +12,14 @@ cd "$(dirname "$0")/.."
 # are best-effort and fast-forward only: an unreachable remote or diverged
 # history just warns and is skipped — it never blocks you from joining.
 BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+# Cap each pull so an unreachable/slow remote fails fast instead of hanging on
+# the OS TCP timeout; GIT_TERMINAL_PROMPT=0 stops it blocking on a credential
+# prompt. (No `timeout` on this box? fall back to a plain pull.)
+TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 10"
 for remote in gitea origin; do
   if git remote get-url "$remote" >/dev/null 2>&1; then
     echo "⛧ syncing $BRANCH from $remote…"
-    git pull --ff-only "$remote" "$BRANCH" 2>&1 \
+    GIT_TERMINAL_PROMPT=0 $TO git pull --ff-only "$remote" "$BRANCH" 2>&1 \
       || echo "  (skipped — couldn't fast-forward from $remote/$BRANCH)"
   fi
 done
