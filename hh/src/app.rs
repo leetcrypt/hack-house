@@ -1,6 +1,7 @@
 //! TUI application state, network event model, and the async run loop.
 
 use crate::ft;
+use crate::layout::Layout;
 use crate::net::{self, Session};
 use crate::sbx;
 use crate::theme::Theme;
@@ -10,7 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -159,6 +160,15 @@ pub struct VboxPicker {
     pub selected: usize,
 }
 
+/// A resizable region of the window, for interactive layout editing. Selected by
+/// clicking it (or cycling with F5); once selected, arrow keys resize it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Chat,
+    Roster,
+    Terminal,
+}
+
 pub struct App {
     pub me: String,
     pub lines: Vec<ChatLine>,
@@ -211,6 +221,13 @@ pub struct App {
     /// Tracked so the broker Ready handler can re-grant its drive and `/ai stop`
     /// can revoke the right ACL entry.
     pub agent_name: Option<String>,
+    /// Window layout: chat/terminal split, roster width, fullscreen zoom. Read
+    /// by `ui::draw` and `sbx_dims`; mutated by F4/F5 + interactive editing.
+    pub layout: Layout,
+    /// Interactive layout editing: the pane currently selected for resizing
+    /// (click it or cycle with F5), or None when not editing. When set, arrow
+    /// keys resize this pane instead of scrolling.
+    pub focused_pane: Option<Pane>,
 }
 
 impl App {
@@ -244,7 +261,23 @@ impl App {
             spin: 0,
             agent_sbx_allow: false,
             agent_name: None,
+            layout: Layout::default(),
+            focused_pane: None,
         }
+    }
+
+    /// Cycle the interactive-edit selection: Terminal → Chat → Roster → off.
+    /// Bound to F5; clicking a pane jumps straight to it instead. The Terminal
+    /// step is skipped when no sandbox is up (nothing to resize there).
+    fn cycle_focus(&mut self) {
+        let has_term = self.sandbox.is_some();
+        self.focused_pane = match self.focused_pane {
+            None if has_term => Some(Pane::Terminal),
+            None => Some(Pane::Chat),
+            Some(Pane::Terminal) => Some(Pane::Chat),
+            Some(Pane::Chat) => Some(Pane::Roster),
+            Some(Pane::Roster) => None,
+        };
     }
 
     /// Append a chat line. Holds the viewport steady if scrolled up, and caps
@@ -463,9 +496,32 @@ impl App {
     }
 }
 
-fn sbx_dims(term_w: u16, term_h: u16) -> (u16, u16) {
+/// Human label for a resizable pane (used in layout-editing hints).
+fn pane_label(p: Pane) -> &'static str {
+    match p {
+        Pane::Chat => "chat",
+        Pane::Roster => "roster",
+        Pane::Terminal => "terminal",
+    }
+}
+
+/// Join saved-preset names for display, or "none" when there are none.
+fn once_or_none(names: Vec<String>) -> String {
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(" · ")
+    }
+}
+
+/// PTY grid (rows, cols) for the sandbox terminal. `pty_pct` is the terminal's
+/// share of the body height (see `layout::Layout`); it must match the split
+/// `ui::draw` paints, so they stay in lock-step via `app.layout`. Width is the
+/// full body width — the terminal pane always spans the frame, only its height
+/// changes with the split.
+fn sbx_dims(term_w: u16, term_h: u16, pty_pct: u16) -> (u16, u16) {
     let body_h = term_h.saturating_sub(4);
-    let sbx_h = (body_h as u32 * 55 / 100) as u16;
+    let sbx_h = (body_h as u32 * pty_pct as u32 / 100) as u16;
     (
         sbx_h.saturating_sub(2).max(1),
         term_w.saturating_sub(2).max(1),
@@ -842,6 +898,10 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
 
     let mut app = App::new(session.username.clone());
     app.password = params.password.clone();
+    // Seed the roster width from the active vestment so a `--theme` with a wider
+    // roster is honoured; from here on the live layout owns it (so /theme swaps
+    // don't stomp a width the user has set with /layout).
+    app.layout.roster_width = theme.roster_width;
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
@@ -863,7 +923,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
 
         if broker.is_some() {
             if let Ok(sz) = term.size() {
-                let dims = sbx_dims(sz.width, sz.height);
+                let dims = sbx_dims(sz.width, sz.height, app.layout.effective_pty_pct());
                 if announced_dims != Some(dims) {
                     announced_dims = Some(dims);
                     if let Some(sb) = &broker {
@@ -1043,6 +1103,64 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             } else {
                                 app.sys("you don't have drive permission — the owner can /grant you");
                             }
+                        } else if k.code == KeyCode::F(4) {
+                            // Fullscreen the terminal (cycle terminal → chat → split).
+                            // Caught before the drive branch so it works mid-session;
+                            // F-keys aren't forwarded to the shell anyway (key_to_pty).
+                            if app.sandbox.is_some() {
+                                app.layout.cycle_zoom();
+                                announced_dims = None; // re-sync PTY to the new height
+                                app.sys(format!("⛧ {}", app.layout.describe()));
+                            } else {
+                                app.sys("no sandbox to fullscreen — /sbx launch first");
+                            }
+                        } else if k.code == KeyCode::F(5) {
+                            // Enter/cycle interactive layout editing: pick a pane to
+                            // resize (Terminal → Chat → Roster → off). Clicking a pane
+                            // selects it directly; arrows then resize it.
+                            app.cycle_focus();
+                            match app.focused_pane {
+                                Some(p) => app.sys(format!(
+                                    "⛧ editing {} — arrows resize · Esc done",
+                                    pane_label(p)
+                                )),
+                                None => app.sys("⛧ layout editing off"),
+                            }
+                        } else if app.focused_pane.is_some() && !app.driving {
+                            // Interactive layout editing: a pane is selected (via click
+                            // or F5). Arrows resize it live; Esc/Enter finishes. Sits
+                            // before the driving branch but is gated on !driving so the
+                            // shell still gets its keys while you hold the PTY.
+                            let pane = app.focused_pane.unwrap();
+                            match (pane, k.code) {
+                                (_, KeyCode::Esc) | (_, KeyCode::Enter) => {
+                                    app.focused_pane = None;
+                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                }
+                                // Terminal taller / chat shorter (and the mirror image
+                                // when the chat pane is the one selected).
+                                (Pane::Terminal, KeyCode::Up) | (Pane::Chat, KeyCode::Down) => {
+                                    app.layout.grow_pty(3);
+                                    announced_dims = None;
+                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                }
+                                (Pane::Terminal, KeyCode::Down) | (Pane::Chat, KeyCode::Up) => {
+                                    app.layout.shrink_pty(3);
+                                    announced_dims = None;
+                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                }
+                                (Pane::Roster, KeyCode::Left) => {
+                                    app.layout.roster_width =
+                                        app.layout.roster_width.saturating_sub(2);
+                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                }
+                                (Pane::Roster, KeyCode::Right) => {
+                                    app.layout.roster_width =
+                                        (app.layout.roster_width + 2).min(Layout::MAX_ROSTER);
+                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                }
+                                _ => {} // ignore other keys while editing
+                            }
                         } else if app.driving {
                             // Esc is NOT a release key here — vim & friends need it,
                             // so it's forwarded to the PTY like any other key (see
@@ -1125,6 +1243,27 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     app.sbx_scroll = app.sbx_scroll.saturating_sub(3);
                                 } else {
                                     app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                                }
+                            }
+                            // Left-click a pane to select it for interactive resize
+                            // (then arrows adjust it; Esc finishes). Skipped while
+                            // driving the shell or with an overlay up, so clicks there
+                            // don't hijack the terminal/help/picker.
+                            MouseEventKind::Down(MouseButton::Left)
+                                if !app.driving && !app.show_help && app.vbox_picker.is_none() =>
+                            {
+                                if let Ok(sz) = term.size() {
+                                    if let Some(p) =
+                                        ui::pane_at(sz.width, sz.height, &app, m.column, m.row)
+                                    {
+                                        app.focused_pane = Some(p);
+                                        app.sys(format!(
+                                            "⛧ editing {} — arrows resize · Esc done",
+                                            pane_label(p)
+                                        ));
+                                    } else {
+                                        app.focused_pane = None;
+                                    }
                                 }
                             }
                             _ => {}
@@ -1516,6 +1655,73 @@ fn handle_command(
                 )),
             }
         }
+    } else if let Some(rest) = line.strip_prefix("/layout") {
+        // Named layout presets only — live resizing is interactive now (F4
+        // fullscreen, F5 or click a pane then arrows). `/layout` keeps just the
+        // memorable verbs for saving/recalling arrangements, plus `reset`.
+        // Loading a preset clears announced_dims so the run loop re-syncs (and
+        // broadcasts) the live PTY size on the next tick.
+        let rest = rest.trim();
+        let (cmd, arg) = rest
+            .split_once(char::is_whitespace)
+            .map(|(c, a)| (c, a.trim()))
+            .unwrap_or((rest, ""));
+        let mut resized = false;
+        match cmd {
+            "" => {
+                app.sys(format!("⛧ layout: {}", app.layout.describe()));
+                app.sys("  resize live: F4 fullscreen · F5 or click a pane, then arrows · Esc done");
+                app.sys(format!(
+                    "  presets: {} — /layout save <name> · load <name> · rm <name>",
+                    once_or_none(Layout::available())
+                ));
+            }
+            "reset" | "default" => {
+                let roster = app.layout.roster_width;
+                app.layout = Layout::default();
+                app.layout.roster_width = roster; // keep your roster choice on reset
+                resized = true;
+                app.sys(format!("⛧ layout reset — {}", app.layout.describe()));
+            }
+            "save" if !arg.is_empty() => match app.layout.save(arg) {
+                Ok(slug) => app.sys(format!(
+                    "⛧ saved layout '{slug}' — re-apply anytime with /layout load {slug}"
+                )),
+                Err(e) => app.err(format!("couldn't save layout: {e}")),
+            },
+            "load" | "apply" if !arg.is_empty() => match Layout::by_name(arg) {
+                Ok(l) => {
+                    app.layout = l;
+                    resized = true;
+                    app.sys(format!("⛧ loaded layout '{arg}' — {}", app.layout.describe()));
+                }
+                Err(_) => app.err(format!(
+                    "no saved layout '{arg}' — saved: {}",
+                    once_or_none(Layout::available())
+                )),
+            },
+            "list" | "presets" | "ls" => {
+                app.sys(format!("⛧ saved layouts: {}", once_or_none(Layout::available())));
+            }
+            "rm" | "delete" | "del" if !arg.is_empty() => match Layout::remove(arg) {
+                Ok(()) => app.sys(format!("⛧ deleted layout '{arg}'")),
+                Err(e) => app.err(format!("{e}")),
+            },
+            // Bare `/layout <name>` → load a saved preset if it exists.
+            name => match Layout::by_name(name) {
+                Ok(l) => {
+                    app.layout = l;
+                    resized = true;
+                    app.sys(format!("⛧ loaded layout '{name}' — {}", app.layout.describe()));
+                }
+                Err(_) => app.sys(
+                    "usage: /layout [save <name>|load <name>|list|rm <name>|reset] — resize live with F4/F5 or click",
+                ),
+            },
+        }
+        if resized {
+            *announced_dims = None; // force the run loop to re-sync the PTY size
+        }
     } else if line == "/drive" {
         // Mobile-friendly alternative to F2 (no function key needed).
         if app.sandbox.is_none() {
@@ -1656,7 +1862,7 @@ fn handle_command(
                         // install also leaves its daemon up).
                         let install_first = !installed;
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                        let (rows, cols) = sbx_dims(sz.0, sz.1);
+                        let (rows, cols) = sbx_dims(sz.0, sz.1, app.layout.effective_pty_pct());
                         *launching = true;
                         let members: Vec<String> =
                             app.users.iter().map(|u| u.username.clone()).collect();
@@ -1762,7 +1968,7 @@ fn handle_command(
                         // (stopped, preserved) instance and re-attaches its shell.
                         let label = label.to_string();
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                        let (rows, cols) = sbx_dims(sz.0, sz.1);
+                        let (rows, cols) = sbx_dims(sz.0, sz.1, app.layout.effective_pty_pct());
                         *launching = true;
                         let members: Vec<String> =
                             app.users.iter().map(|u| u.username.clone()).collect();

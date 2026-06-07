@@ -1,9 +1,10 @@
 //! ratatui rendering — top bar, chat, roster, input.
 
 use crate::app::{App, ChatLine, Role};
+use crate::layout::Zoom;
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
@@ -26,20 +27,17 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 
     draw_top(f, rows[0], app, theme);
 
-    // When a sandbox is live, split the body: chat+roster on top, PTY below.
-    let (chat_area, sbx_area) = if app.sandbox.is_some() {
-        let split = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(rows[1]);
-        (split[0], Some(split[1]))
-    } else {
-        (rows[1], None)
-    };
-
-    let body = Layout::horizontal([Constraint::Min(1), Constraint::Length(theme.roster_width)])
-        .split(chat_area);
-    draw_chat(f, body[0], app, theme);
-    draw_roster(f, body[1], app, theme);
-    if let Some(area) = sbx_area {
+    // Divide the body into chat / roster / sandbox-terminal rects. `body_areas`
+    // is the single source of truth for that geometry, shared with `pane_at`
+    // (mouse hit-testing) so what you click is exactly what's painted.
+    let areas = body_areas(rows[1], app);
+    if let Some(chat_area) = areas.chat {
+        draw_chat(f, chat_area, app, theme);
+    }
+    if let Some(roster_area) = areas.roster {
+        draw_roster(f, roster_area, app, theme);
+    }
+    if let Some(area) = areas.sbx {
         draw_sandbox(f, area, app, theme);
     }
     draw_input(f, rows[2], app, theme);
@@ -52,6 +50,101 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     }
     if let Some(msg) = &app.error {
         draw_error(f, f.area(), theme, msg);
+    }
+}
+
+/// The body's pane rectangles. Any field is `None` when that pane is hidden
+/// (terminal absent, fullscreen zoom, or roster width 0).
+struct BodyAreas {
+    chat: Option<Rect>,
+    roster: Option<Rect>,
+    sbx: Option<Rect>,
+}
+
+/// Carve the body region (`rows[1]`) into chat / roster / sandbox rectangles,
+/// honouring the sandbox presence, `Zoom`, and roster width. This is the single
+/// source of truth used by both `draw` (painting) and `pane_at` (hit-testing).
+fn body_areas(body: Rect, app: &App) -> BodyAreas {
+    // Vertical split: chat-column vs sandbox terminal.
+    let (chat_col, sbx) = if app.sandbox.is_some() {
+        match app.layout.zoom {
+            Zoom::Term => (None, Some(body)), // terminal fullscreen
+            Zoom::Chat => (Some(body), None), // chat fullscreen (terminal hidden)
+            Zoom::Normal => {
+                let pty = app.layout.pty_pct;
+                let split = Layout::vertical([
+                    Constraint::Percentage(100 - pty),
+                    Constraint::Percentage(pty),
+                ])
+                .split(body);
+                (Some(split[0]), Some(split[1]))
+            }
+        }
+    } else {
+        (Some(body), None) // no sandbox → chat owns the whole body
+    };
+
+    // Horizontal split of the chat column into chat vs roster.
+    let (chat, roster) = match chat_col {
+        Some(col) if app.layout.roster_width != 0 => {
+            let lr = Layout::horizontal([
+                Constraint::Min(1),
+                Constraint::Length(app.layout.roster_width),
+            ])
+            .split(col);
+            (Some(lr[0]), Some(lr[1]))
+        }
+        Some(col) => (Some(col), None), // roster hidden
+        None => (None, None),
+    };
+
+    BodyAreas { chat, roster, sbx }
+}
+
+/// Hit-test a screen cell against the laid-out panes, for click-to-select in
+/// interactive layout editing. Recomputes the exact rects `draw` used (via the
+/// shared `body_areas`) so a click lands on the pane the user actually sees.
+pub fn pane_at(w: u16, h: u16, app: &App, col: u16, row: u16) -> Option<crate::app::Pane> {
+    use crate::app::Pane;
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: w,
+        height: h,
+    };
+    // Mirror draw()'s top-bar / body / input split; only the body is selectable.
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(3),
+    ])
+    .split(area);
+    let areas = body_areas(rows[1], app);
+    let p = Position { x: col, y: row };
+    if areas.sbx.is_some_and(|r| r.contains(p)) {
+        Some(Pane::Terminal)
+    } else if areas.roster.is_some_and(|r| r.contains(p)) {
+        Some(Pane::Roster)
+    } else if areas.chat.is_some_and(|r| r.contains(p)) {
+        Some(Pane::Chat)
+    } else {
+        None
+    }
+}
+
+/// Border decoration for a pane: when it's the one selected for interactive
+/// resize (F5 / click), give it a bold accent border and an "✎" title marker so
+/// it's obvious which pane the arrows will move; otherwise the plain `base`.
+fn edit_decor(app: &App, pane: crate::app::Pane, theme: &Theme, base: Color) -> (Style, &'static str) {
+    if app.focused_pane == Some(pane) {
+        (
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+            "✎ ",
+        )
+    } else {
+        (Style::default().fg(base), "")
     }
 }
 
@@ -268,10 +361,33 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
             ],
         },
         HelpCluster {
+            title: "LAYOUT (resize panes)",
+            items: vec![
+                kv("F4", "fullscreen the terminal (cycle: terminal → chat → split)"),
+                kv(
+                    "click a pane  ·  F5",
+                    "select a pane to resize (✎ marks it) — F5 cycles terminal → chat → roster",
+                ),
+                kv(
+                    "↑ / ↓  (terminal/chat selected)",
+                    "grow / shrink that pane's height share",
+                ),
+                kv("← / →  (roster selected)", "narrow / widen the roster column"),
+                kv("Esc / Enter", "finish editing the selected pane"),
+                kv("/layout reset", "restore the default split"),
+                kv(
+                    "/layout save <name>  ·  load <name>",
+                    "remember an arrangement and re-apply it later",
+                ),
+                kv("/layout list  ·  rm <name>", "list or delete saved layouts"),
+            ],
+        },
+        HelpCluster {
             title: "KEYS",
             items: vec![
                 kv("Enter", "send chat message"),
                 kv("F1  ·  /help", "toggle this help"),
+                kv("F4 · F5 · click", "layout: fullscreen terminal · select pane to resize (see LAYOUT)"),
                 kv("Ctrl-C  (while driving)", "interrupt the running command"),
                 kv(
                     "Ctrl-X  (owner, not driving)",
@@ -472,15 +588,16 @@ fn draw_sandbox(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &T
     } else {
         " · /drive (or F2) · ↑/↓/wheel scroll".to_string()
     };
-    let title = format!(" sandbox · {}{} ", sv.backend, drive);
-    let border = if app.driving {
+    let base = if app.driving {
         theme.accent
     } else {
         theme.border
     };
+    let (border_style, mark) = edit_decor(app, crate::app::Pane::Terminal, theme, base);
+    let title = format!(" {mark}sandbox · {}{} ", sv.backend, drive);
     let pane = Paragraph::new(lines).block(
         Block::bordered()
-            .border_style(Style::default().fg(border))
+            .border_style(border_style)
             .title(Span::styled(title, Style::default().fg(theme.title))),
     );
     f.render_widget(pane, area);
@@ -586,15 +703,16 @@ fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Them
     let max_scroll = total_rows.saturating_sub(inner_h);
     let scroll = max_scroll.saturating_sub(app.chat_scroll) as u16;
 
+    let (border_style, mark) = edit_decor(app, crate::app::Pane::Chat, theme, theme.border);
     let title = if app.chat_scroll > 0 {
-        format!(" chat ↑{} (End=live) ", app.chat_scroll)
+        format!(" {mark}chat ↑{} (End=live) ", app.chat_scroll)
     } else {
-        " chat ".to_string()
+        format!(" {mark}chat ")
     };
     let chat = Paragraph::new(lines)
         .block(
             Block::bordered()
-                .border_style(Style::default().fg(theme.border))
+                .border_style(border_style)
                 .title(Span::styled(title, Style::default().fg(theme.title))),
         )
         .wrap(Wrap { trim: false })
@@ -639,10 +757,14 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
             )))
         })
         .collect();
+    let (border_style, mark) = edit_decor(app, crate::app::Pane::Roster, theme, theme.border);
     let roster = List::new(items).block(
         Block::bordered()
-            .border_style(Style::default().fg(theme.border))
-            .title(Span::styled(" clergy ", Style::default().fg(theme.title))),
+            .border_style(border_style)
+            .title(Span::styled(
+                format!(" {mark}clergy "),
+                Style::default().fg(theme.title),
+            )),
     );
     f.render_widget(roster, area);
 }
