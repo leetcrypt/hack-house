@@ -14,6 +14,8 @@ use std::sync::mpsc;
 
 /// Helper that ensures the Docker daemon is running (ships in hh/scripts/).
 const ENSURE_DOCKER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-docker.sh");
+/// Detect-first Multipass installer (ships in hh/scripts/).
+const ENSURE_MULTIPASS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-multipass.sh");
 /// Detect-first VirtualBox installer (ships in hh/scripts/).
 const ENSURE_VBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-vbox.sh");
 /// Baseline dev-toolchain installer run inside Docker sandboxes (hh/scripts/).
@@ -22,6 +24,19 @@ const SBX_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbo
 const SBX_TOOLS_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbox-tools.json");
 /// Creates a fresh, cloud-init-provisioned Ubuntu VirtualBox VM (hh/scripts/).
 const VBOX_NEW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-new.sh");
+
+/// Is the `docker` binary installed? (`docker --version` succeeds.) This is a
+/// weaker check than `docker_daemon_up`: the CLI can be present while the daemon
+/// is down. We need both before a Docker sandbox can launch.
+pub fn docker_installed() -> bool {
+    Command::new("docker")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
 
 /// Is the Docker daemon accepting connections? (`docker info` succeeds.)
 pub fn docker_daemon_up() -> bool {
@@ -48,6 +63,54 @@ fn start_docker_daemon() -> Result<()> {
             .lines()
             .last()
             .unwrap_or("could not start the docker daemon");
+        anyhow::bail!("{last}");
+    }
+    Ok(())
+}
+
+/// Install Docker via `ensure-docker.sh --install --yes` (Docker's official,
+/// GPG-verified repo), then leave the daemon started. Consent is the caller's
+/// job (they passed `install`); the script is idempotent if Docker is present.
+/// Returns the script's last error line on failure (e.g. needs sudo).
+pub fn ensure_docker_install() -> Result<()> {
+    let out = Command::new("bash")
+        .arg(ENSURE_DOCKER)
+        .arg("--install")
+        .arg("--yes")
+        .output()
+        .context("running ensure-docker.sh --install")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let last = err.lines().last().unwrap_or("could not install Docker");
+        anyhow::bail!("{last}");
+    }
+    Ok(())
+}
+
+/// Is Multipass installed? (`multipass version` succeeds.)
+pub fn multipass_installed() -> bool {
+    Command::new("multipass")
+        .arg("version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Install Multipass via `ensure-multipass.sh --yes`. On Linux this is a snap
+/// install (the only supported channel). Consent is the caller's job; the
+/// script is idempotent if Multipass is already present. Returns the script's
+/// last error line on failure (e.g. snapd missing, or needs sudo).
+pub fn ensure_multipass_install() -> Result<()> {
+    let out = Command::new("bash")
+        .arg(ENSURE_MULTIPASS)
+        .arg("--yes")
+        .output()
+        .context("running ensure-multipass.sh")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let last = err.lines().last().unwrap_or("could not install Multipass");
         anyhow::bail!("{last}");
     }
     Ok(())

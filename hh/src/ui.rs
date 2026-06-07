@@ -154,12 +154,12 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
             items: vec![
                 // ── launch (one verb per backend) ──
                 kv(
-                    "/sbx launch docker [image]",
-                    "Linux container — shared shell relayed to the room (default ubuntu:24.04 + auto dev toolchain)",
+                    "/sbx launch docker [image] [install]",
+                    "Linux container — shared shell relayed to the room (default ubuntu:24.04 + auto dev toolchain; append install if Docker is missing)",
                 ),
                 kv(
-                    "/sbx launch multipass [image]",
-                    "full Ubuntu VM — shared shell relayed to the room (same dev toolchain)",
+                    "/sbx launch multipass [image] [install]",
+                    "full Ubuntu VM — shared shell relayed to the room (same dev toolchain; append install if Multipass is missing)",
                 ),
                 kv(
                     "/sbx launch vbox",

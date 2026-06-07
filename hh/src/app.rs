@@ -1585,7 +1585,14 @@ fn handle_command(
                 let start_daemon = args
                     .iter()
                     .any(|a| matches!(*a, "--start" | "--start-daemon" | "-y"));
-                let mut pos = args.iter().copied().filter(|a| !a.starts_with('-'));
+                // Consent token: if the selected backend's binary is missing,
+                // `install` opts in to installing it (detect-then-install). It's
+                // a positional keyword (not the image), so filter it out below.
+                let want_install = args.iter().any(|a| matches!(*a, "install" | "--install"));
+                let mut pos = args
+                    .iter()
+                    .copied()
+                    .filter(|a| !a.starts_with('-') && !matches!(*a, "install"));
                 let first = pos.next();
                 if matches!(first, Some("virtualbox") | Some("vbox")) {
                     // VirtualBox runs locally in its own GUI — host & guest each
@@ -1623,18 +1630,47 @@ fn handle_command(
                         .next()
                         .map(str::to_string)
                         .unwrap_or_else(|| backend.default_image().to_string());
-                    if backend == sbx::Backend::Docker && !start_daemon && !sbx::docker_daemon_up() {
+                    // Is this backend's binary present? Docker/Multipass can be
+                    // installed on consent; Local needs nothing and vbox is
+                    // handled in its own branch above.
+                    let installed = match backend {
+                        sbx::Backend::Docker => sbx::docker_installed(),
+                        sbx::Backend::Multipass => sbx::multipass_installed(),
+                        _ => true,
+                    };
+                    let token = first.unwrap_or("docker");
+                    if !installed && !want_install {
+                        app.err(format!(
+                            "{} is not installed — retry with `/sbx launch {token} install` to install it (needs sudo)",
+                            backend.label()
+                        ));
+                    } else if installed
+                        && backend == sbx::Backend::Docker
+                        && !start_daemon
+                        && !sbx::docker_daemon_up()
+                    {
                         app.err("docker daemon is not running — retry with `/sbx launch docker --start` to boot it (sudo), or run ./scripts/ensure-docker.sh in a terminal first");
                     } else {
+                        // install_first ⇒ binary missing + consent given: install
+                        // it off-thread before provisioning (a fresh Docker
+                        // install also leaves its daemon up).
+                        let install_first = !installed;
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
                         let (rows, cols) = sbx_dims(sz.0, sz.1);
                         *launching = true;
                         let members: Vec<String> =
                             app.users.iter().map(|u| u.username.clone()).collect();
-                        app.sys(format!(
-                            "summoning {} sandbox… (provisioning unix users; multipass boot ~30s)",
-                            backend.label()
-                        ));
+                        if install_first {
+                            app.sys(format!(
+                                "installing {} (needs sudo)… then summoning the sandbox",
+                                backend.label()
+                            ));
+                        } else {
+                            app.sys(format!(
+                                "summoning {} sandbox… (provisioning unix users; multipass boot ~30s)",
+                                backend.label()
+                            ));
+                        }
                         spawn_launch(
                             backend,
                             image,
@@ -1643,6 +1679,7 @@ fn handle_command(
                             rows,
                             cols,
                             start_daemon,
+                            install_first,
                             pty_tx.clone(),
                             broker_tx.clone(),
                             app_tx.clone(),
@@ -1751,7 +1788,7 @@ fn handle_command(
                                     let _ = atx.send(Net::Sys(format!("loading docker sandbox from {image}…")));
                                     spawn_launch(
                                         sbx::Backend::Docker, image, owner, members, rows,
-                                        cols, false, pty, btx, atx,
+                                        cols, false, false, pty, btx, atx,
                                     );
                                 }
                                 sbx::SnapKind::Multipass => {
@@ -1766,7 +1803,7 @@ fn handle_command(
                                             spawn_launch(
                                                 sbx::Backend::Multipass,
                                                 sbx::Backend::Multipass.default_image().to_string(),
-                                                owner, members, rows, cols, false, pty, btx, atx,
+                                                owner, members, rows, cols, false, false, pty, btx, atx,
                                             );
                                         }
                                         Ok(Err(e)) => {
@@ -2402,11 +2439,28 @@ fn spawn_launch(
     rows: u16,
     cols: u16,
     start_daemon: bool,
+    install_first: bool,
     pty_tx: UnboundedSender<Vec<u8>>,
     broker_tx: UnboundedSender<BrokerMsg>,
     app_tx: UnboundedSender<Net>,
 ) {
     tokio::spawn(async move {
+        // Optional install step: the backend's binary was missing and the user
+        // opted in. Runs before provisioning; failure aborts the launch (and
+        // clears the *launching guard via BrokerMsg::Failed).
+        if install_first {
+            let res = tokio::task::spawn_blocking(move || match backend {
+                sbx::Backend::Docker => sbx::ensure_docker_install(),
+                sbx::Backend::Multipass => sbx::ensure_multipass_install(),
+                _ => Ok(()),
+            })
+            .await;
+            if let Err(e) = res.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))) {
+                let _ = app_tx.send(Net::Err(format!("install failed: {e}")));
+                let _ = broker_tx.send(BrokerMsg::Failed);
+                return;
+            }
+        }
         let name = SBX_NAME.to_string();
         let prep = {
             let (n, img) = (name.clone(), image.clone());
