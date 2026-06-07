@@ -13,11 +13,12 @@
 # so it is briefly visible in the process list (ps) to other *local* users for
 # the lifetime of the session. Nothing is ever written to disk.
 #
-# Usage: ./connect.sh [NAME] [HOST] [-p PASSWORD] [-P PORT] [--tls] [--insecure] [--no-build]
+# Usage: ./connect.sh [NAME] [HOST] [-p PASSWORD] [-P PORT] [--tls] [--insecure] [--sync] [--no-build]
 #   NAME       display handle; omit to be prompted for one on join
 #   HOST       server IP/host                   (default: 127.0.0.1)
 #   -P         port                             (default: 4173, or $HH_PORT)
 #   --tls      use wss/https instead of the default plaintext-over-Tailscale
+#   --sync     git-pull the latest code (gitea then origin, ff-only) before building
 #   --no-build run the prebuilt binary as-is (skip the fresh debug rebuild)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -31,6 +32,7 @@ PORT="${HH_PORT:-$DEFAULT_PORT}"
 PASSWORD="${HH_PASSWORD:-}"
 NO_TLS=1        # rooms run --no-tls over Tailscale/LAN by default
 INSECURE=0
+SYNC=0          # opt-in: pull latest code before building (handy for demos/dev)
 NO_BUILD=0      # rebuild a fresh debug binary first so the UI is never stale
 
 while [[ $# -gt 0 ]]; do
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     -P|--port)     PORT="$2";     shift 2 ;;
     --tls)         NO_TLS=0;      shift ;;
     --insecure)    INSECURE=1;    shift ;;
+    --sync)        SYNC=1;        shift ;;
     --no-build)    NO_BUILD=1;    shift ;;
     -h|--help)     sed -n '2,/^set /{/^set /d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
     -*)            echo "✖ unknown option: $1" >&2; exit 2 ;;
@@ -58,6 +61,22 @@ if [[ -z "$PASSWORD" ]]; then
   echo
 fi
 [[ -n "$PASSWORD" ]] || { echo "✖ a password is required" >&2; exit 1; }
+
+# --sync: pull the latest code before building so a fresh join runs current
+# source. Pulls are best-effort and fast-forward only — an unreachable remote or
+# diverged history just warns and is skipped, never blocking the join. Each pull
+# is capped (timeout) and GIT_TERMINAL_PROMPT=0 stops it hanging on credentials.
+if [[ "$SYNC" -eq 1 ]]; then
+  BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+  TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 10"
+  for remote in gitea origin; do
+    if git remote get-url "$remote" >/dev/null 2>&1; then
+      echo "⛧ syncing $BRANCH from $remote…" >&2
+      GIT_TERMINAL_PROMPT=0 $TO git pull --ff-only "$remote" "$BRANCH" 2>&1 \
+        || echo "  (skipped — couldn't fast-forward from $remote/$BRANCH)" >&2
+    fi
+  done
+fi
 
 # Build a fresh debug binary so the UI always matches the current source — an
 # incremental build is ~instant when nothing changed. --no-build skips this and
