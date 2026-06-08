@@ -662,14 +662,66 @@ class AgentBridge(Client):
             await worker
         return "".join(parts)
 
+    # Reconnect policy. A session that stays up at least _RECONNECT_STABLE_SECS
+    # is treated as healthy: the next drop resets backoff so a one-off blip
+    # reconnects fast, while only rapid repeated failures back off (capped).
+    _RECONNECT_STABLE_SECS = 30.0
+    _RECONNECT_MAX_BACKOFF = 30.0
+    # Keepalive: ping every 20s but tolerate a slow pong, since a heavy CPU-only
+    # Ollama generation can briefly starve the event loop. A real drop is caught
+    # by the reconnect loop, so a forgiving timeout just avoids needless churn.
+    _PING_INTERVAL = 20.0
+    _PING_TIMEOUT = 60.0
+
     async def run_async(self) -> None:
-        self.srp_authenticate()
+        """Join the room and serve forever, reconnecting on any unexpected drop.
+
+        The agent used to hold a single websocket with no retry: any close —
+        server restart, idle/ping reap, laptop sleep, a transient network blip —
+        ended the serve loop, so ``run_async`` returned and the process exited
+        silently. The agent then vanished from the roster with no ``/ai stop`` and
+        no goodbye. We now wrap the connection in a backoff-reconnect loop. The
+        server frees our session + name when a socket drops, so each attempt
+        re-runs SRP to mint a fresh token before reopening. Only Ctrl-C / process
+        kill (KeyboardInterrupt / CancelledError — the latter is how ``/ai stop``
+        terminates us) ends the loop."""
+        backoff = 1.0
+        first = True
+        while True:
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            try:
+                await self._connect_and_serve(reconnect=not first)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise  # intentional shutdown — never reconnect
+            except (websockets.ConnectionClosed, OSError) as e:
+                self.info(f"connection lost ({type(e).__name__}); reconnecting…")
+            except Exception as e:  # noqa: BLE001 — auth/transient error: retry, don't die
+                self.info(f"agent loop error ({type(e).__name__}: {e}); reconnecting…")
+            else:
+                self.info("disconnected; reconnecting…")  # clean close under us
+            if loop.time() - started >= self._RECONNECT_STABLE_SECS:
+                backoff = 1.0  # the session was healthy → reconnect promptly
+            first = False
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self._RECONNECT_MAX_BACKOFF)
+
+    async def _connect_and_serve(self, reconnect: bool) -> None:
+        """One connection lifecycle: (re)authenticate, open the socket, announce,
+        then serve frames until the socket closes. Raises on any drop so the outer
+        ``run_async`` loop can decide whether to reconnect."""
+        self.srp_authenticate()  # fresh session each attempt; the old token dies on a drop
         url = f"{self.ws_url}/ws/chat?user_id={self.user_id}&ws_token={self.ws_token}"
-        self.info(f"agent '{self.name}' connecting via {self.provider.name}/{self.provider.model}…")
-        async with websockets.connect(url, ssl=self._ws_ssl_context()) as ws:
+        verb = "reconnecting" if reconnect else "connecting"
+        self.info(f"agent '{self.name}' {verb} via {self.provider.name}/{self.provider.model}…")
+        async with websockets.connect(
+            url, ssl=self._ws_ssl_context(),
+            ping_interval=self._PING_INTERVAL, ping_timeout=self._PING_TIMEOUT,
+        ) as ws:
             self.running = True
             announce = (
-                f"{self.name} (ai) online — {self.provider.name}/{self.provider.model}. "
+                f"{self.name} (ai) {'back online' if reconnect else 'online'} — "
+                f"{self.provider.name}/{self.provider.model}. "
                 f"Ask me with /ai <question>; /ai {self.name} !<task> to act in the sandbox."
             )
             await ws.send(self.room_fernet.encrypt(announce.encode()).decode())
@@ -685,44 +737,57 @@ class AgentBridge(Client):
                     embed_task.cancel()
 
     async def _serve(self, ws) -> None:
+        """Drain frames until the socket closes. Each frame is handled under a
+        guard so a single malformed/poisoned frame — or a provider/handler error —
+        can never unwind the serve loop and drop the agent. A closed socket or a
+        cancellation propagates up to the reconnect loop / shutdown."""
         async for raw in ws:
             if not self.running:
                 break
             try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            mtype = data.get("type")
-            if mtype == "init":
-                self.users = data.get("users", [])
-                self._seed_transcript(data.get("messages", []))
-                continue
-            if mtype == "roster":
-                self.users = data.get("users", [])
-                continue
-            if mtype != "message":
-                continue
-            msg = self.decrypt_message(data.get("data", {}))
-            text = msg.get("text", "")
-            sender = msg.get("username", "?")
-            if sender == self.name:
-                continue  # never react to our own messages
-            if text.startswith('{"_'):
-                self._handle_control(text)  # track ACL grants; ignore other ctrl frames
-                continue
-            question = self._addressed_question(text)
-            if question is None:
-                # keep a short rolling transcript for context on future asks,
-                # and feed the line to long-term semantic memory
-                captured = Msg("user", f"{sender}: {text}")
-                self.transcript.append(captured)
-                self.transcript = self.transcript[-(self.context_window * 2):]
-                self._remember(captured)
-            elif question.startswith("!"):
-                self.info(f"{sender} → /ai !sbx: {question[1:].strip()}")
-                await self._run_in_sandbox(ws, question[1:].strip(), sender)
-            elif question.strip().lower() == "confirm":
-                await self._confirm_pending(ws, sender)
-            else:
-                self.info(f"{sender} → /ai: {question}")
-                await self._answer(ws, question, sender)
+                await self._handle_frame(ws, raw)
+            except (websockets.ConnectionClosed, asyncio.CancelledError):
+                raise  # socket gone / shutting down → let run_async decide
+            except Exception as e:  # noqa: BLE001 — one bad frame must not kill the agent
+                self.info(f"skipped frame after error ({type(e).__name__}: {e})")
+
+    async def _handle_frame(self, ws, raw) -> None:
+        """Decode and act on one server frame (init/roster/message)."""
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        mtype = data.get("type")
+        if mtype == "init":
+            self.users = data.get("users", [])
+            self._seed_transcript(data.get("messages", []))
+            return
+        if mtype == "roster":
+            self.users = data.get("users", [])
+            return
+        if mtype != "message":
+            return
+        msg = self.decrypt_message(data.get("data", {}))
+        text = msg.get("text", "")
+        sender = msg.get("username", "?")
+        if sender == self.name:
+            return  # never react to our own messages
+        if text.startswith('{"_'):
+            self._handle_control(text)  # track ACL grants; ignore other ctrl frames
+            return
+        question = self._addressed_question(text)
+        if question is None:
+            # keep a short rolling transcript for context on future asks,
+            # and feed the line to long-term semantic memory
+            captured = Msg("user", f"{sender}: {text}")
+            self.transcript.append(captured)
+            self.transcript = self.transcript[-(self.context_window * 2):]
+            self._remember(captured)
+        elif question.startswith("!"):
+            self.info(f"{sender} → /ai !sbx: {question[1:].strip()}")
+            await self._run_in_sandbox(ws, question[1:].strip(), sender)
+        elif question.strip().lower() == "confirm":
+            await self._confirm_pending(ws, sender)
+        else:
+            self.info(f"{sender} → /ai: {question}")
+            await self._answer(ws, question, sender)
