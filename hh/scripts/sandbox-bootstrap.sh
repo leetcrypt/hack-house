@@ -50,36 +50,9 @@ if ! apt-get install -y --no-install-recommends $PKGS; then
     done
 fi
 
-# ---- Goose harness (the /ai agent's sandbox `!task` path) --------------------
-# Goose ships as a release binary (not apt), so install it via its official
-# installer into a system path so every container user can run it. Best-effort:
-# a failure here just means the agent falls back to its built-in one-shot
-# injector, so it never blocks provisioning. Skip entirely with HH_SBX_GOOSE=0.
-if [[ "${HH_SBX_GOOSE:-1}" != "0" ]] && ! command -v goose >/dev/null 2>&1; then
-    if command -v curl >/dev/null 2>&1; then
-        GOOSE_BIN_DIR=/usr/local/bin CONFIGURE=false \
-            bash -c 'curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash' \
-            || true
-    fi
-fi
-
-# Container-side Goose config: point it at the host's Ollama via the engine's
-# host gateway (passed in as $HH_OLLAMA_HOST by the launcher). The shared shell
-# runs as root here, so write it under /root — only if absent, so a tuned config
-# survives a re-provision.
-if command -v goose >/dev/null 2>&1; then
-    GOOSE_CFG=/root/.config/goose/config.yaml
-    if [[ ! -f "$GOOSE_CFG" ]]; then
-        mkdir -p "$(dirname "$GOOSE_CFG")"
-        cat > "$GOOSE_CFG" <<EOF
-# Written by hh sandbox-bootstrap.sh — Goose runs INSIDE this sandbox and reaches
-# the host Ollama over the engine's host gateway. No host filesystem is mounted.
-GOOSE_PROVIDER: ollama
-GOOSE_MODEL: ${HH_GOOSE_MODEL:-qwen2.5:3b}
-OLLAMA_HOST: ${HH_OLLAMA_HOST:-http://host.containers.internal:11434}
-EOF
-    fi
-fi
+# No in-sandbox agentic harness is installed here: the native `!task` harness
+# runs the model host-side and only execs commands into this sandbox, so nothing
+# extra needs to live in the container.
 
 mkdir -p "$(dirname "$SENTINEL")"
 date -u +%FT%TZ > "$SENTINEL"       # mark done; skip on the next provision pass

@@ -2624,11 +2624,12 @@ fn handle_command(
             app.sys("an AI agent is already running from this client — /ai stop first");
         } else {
             // Trailing flag words (any order): `allow` auto-grants the agent
-            // sandbox drive on launch; `plain` selects the legacy one-shot
-            // injector instead of the default Goose harness.
+            // sandbox drive on launch; the harness word `native` (default) or
+            // `simple` picks the granted-`!task` harness. `plain` is a back-compat
+            // alias for `simple`.
             let mut raw = rest.trim();
             let mut grant_sbx = false;
-            let mut plain = false;
+            let mut harness: Option<&str> = None;
             loop {
                 if let Some(head) = raw
                     .strip_suffix("allow")
@@ -2638,17 +2639,20 @@ fn handle_command(
                     raw = head.trim();
                     continue;
                 }
-                if let Some(head) = raw
-                    .strip_suffix("plain")
-                    .filter(|h| h.is_empty() || h.ends_with(' '))
+                if let Some((word, head)) = ["native", "simple", "plain"]
+                    .iter()
+                    .find_map(|w| {
+                        raw.strip_suffix(w)
+                            .filter(|h| h.is_empty() || h.ends_with(' '))
+                            .map(|h| (*w, h))
+                    })
                 {
-                    plain = true;
+                    harness = Some(if word == "native" { "native" } else { "simple" });
                     raw = head.trim();
                     continue;
                 }
                 break;
             }
-            let harness = if plain { Some("simple") } else { None };
             // A bare name (no ':' tag, no '/' path) is a models.toml profile;
             // anything else is treated as a literal Ollama model tag.
             let (profile, model): (Option<&str>, &str) = if raw.is_empty() {
@@ -2671,7 +2675,10 @@ fn handle_command(
                         Some(p) => format!("profile {p}"),
                         None => format!("ollama/{model}"),
                     };
-                    let hdesc = if plain { ", simple harness" } else { "" };
+                    let hdesc = match harness {
+                        Some(h) => format!(", {h} harness"),
+                        None => String::new(),
+                    };
                     app.sys(format!(
                         "⛧ summoning {name} ({desc}{hdesc})… it will announce when online"
                     ));
@@ -3245,8 +3252,8 @@ fn spawn_agent(
                 .arg(model);
         }
     }
-    // Override the agent's default `!task` harness (goose) when the launcher
-    // asked for the legacy one-shot injector via `/ai start … plain`.
+    // Override the agent's default `!task` harness when the launcher asked for a
+    // specific one via `/ai start … native|simple` (plain aliases simple).
     if let Some(h) = harness {
         cmd.arg("--harness").arg(h);
     }

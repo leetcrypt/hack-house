@@ -685,7 +685,7 @@ impl Backend {
     /// sandbox — `docker`/`podman exec`, `multipass exec`, or host `local`.
     /// Advertised in the `_sbx:status` frame (distinct from `label`, whose Local
     /// value is the cosmetic "local-shell") so the bridge can build the right
-    /// `goose run` invocation for the backend that holds the sandbox.
+    /// `<engine> exec` invocation for the backend that holds the sandbox.
     pub fn engine(self) -> &'static str {
         match self {
             Backend::Local => "local",
@@ -777,19 +777,11 @@ pub fn prepare(
             // surfaced through the returned error (shown in the error popup).
             let mut run = Command::new(engine);
             run.args(["run", "-d", "--name", name, "--hostname", name, "-w", "/root"]);
-            // Goose (and any in-container tool) reaches the host Ollama via a
-            // gateway. Docker maps `host.docker.internal` to the host gateway IP.
-            // For rootless Podman the native `host.containers.internal` resolves to
-            // the host's *LAN* interface, which can't reach an Ollama bound to
-            // 127.0.0.1 (the safe default) — so request slirp4netns host-loopback
-            // forwarding and point the in-container OLLAMA_HOST at the slirp gateway
-            // 10.0.2.2 (see dk_bootstrap). Without this the granted `!task` path dies
-            // with "Could not connect to host.containers.internal:11434".
-            if backend == Backend::Docker {
-                run.arg("--add-host=host.docker.internal:host-gateway");
-            } else if backend == Backend::Podman {
-                run.arg("--network=slirp4netns:allow_host_loopback=true");
-            }
+            // The native harness runs the model host-side and only execs commands
+            // into the container, so the sandbox no longer needs to reach host
+            // Ollama. The old in-container Ollama gateway (Docker host-gateway /
+            // Podman slirp4netns host-loopback) is therefore gone — and with it the
+            // rootless-Podman loopback bug it used to work around.
             run.args([image, "sleep", "infinity"]);
             let out = run
                 .output()
@@ -1246,21 +1238,9 @@ fn dk_bootstrap(engine: &str, name: &str) {
         "apt-get update -qq && apt-get install -y --no-install-recommends $HH_SBX_PKGS".into()
     });
     let pkgs_env = format!("HH_SBX_PKGS={}", sandbox_pkgs());
-    // The in-container Goose config points OLLAMA_HOST at the host gateway, whose
-    // address depends on the engine. Docker resolves `host.docker.internal` via the
-    // `--add-host` we add at run time. Rootless Podman's `host.containers.internal`
-    // resolves to the host LAN IP and can't reach a loopback-bound Ollama, so we
-    // launch the container with slirp4netns:allow_host_loopback=true (see launch())
-    // and target the slirp host-loopback gateway 10.0.2.2 instead. Pass it through
-    // so sandbox-bootstrap.sh can bake the right URL.
-    let gateway = if engine == "podman" {
-        "HH_OLLAMA_HOST=http://10.0.2.2:11434"
-    } else {
-        "HH_OLLAMA_HOST=http://host.docker.internal:11434"
-    };
     let child = Command::new(engine)
         .args([
-            "exec", "-i", "-e", &pkgs_env, "-e", gateway, name, "bash", "-s",
+            "exec", "-i", "-e", &pkgs_env, name, "bash", "-s",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

@@ -1,5 +1,11 @@
 # hack-house → Podman backend + Goose harness — Spec
 
+> ⚠️ **SUPERSEDED (harness portion only).** The Goose harness described here was
+> stripped on 2026-06-08 and replaced by the lightweight, host-side, Ollama-native
+> harness — see **`docs/spec-native-harness.md`**. **The Podman backend introduced
+> by this spec still stands** (it is not Goose-specific). Read this document only
+> for the Podman backend rationale; ignore every Goose section below.
+
 > **Status:** Draft v1 · **Date:** 2026-06-07
 > **Scope:** Add **Podman** as an additional sandbox backend (Docker stays), and
 > make **Goose** (block/goose) the default agentic harness for the `/ai !task`
