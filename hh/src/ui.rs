@@ -274,12 +274,12 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
             items: vec![
                 // ── launch: /sbx <type> <option> (one backend token per line) ──
                 kv(
-                    "/sbx docker [gui] [image] [install]",
-                    "Linux container — shared shell relayed to the room (default parrotsec/core + auto dev toolchain; gui = noVNC desktop; append install if Docker is missing)",
+                    "/sbx docker [image] [install]",
+                    "Linux container — shared shell relayed to the room (default parrotsec/core + auto dev toolchain; append install if Docker is missing)",
                 ),
                 kv(
-                    "/sbx podman [gui] [image] [install]",
-                    "rootless/daemonless container — no sudo modal (default kalilinux/kali-rolling; gui = noVNC desktop; append install if Podman is missing)",
+                    "/sbx podman [image] [install]",
+                    "rootless/daemonless container — no sudo modal (default kalilinux/kali-rolling; append install if Podman is missing)",
                 ),
                 kv(
                     "/sbx multipass [image] [install]",

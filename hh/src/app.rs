@@ -185,7 +185,6 @@ pub struct PendingSudoLaunch {
     pub cols: u16,
     pub start_daemon: bool,
     pub install_first: bool,
-    pub gui: bool,
 }
 
 /// Launch parameters captured when installing VirtualBox needs root but sudo
@@ -216,31 +215,6 @@ pub enum PendingPrivileged {
 pub struct SudoPrompt {
     pub password: String,
     pub pending: PendingPrivileged,
-}
-
-/// Launch parameters captured when a GUI sandbox's noVNC port is already bound
-/// by another process. Held aside while the port-consent modal asks whether to
-/// kill the holder; the launch fires once the owner confirms. Carries the
-/// (already-collected) sudo password, if any, so the gate works on both the
-/// no-sudo and sudo-submit launch paths.
-pub struct PendingGuiLaunch {
-    pub backend: sbx::Backend,
-    pub image: String,
-    pub members: Vec<String>,
-    pub rows: u16,
-    pub cols: u16,
-    pub start_daemon: bool,
-    pub install_first: bool,
-    pub gui: bool,
-    pub password: Option<String>,
-}
-
-/// Active "port in use — kill it?" consent prompt for a GUI sandbox launch.
-/// While `Some`, y/n keystrokes resolve this instead of feeding chat.
-pub struct PortPrompt {
-    pub pid: i32,
-    pub holder: String,
-    pub pending: PendingGuiLaunch,
 }
 
 pub struct App {
@@ -306,10 +280,6 @@ pub struct App {
     /// and creds aren't cached). While `Some`, keystrokes feed this masked
     /// buffer instead of chat — the secret never leaves the client.
     pub sudo_prompt: Option<SudoPrompt>,
-    /// Active "noVNC port already in use — kill the holder?" consent prompt for a
-    /// GUI sandbox launch (None unless the port is busy). While `Some`, y/n keys
-    /// resolve it instead of feeding chat.
-    pub port_prompt: Option<PortPrompt>,
 }
 
 impl App {
@@ -346,7 +316,6 @@ impl App {
             layout: Layout::default(),
             focused_pane: None,
             sudo_prompt: None,
-            port_prompt: None,
         }
     }
 
@@ -462,7 +431,7 @@ impl App {
                 self.connected = true;
                 self.chat_scroll = 0;
                 self.sys(format!("joined as {} ⛧", self.me));
-                self.sys("/sbx <docker|podman|multipass|vbox|local> [gui] · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys("/sbx <docker|podman|multipass|vbox|local> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => self.push_line(l),
             Net::Roster { users, capacity } => {
@@ -1079,33 +1048,6 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     } else {
                                         match pending {
                                         PendingPrivileged::Launch(pending) => {
-                                        if let Some(h) =
-                                            if pending.gui { sbx::port_holder(sbx::GUI_PORT) } else { None }
-                                        {
-                                            // Root's now authenticated, but the noVNC port
-                                            // is taken — carry the password into the
-                                            // port-consent gate so the launch can still fire
-                                            // (with sudo) once the holder is cleared.
-                                            app.sys(format!(
-                                                "⚠ port {} (noVNC) in use by pid {} ({}) — kill it and proceed? [y/N] · Esc cancels",
-                                                sbx::GUI_PORT, h.pid, h.name
-                                            ));
-                                            app.port_prompt = Some(PortPrompt {
-                                                pid: h.pid,
-                                                holder: h.name,
-                                                pending: PendingGuiLaunch {
-                                                    backend: pending.backend,
-                                                    image: pending.image,
-                                                    members: pending.members,
-                                                    rows: pending.rows,
-                                                    cols: pending.cols,
-                                                    start_daemon: pending.start_daemon,
-                                                    install_first: pending.install_first,
-                                                    gui: pending.gui,
-                                                    password: Some(password),
-                                                },
-                                            });
-                                        } else {
                                             launching = true;
                                             app.sys("🔒 authenticating + launching…");
                                             spawn_launch(
@@ -1117,13 +1059,11 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                                 pending.cols,
                                                 pending.start_daemon,
                                                 pending.install_first,
-                                                pending.gui,
                                                 Some(password),
                                                 pty_tx.clone(),
                                                 broker_tx.clone(),
                                                 app_tx.clone(),
                                             );
-                                        }
                                         }
                                         PendingPrivileged::VboxInstall(p) => {
                                             // Root authenticated → install VirtualBox
@@ -1160,50 +1100,6 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     if let Some(p) = app.sudo_prompt.as_mut() {
                                         p.password.push(c);
                                     }
-                                }
-                                _ => {}
-                            }
-                        } else if app.port_prompt.is_some() {
-                            // GUI-launch port-consent modal: the noVNC port is held
-                            // by another process. y/Y kills the named pid then fires
-                            // the held launch; n/N/Esc aborts. Swallows keys so the
-                            // y/n never lands in chat.
-                            match k.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                    let PortPrompt { pid, holder, pending } =
-                                        app.port_prompt.take().unwrap();
-                                    app.sys(format!(
-                                        "⛧ killing {holder} (pid {pid}) to free port {}…",
-                                        sbx::GUI_PORT
-                                    ));
-                                    if sbx::kill_port_holder(sbx::GUI_PORT, pid) {
-                                        launching = true;
-                                        app.sys("🖥 port freed — launching…");
-                                        spawn_launch(
-                                            pending.backend,
-                                            pending.image,
-                                            app.me.clone(),
-                                            pending.members,
-                                            pending.rows,
-                                            pending.cols,
-                                            pending.start_daemon,
-                                            pending.install_first,
-                                            pending.gui,
-                                            pending.password,
-                                            pty_tx.clone(),
-                                            broker_tx.clone(),
-                                            app_tx.clone(),
-                                        );
-                                    } else {
-                                        app.sys(format!(
-                                            "⚠ couldn't free port {} — launch aborted",
-                                            sbx::GUI_PORT
-                                        ));
-                                    }
-                                }
-                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                    app.port_prompt = None;
-                                    app.sys("⛧ launch aborted — port left untouched");
                                 }
                                 _ => {}
                             }
@@ -2060,7 +1956,7 @@ fn handle_command(
         let mut p = rest.split_whitespace();
         match p.next() {
             // Grammar: `/sbx <vm type> <option>` — the backend leads, e.g.
-            // `/sbx podman gui`, `/sbx docker`, `/sbx multipass`, `/sbx local`.
+            // `/sbx podman`, `/sbx docker`, `/sbx multipass`, `/sbx local`.
             // vbox is the exception that takes extra options (a VM name, `new`,
             // confirm): `/sbx vbox gui <vm>`, `/sbx vbox new [name]`.
             // `launch` stays accepted as a transitional alias (`/sbx launch
@@ -2087,10 +1983,9 @@ fn handle_command(
                 // `install` opts in to installing it (detect-then-install). It's
                 // a positional keyword (not the image), so filter it out below.
                 let want_install = args.iter().any(|a| matches!(*a, "install" | "--install"));
-                // `gui` option (`/sbx podman gui`): provision an XFCE/noVNC desktop
-                // in the container and publish it on the host loopback. Keyword, not
-                // an image, so it's filtered out of the positionals like `install`.
-                let want_gui = args.iter().any(|a| matches!(*a, "gui"));
+                // `gui` is only meaningful for the vbox path (`/sbx vbox gui <vm>`);
+                // it's a keyword, not an image, so strip it from the positionals like
+                // `install` so the VM name is the next positional.
                 let mut pos = args
                     .iter()
                     .copied()
@@ -2144,16 +2039,6 @@ fn handle_command(
                         _ => true,
                     };
                     let token = first.unwrap_or("docker");
-                    // GUI is a container-only feature (headless containers get a
-                    // published noVNC port). Asking for it on multipass/local is a
-                    // no-op we flag rather than silently drop.
-                    let gui = want_gui && matches!(backend, sbx::Backend::Docker | sbx::Backend::Podman);
-                    if want_gui && !gui {
-                        app.sys(format!(
-                            "`gui` only applies to docker/podman sandboxes — ignoring it for {}",
-                            backend.label()
-                        ));
-                    }
                     if !installed && !want_install {
                         app.err(format!(
                             "{} is not installed — retry with `/sbx {token} install` to install it (needs sudo)",
@@ -2197,33 +2082,9 @@ fn handle_command(
                                     cols,
                                     start_daemon,
                                     install_first,
-                                    gui,
                                 }),
                             });
                             app.sys("🔒 sudo password needed — type it here (hidden), Enter to launch · Esc cancels. Local only: never sent to the room.");
-                        } else if let Some(h) = if gui { sbx::port_holder(sbx::GUI_PORT) } else { None } {
-                            // The noVNC port is already bound (a stale sandbox, a
-                            // leftover websockify, etc.). Don't blindly collide —
-                            // ask the owner whether to kill the holder, then launch.
-                            app.sys(format!(
-                                "⚠ port {} (noVNC) in use by pid {} ({}) — kill it and proceed? [y/N] · Esc cancels",
-                                sbx::GUI_PORT, h.pid, h.name
-                            ));
-                            app.port_prompt = Some(PortPrompt {
-                                pid: h.pid,
-                                holder: h.name,
-                                pending: PendingGuiLaunch {
-                                    backend,
-                                    image,
-                                    members,
-                                    rows,
-                                    cols,
-                                    start_daemon,
-                                    install_first,
-                                    gui,
-                                    password: None,
-                                },
-                            });
                         } else {
                             *launching = true;
                             if install_first {
@@ -2237,12 +2098,6 @@ fn handle_command(
                                     backend.label()
                                 ));
                             }
-                            if gui {
-                                app.sys(format!(
-                                    "🖥 gui sandbox: installing the desktop (heavy first pull) — when it's up, open http://127.0.0.1:{} in a browser (noVNC, default password 'hackhouse')",
-                                    sbx::GUI_PORT
-                                ));
-                            }
                             spawn_launch(
                                 backend,
                                 image,
@@ -2252,7 +2107,6 @@ fn handle_command(
                                 cols,
                                 start_daemon,
                                 install_first,
-                                gui,
                                 None,
                                 pty_tx.clone(),
                                 broker_tx.clone(),
@@ -2363,7 +2217,7 @@ fn handle_command(
                                     let _ = atx.send(Net::Sys(format!("loading docker sandbox from {image}…")));
                                     spawn_launch(
                                         sbx::Backend::Docker, image, owner, members, rows,
-                                        cols, false, false, false, None, pty, btx, atx,
+                                        cols, false, false, None, pty, btx, atx,
                                     );
                                 }
                                 sbx::SnapKind::Podman => {
@@ -2373,7 +2227,7 @@ fn handle_command(
                                     let _ = atx.send(Net::Sys(format!("loading podman sandbox from {image}…")));
                                     spawn_launch(
                                         sbx::Backend::Podman, image, owner, members, rows,
-                                        cols, false, false, false, None, pty, btx, atx,
+                                        cols, false, false, None, pty, btx, atx,
                                     );
                                 }
                                 sbx::SnapKind::Multipass => {
@@ -2388,7 +2242,7 @@ fn handle_command(
                                             spawn_launch(
                                                 sbx::Backend::Multipass,
                                                 sbx::Backend::Multipass.default_image().to_string(),
-                                                owner, members, rows, cols, false, false, false, None, pty, btx, atx,
+                                                owner, members, rows, cols, false, false, None, pty, btx, atx,
                                             );
                                         }
                                         Ok(Err(e)) => {
@@ -2562,7 +2416,7 @@ fn handle_command(
                 }
             }
             other => {
-                let usage = "usage: /sbx <type> <option> — /sbx docker|podman|multipass|local [gui] [image] (gui = noVNC desktop, docker/podman only) · /sbx vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx vbox new [name] (fresh VM) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>";
+                let usage = "usage: /sbx <type> <option> — /sbx docker|podman|multipass|local [image] · /sbx vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx vbox new [name] (fresh VM) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>";
                 // Bare `/sbx` → usage. An unrecognised subcommand → suggest the
                 // closest documented one before the usage line.
                 match other.and_then(|bad| closest(bad, SBX_SUBCOMMANDS).map(|s| (bad, s))) {
@@ -3145,9 +2999,6 @@ fn spawn_launch(
     cols: u16,
     start_daemon: bool,
     install_first: bool,
-    // GUI sandbox: publish noVNC on the host loopback and provision the desktop
-    // stack inside the container. Only honoured for Docker/Podman.
-    gui: bool,
     // The sudo password captured by the in-TUI masked prompt, if escalation was
     // needed. Local-only: it is fed to `sudo -S` via stdin inside the blocking
     // install/prepare steps and never enters chat, the PTY, or any outbound frame.
@@ -3178,7 +3029,7 @@ fn spawn_launch(
         let name = SBX_NAME.to_string();
         let prep = {
             let (n, img, pw) = (name.clone(), image.clone(), password.clone());
-            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon, pw, gui))
+            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon, pw))
                 .await
         };
         if let Err(e) = prep.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))) {
@@ -3189,7 +3040,7 @@ fn spawn_launch(
         // Provision real unix accounts (owner = sudoer) → the shell's run-user.
         let run_user = {
             let (n, o, ms) = (name.clone(), owner.clone(), members.clone());
-            tokio::task::spawn_blocking(move || sbx::provision(backend, &n, &o, &ms, gui))
+            tokio::task::spawn_blocking(move || sbx::provision(backend, &n, &o, &ms))
                 .await
                 .unwrap_or_default()
         };

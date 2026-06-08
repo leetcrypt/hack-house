@@ -27,99 +27,6 @@ const SBX_TOOLS_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandb
 /// Creates a fresh, cloud-init-provisioned Ubuntu VirtualBox VM (hh/scripts/).
 const VBOX_NEW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-new.sh");
 
-/// Port a GUI sandbox serves noVNC on, both inside the container and on the host
-/// loopback (`-p 127.0.0.1:6080:6080`). The bootstrap bridges the container's VNC
-/// server (:1 / 5901) to this port via websockify; the owner opens it in a browser.
-pub const GUI_PORT: u16 = 6080;
-
-/// A process currently bound to a TCP port we want to use.
-pub struct PortHolder {
-    pub pid: i32,
-    pub name: String,
-}
-
-/// Find the process listening on `port` (host loopback/any), if any.
-///
-/// Parses `ss -H -ltnp` — one listening socket per line, e.g.
-/// `LISTEN 0 4096 127.0.0.1:6080 0.0.0.0:* users:(("websockify",pid=3395944,fd=3))`.
-/// We match the local-address column (index 3) ending in `:port` and pull the
-/// first `("name",pid=N` out of the `users:(...)` column. Returns `None` if the
-/// port is free or `ss` can't report the owner (no `-p` perms → no name/pid).
-pub fn port_holder(port: u16) -> Option<PortHolder> {
-    let out = Command::new("ss")
-        .args(["-H", "-ltnp"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let suffix = format!(":{port}");
-    for line in text.lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 4 {
-            continue;
-        }
-        // Local address is the 4th column (Recv-Q is dropped by some ss builds,
-        // so guard by scanning for the column that ends in `:<port>`).
-        let local_match = cols.iter().any(|c| c.ends_with(&suffix));
-        if !local_match {
-            continue;
-        }
-        // users:(("websockify",pid=3395944,fd=3),...)
-        let users = match line.split_once("users:(") {
-            Some((_, rest)) => rest,
-            None => continue,
-        };
-        let name = users
-            .split_once("(\"")
-            .and_then(|(_, r)| r.split_once('"'))
-            .map(|(n, _)| n.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        let pid = users
-            .split_once("pid=")
-            .and_then(|(_, r)| {
-                let end = r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len());
-                r[..end].parse::<i32>().ok()
-            });
-        if let Some(pid) = pid {
-            return Some(PortHolder { pid, name });
-        }
-    }
-    None
-}
-
-/// Kill the process holding `port` and wait for the port to free up.
-///
-/// Sends SIGTERM first (graceful), then SIGKILL if it lingers, polling
-/// `port_holder` until the port is free or a short timeout elapses. Returns
-/// `true` once the port is free. Used by the GUI-launch consent gate after the
-/// owner confirms killing the named pid.
-pub fn kill_port_holder(port: u16, pid: i32) -> bool {
-    let _ = Command::new("kill")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    for _ in 0..15 {
-        if port_holder(port).is_none() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    // Still bound after SIGTERM — escalate to SIGKILL.
-    let _ = Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    for _ in 0..15 {
-        if port_holder(port).is_none() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    port_holder(port).is_none()
-}
-
 /// Is the `docker` binary installed? (`docker --version` succeeds.) This is a
 /// weaker check than `docker_daemon_up`: the CLI can be present while the daemon
 /// is down. We need both before a Docker sandbox can launch.
@@ -690,11 +597,6 @@ pub fn prepare(
     image: &str,
     start_daemon: bool,
     password: Option<String>,
-    // GUI sandbox: publish the in-container noVNC port (6080) on the host loopback
-    // so a browser can reach the desktop. Containers are headless, so this is the
-    // only way out for a GUI — bound to 127.0.0.1 (never 0.0.0.0) to keep the
-    // surface local. Only meaningful for Docker/Podman; ignored otherwise.
-    gui: bool,
 ) -> Result<()> {
     match backend {
         Backend::Local => Ok(()),
@@ -767,13 +669,6 @@ pub fn prepare(
                 run.arg("--add-host=host.docker.internal:host-gateway");
             } else if backend == Backend::Podman {
                 run.arg("--network=slirp4netns:allow_host_loopback=true");
-            }
-            // GUI sandbox: publish noVNC (container 6080 → host 127.0.0.1:6080).
-            // Loopback-only so the desktop is reachable from this machine's browser
-            // but not the LAN. The desktop+VNC stack itself is installed by the
-            // bootstrap when HH_SBX_GUI=1 (see dk_bootstrap / sandbox-bootstrap.sh).
-            if gui {
-                run.args(["-p", &format!("127.0.0.1:{GUI_PORT}:{GUI_PORT}")]);
             }
             run.args([image, "sleep", "infinity"]);
             let out = run
@@ -1224,7 +1119,7 @@ fn sandbox_pkgs() -> String {
 /// Run the sandbox bootstrap inside the container, piping the script to `bash -s`
 /// on stdin (keeps it out of argv) with the resolved package list in the env.
 /// Blocking — provision() is already off the UI thread.
-fn dk_bootstrap(engine: &str, name: &str, gui: bool) {
+fn dk_bootstrap(engine: &str, name: &str) {
     let script = std::fs::read_to_string(SBX_BOOTSTRAP).unwrap_or_else(|_| {
         // Degraded fallback if the script file is missing: still refresh the
         // index and install whatever the env carries (at minimum vim+curl).
@@ -1243,12 +1138,9 @@ fn dk_bootstrap(engine: &str, name: &str, gui: bool) {
     } else {
         "HH_OLLAMA_HOST=http://host.docker.internal:11434"
     };
-    // HH_SBX_GUI=1 tells the bootstrap to also install + start the XFCE/noVNC
-    // desktop stack (heavy — only when the launcher asked for a GUI sandbox).
-    let gui_env = format!("HH_SBX_GUI={}", if gui { "1" } else { "0" });
     let child = Command::new(engine)
         .args([
-            "exec", "-i", "-e", &pkgs_env, "-e", gateway, "-e", &gui_env, name, "bash", "-s",
+            "exec", "-i", "-e", &pkgs_env, "-e", gateway, name, "bash", "-s",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1292,7 +1184,7 @@ fn mp_revoke_sudo(name: &str, u: &str) {
 /// Provision a real unix account per clergy member inside the VM/container and
 /// make the owner a superuser (sudoer). Returns the unix user the shared shell
 /// should run as. Blocking — call off the UI thread.
-pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String], gui: bool) -> String {
+pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) -> String {
     let run = unix_name(owner);
     match backend {
         Backend::Multipass => {
@@ -1315,7 +1207,7 @@ pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String], 
             // sandbox comes up usable instead of bare. The script also refreshes
             // the apt index (base images ship without /var/lib/apt/lists) and is
             // idempotent + sentinel-guarded, so re-provisions stay fast.
-            dk_bootstrap(engine, name, gui);
+            dk_bootstrap(engine, name);
             for m in members {
                 let u = unix_name(m);
                 if !u.is_empty() {
