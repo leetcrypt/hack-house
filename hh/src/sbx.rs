@@ -26,6 +26,11 @@ const SBX_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbo
 const SBX_TOOLS_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbox-tools.json");
 /// Creates a fresh, cloud-init-provisioned Ubuntu VirtualBox VM (hh/scripts/).
 const VBOX_NEW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-new.sh");
+/// Browse + locally-build VMs from the curated library (hh/scripts/).
+const VBOX_LIBRARY_SH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-library.sh");
+/// The library manifest: pointers (URLs/pages) to VMs, never the images. The
+/// loader cross-references `list_vms` to mark which are already built locally.
+const VBOX_LIBRARY_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-library.json");
 
 /// Is the `docker` binary installed? (`docker --version` succeeds.) This is a
 /// weaker check than `docker_daemon_up`: the CLI can be present while the daemon
@@ -377,6 +382,121 @@ pub fn vbox_new(name: &str, user: &str) -> Result<String> {
         Some(p) => format!("{last} · {}", p.trim()),
         None => last.to_string(),
     })
+}
+
+/// Names of VMs that are currently running (`VBoxManage list runningvms`), so the
+/// `/sbx vms` listing can flag which of the registered VMs are live.
+pub fn running_vms() -> Vec<String> {
+    Command::new("VBoxManage")
+        .args(["list", "runningvms"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let start = l.find('"')? + 1;
+                    let end = l[start..].find('"')? + start;
+                    Some(l[start..end].to_string())
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---- VM library (curated pointers; built locally on demand) -----------------
+//
+// The repo ships scripts/vbox-library.json — POINTERS only (download URLs/pages),
+// never the multi-GB images. Choosing a VM builds it on the caller's own machine
+// via scripts/vbox-library.sh. Here we parse the manifest for listing/info; the
+// heavy build is shelled out to the script (which already handles download +
+// VBoxManage create/import + boot, with rollback).
+
+/// One curated VM as declared in the manifest. Only the fields we surface in the
+/// TUI are deserialized; the rest of the JSON (specs, firmware, etc.) is consumed
+/// by the build script.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct LibraryVm {
+    pub id: String,
+    pub name: String,
+    pub os: String,
+    pub size: String,
+    #[serde(default)]
+    pub page: String,
+    #[serde(default)]
+    pub notes: String,
+    /// Filled in by `vbox_library()` (not in the JSON): is a VM of this name
+    /// already registered in VirtualBox on this machine?
+    #[serde(skip)]
+    pub installed: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct LibraryManifest {
+    vms: Vec<LibraryVm>,
+}
+
+/// Parse the VM library manifest, marking each entry `installed` if a VM of that
+/// display name is already registered locally (`list_vms`). The catalog is the
+/// same for everyone; `installed` is per-machine, so this works identically for a
+/// host or any room member — VirtualBox VMs are always local to the caller.
+pub fn vbox_library() -> Result<Vec<LibraryVm>> {
+    let text = std::fs::read_to_string(VBOX_LIBRARY_JSON)
+        .with_context(|| format!("reading VM library manifest ({VBOX_LIBRARY_JSON})"))?;
+    let manifest: LibraryManifest =
+        serde_json::from_str(&text).context("parsing vbox-library.json")?;
+    let have = list_vms().unwrap_or_default();
+    Ok(manifest
+        .vms
+        .into_iter()
+        .map(|mut v| {
+            v.installed = have.iter().any(|n| n == &v.name);
+            v
+        })
+        .collect())
+}
+
+/// Look up a single library entry by its id (with `installed` resolved).
+pub fn library_vm(id: &str) -> Option<LibraryVm> {
+    vbox_library().ok()?.into_iter().find(|v| v.id == id)
+}
+
+/// Build a library VM locally by driving scripts/vbox-library.sh `--install`.
+/// Blocking and potentially slow (large download); run off the UI thread. No
+/// sudo is needed — VBoxManage create/import run as the user. `iso` supplies a
+/// locally-downloaded installer for entries with no auto-download (e.g. Windows).
+/// Returns the script's final status line(s).
+pub fn vbox_library_install(id: &str, iso: Option<String>) -> Result<String> {
+    let mut cmd = Command::new("bash");
+    cmd.arg(VBOX_LIBRARY_SH).args(["--install", id, "--yes"]);
+    if let Some(path) = iso.as_deref() {
+        cmd.args(["--iso", path]);
+    }
+    let out = cmd
+        .output()
+        .context("running vbox-library.sh (is bash available?)")?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        // The script narrates on stderr and ends with a ✖ reason / pointer.
+        let reason = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("build failed")
+            .trim();
+        anyhow::bail!("{reason}");
+    }
+    // Surface the final ✓/ⓘ status line.
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|l| {
+            let t = l.trim_start();
+            t.starts_with('✓') || t.starts_with('ⓘ')
+        })
+        .unwrap_or("done")
+        .trim();
+    Ok(last.to_string())
 }
 
 /// A running hypervisor that holds the CPU's VT-x/VMX root mode. While one is

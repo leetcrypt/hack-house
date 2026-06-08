@@ -294,6 +294,10 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "build a FRESH Ubuntu VM from a cloud image (cloud-init installs the dev toolchain)",
                 ),
                 kv(
+                    "/sbx vmlib [<id> [install]]",
+                    "VM library — catalog of installable VMs (Win11, macOS, Kali…); <id> install builds it LOCALLY on your machine (pointers only, no images bundled)",
+                ),
+                kv(
                     "/sbx vbox [gui] <vm> [yes]",
                     "boot a VirtualBox VM's GUI on YOUR machine (non-host appends yes to install/import first)",
                 ),

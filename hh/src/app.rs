@@ -2291,15 +2291,23 @@ fn handle_command(
                             "VirtualBox isn't installed — install it with `/sbx gui <vm> --install`, or run ./scripts/ensure-vbox.sh".to_string()
                         })?;
                         let vms = sbx::list_vms().map_err(|e| e.to_string())?;
-                        Ok::<_, String>((ver, vms))
+                        let running = sbx::running_vms();
+                        Ok::<_, String>((ver, vms, running))
                     })
                     .await;
                     let _ = match res {
-                        Ok(Ok((ver, v))) if !v.is_empty() => tx.send(Net::Sys(format!(
+                        Ok(Ok((ver, v, running))) if !v.is_empty() => tx.send(Net::Sys(format!(
                             "VirtualBox {ver} detected · VMs: {}",
-                            v.join(", ")
+                            v.iter()
+                                .map(|n| if running.iter().any(|r| r == n) {
+                                    format!("{n} ▶")
+                                } else {
+                                    n.clone()
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ))),
-                        Ok(Ok((ver, _))) => tx.send(Net::Sys(format!(
+                        Ok(Ok((ver, _, _))) => tx.send(Net::Sys(format!(
                             "VirtualBox {ver} detected · no VMs registered"
                         ))),
                         Ok(Err(e)) => tx.send(Net::Err(e)),
@@ -2401,6 +2409,102 @@ fn handle_command(
                     }
                 }
             }
+            Some("vmlib") => {
+                // VM library: a catalog of pointers to installable VMs (no
+                // images are bundled). Bare `/sbx vmlib` lists the catalog
+                // marking which are already installed locally; `/sbx vmlib <id>`
+                // shows the pointer/notes; `/sbx vmlib <id> install [--iso path]`
+                // builds the chosen VM locally on the caller's own machine.
+                let args: Vec<&str> = p.collect();
+                let iso = args
+                    .iter()
+                    .position(|a| *a == "--iso")
+                    .and_then(|i| args.get(i + 1).copied())
+                    .map(str::to_string);
+                let mut pos = args.iter().copied().filter(|a| !a.starts_with('-'));
+                match pos.next() {
+                    None => {
+                        // Catalog listing
+                        let tx = app_tx.clone();
+                        tokio::spawn(async move {
+                            let res =
+                                tokio::task::spawn_blocking(sbx::vbox_library).await;
+                            let _ = match res {
+                                Ok(Ok(vms)) => {
+                                    let body = vms
+                                        .iter()
+                                        .map(|v| {
+                                            let mark = if v.installed { "✓" } else { "↓" };
+                                            format!("{mark} {} — {} ({})", v.id, v.name, v.os)
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    tx.send(Net::Sys(format!(
+                                        "VM library (✓ installed · ↓ available) — `/sbx vmlib <id>` for details, `/sbx vmlib <id> install` to build locally:\n{body}"
+                                    )))
+                                }
+                                Ok(Err(e)) => tx.send(Net::Err(format!("vmlib: {e}"))),
+                                Err(e) => tx.send(Net::Err(format!("vmlib task: {e}"))),
+                            };
+                        });
+                    }
+                    Some(id) => {
+                        let id = id.to_string();
+                        let action = pos.next();
+                        if matches!(action, Some("install")) {
+                            app.sys(format!(
+                                "building VM '{id}' locally{}… (this downloads + provisions on your own machine; watch for a VirtualBox window)",
+                                iso.as_deref().map(|p| format!(" from {p}")).unwrap_or_default()
+                            ));
+                            let (tx, iso) = (app_tx.clone(), iso.clone());
+                            tokio::spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    sbx::vbox_library_install(&id, iso)
+                                })
+                                .await;
+                                let _ = match res {
+                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
+                                    Ok(Err(e)) => tx.send(Net::Err(format!("vmlib install failed: {e}"))),
+                                    Err(e) => tx.send(Net::Err(format!("vmlib install task: {e}"))),
+                                };
+                            });
+                        } else {
+                            // Info / pointer for one entry
+                            let tx = app_tx.clone();
+                            tokio::spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    sbx::library_vm(&id).ok_or(id)
+                                })
+                                .await;
+                                let _ = match res {
+                                    Ok(Ok(v)) => {
+                                        let state = if v.installed {
+                                            "already installed".to_string()
+                                        } else {
+                                            "available — `/sbx vmlib <id> install` to build locally".to_string()
+                                        };
+                                        let mut body = format!(
+                                            "{} ({}) · {} · {}\n{}",
+                                            v.name, v.id, v.os, v.size, state
+                                        );
+                                        if !v.notes.is_empty() {
+                                            body.push_str(&format!("\n{}", v.notes));
+                                        }
+                                        if !v.page.is_empty() {
+                                            body.push_str(&format!("\nsource: {}", v.page));
+                                        }
+                                        tx.send(Net::Sys(body))
+                                    }
+                                    Ok(Err(bad)) => tx.send(Net::Err(format!(
+                                        "no VM library entry '{bad}' — `/sbx vmlib` lists the catalog"
+                                    ))),
+                                    Err(e) => tx.send(Net::Err(format!("vmlib task: {e}"))),
+                                };
+                            });
+                        }
+                    }
+                }
+            }
             Some("gui") => {
                 // Convenience alias for `/sbx vbox gui <vm> [yes]` — opens a
                 // local VirtualBox VM's GUI on your own machine. Bare `/sbx gui`
@@ -2416,7 +2520,7 @@ fn handle_command(
                 }
             }
             other => {
-                let usage = "usage: /sbx <type> <option> — /sbx docker|podman|multipass|local [image] · /sbx vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx vbox new [name] (fresh VM) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>";
+                let usage = "usage: /sbx <type> <option> — /sbx docker|podman|multipass|local [image] · /sbx vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx vbox new [name] (fresh VM) · vmlib [<id> [install [--iso path]]] (VM library — build locally) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>";
                 // Bare `/sbx` → usage. An unrecognised subcommand → suggest the
                 // closest documented one before the usage line.
                 match other.and_then(|bad| closest(bad, SBX_SUBCOMMANDS).map(|s| (bad, s))) {
@@ -2686,7 +2790,7 @@ const KNOWN_COMMANDS: &[&str] = &[
 /// omitted so suggestions point at the documented form.
 const SBX_SUBCOMMANDS: &[&str] = &[
     "docker", "podman", "multipass", "local", "vbox", "stop", "save", "load", "snaps", "vms",
-    "vmsave", "vmload", "vmsnaps",
+    "vmsave", "vmload", "vmsnaps", "vmlib",
 ];
 
 /// Classic Levenshtein edit distance (insert/delete/substitute, each cost 1).
