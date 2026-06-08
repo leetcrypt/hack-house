@@ -152,9 +152,9 @@ pub struct SbxView {
     pub backend: String,
 }
 
-/// The arrow-navigable VirtualBox VM picker, opened by a bare `/sbx launch vbox`
+/// The arrow-navigable VirtualBox VM picker, opened by a bare `/sbx vbox`
 /// (or `/sbx gui`). Holds the locally-registered VM names and the highlighted
-/// row; Enter/Tab fills `/sbx launch vbox gui <vm>` into the input, Esc dismisses.
+/// row; Enter/Tab fills `/sbx vbox gui <vm>` into the input, Esc dismisses.
 #[derive(Clone)]
 pub struct VboxPicker {
     pub vms: Vec<String>,
@@ -185,6 +185,7 @@ pub struct PendingSudoLaunch {
     pub cols: u16,
     pub start_daemon: bool,
     pub install_first: bool,
+    pub gui: bool,
 }
 
 /// A local, masked sudo-password prompt. The typed password lives ONLY here —
@@ -410,7 +411,7 @@ impl App {
                 self.connected = true;
                 self.chat_scroll = 0;
                 self.sys(format!("joined as {} ⛧", self.me));
-                self.sys("/sbx launch <docker|multipass|vbox> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys("/sbx <docker|podman|multipass|vbox|local> [gui] · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => self.push_line(l),
             Net::Roster { users, capacity } => {
@@ -1036,6 +1037,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                             pending.cols,
                                             pending.start_daemon,
                                             pending.install_first,
+                                            pending.gui,
                                             Some(password),
                                             pty_tx.clone(),
                                             broker_tx.clone(),
@@ -1112,7 +1114,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 });
                             }
                         } else if app.vbox_picker.is_some() {
-                            // Modal VM picker (from a bare `/sbx launch vbox`): arrow
+                            // Modal VM picker (from a bare `/sbx vbox`): arrow
                             // keys move the highlight, Enter/Tab boots the selected VM
                             // on this machine (host-frictionless path; a non-host who
                             // needs install/import is steered to re-issue with `yes`),
@@ -1218,7 +1220,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 announced_dims = None; // re-sync PTY to the new height
                                 app.sys(format!("⛧ {}", app.layout.describe()));
                             } else {
-                                app.sys("no sandbox to fullscreen — /sbx launch first");
+                                app.sys("no sandbox to fullscreen — /sbx <type> first");
                             }
                         } else if k.code == KeyCode::F(5) {
                             // Enter/cycle interactive layout editing: pick a pane to
@@ -1429,7 +1431,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             {
                                 // A received VirtualBox appliance auto-imports so the VM
                                 // registers locally and the recipient can immediately
-                                // `/sbx launch vbox gui <vm>`. Off-thread (VBoxManage import
+                                // `/sbx vbox gui <vm>`. Off-thread (VBoxManage import
                                 // is slow); reports back via the app channel.
                                 let ext = path
                                     .extension()
@@ -1445,7 +1447,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                         .await;
                                         let _ = match res {
                                             Ok(Ok(vm)) => tx.send(Net::Sys(format!(
-                                                "⛧ imported VM ‘{vm}’ — `/sbx launch vbox gui {vm}` to boot it"
+                                                "⛧ imported VM ‘{vm}’ — `/sbx vbox gui {vm}` to boot it"
                                             ))),
                                             Ok(Err(e)) => tx.send(Net::Sys(format!(
                                                 "(received .ova not auto-imported: {e})"
@@ -1500,11 +1502,12 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             // The status/data handlers are idempotent, so members
                             // already in the room aren't disturbed by the replay.
                             if broker.is_some() {
-                                if let (Some(v), Some((be, _))) = (&app.sandbox, &broker_meta) {
+                                if let (Some(v), Some((be, sbx_name))) = (&app.sandbox, &broker_meta) {
                                     let (rows, cols) = v.parser.screen().size();
                                     send_frame(&out_tx, &session.room, json!({
                                         "_sbx":"status","state":"ready",
-                                        "backend": be.label(),"rows": rows,"cols": cols
+                                        "backend": be.label(),"engine": be.engine(),"name": sbx_name,
+                                        "rows": rows,"cols": cols
                                     }));
                                     let snap = v.parser.screen().contents_formatted();
                                     send_frame(&out_tx, &session.room, json!({
@@ -1541,7 +1544,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                 match msg {
                     Some(BrokerMsg::Ready { sb, backend, name, rows, cols }) => {
                         broker = Some(sb);
-                        broker_meta = Some((backend, name));
+                        broker_meta = Some((backend, name.clone()));
                         announced_dims = Some((rows, cols));
                         launching = false;
                         // Local sandbox view — broker renders straight from the PTY.
@@ -1562,7 +1565,8 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             }
                         }
                         send_frame(&out_tx, &session.room, json!({
-                            "_sbx":"status","state":"ready","backend": backend.label(), "rows": rows, "cols": cols
+                            "_sbx":"status","state":"ready","backend": backend.label(),
+                            "engine": backend.engine(),"name": name,"rows": rows,"cols": cols
                         }));
                         broadcast_acl(&out_tx, &session.room, &app);
                     }
@@ -1582,12 +1586,13 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     app.sys("⛧ websocket re-attached — syncing…");
                                     // If we host the sandbox, re-announce it so the
                                     // rest of the house re-syncs the shared shell.
-                                    if let Some((be, _)) = &broker_meta {
+                                    if let Some((be, sbx_name)) = &broker_meta {
                                         if let Some(v) = &app.sandbox {
                                             let (rows, cols) = v.parser.screen().size();
                                             send_frame(&out_tx, &session.room, json!({
                                                 "_sbx":"status","state":"ready",
-                                                "backend": be.label(),"rows": rows,"cols": cols
+                                                "backend": be.label(),"engine": be.engine(),"name": sbx_name,
+                                                "rows": rows,"cols": cols
                                             }));
                                             broadcast_acl(&out_tx, &session.room, &app);
                                         }
@@ -1851,7 +1856,7 @@ fn handle_command(
     } else if line == "/drive" {
         // Mobile-friendly alternative to F2 (no function key needed).
         if app.sandbox.is_none() {
-            app.sys("no sandbox running — /sbx launch first");
+            app.sys("no sandbox running — /sbx <type> first");
         } else if app.can_drive() {
             app.driving = true;
             app.sys("⛧ drive mode ON — type into the shell (Esc reaches vim etc.) · press F2 to release");
@@ -1908,12 +1913,27 @@ fn handle_command(
     } else if let Some(rest) = line.strip_prefix("/sbx") {
         let mut p = rest.split_whitespace();
         match p.next() {
-            Some("launch") => {
+            // Grammar: `/sbx <vm type> <option>` — the backend leads, e.g.
+            // `/sbx podman gui`, `/sbx docker`, `/sbx multipass`, `/sbx local`.
+            // vbox is the exception that takes extra options (a VM name, `new`,
+            // confirm): `/sbx vbox gui <vm>`, `/sbx vbox new [name]`.
+            // `launch` stays accepted as a transitional alias (`/sbx launch
+            // <backend> …`) so older muscle memory and help strings keep working.
+            Some(
+                sub @ ("launch" | "docker" | "podman" | "multipass" | "local" | "vbox"
+                | "virtualbox"),
+            ) => {
                 // `--start` (alias `--start-daemon` / `-y`) opts in to booting a
                 // stopped Docker daemon; everything else is positional. The first
-                // positional selects the backend: docker | multipass | vbox |
-                // local. Each runs on the *invoker's* own machine.
-                let args: Vec<&str> = p.collect();
+                // positional selects the backend: docker | podman | multipass |
+                // vbox | local. Each runs on the *invoker's* own machine.
+                let mut args: Vec<&str> = p.collect();
+                // Backend-led form: the matched token IS the backend, so push it to
+                // the front of the positional args where the `first` logic below
+                // expects it. The `launch` alias leaves the backend in `args` as-is.
+                if sub != "launch" {
+                    args.insert(0, sub);
+                }
                 let start_daemon = args
                     .iter()
                     .any(|a| matches!(*a, "--start" | "--start-daemon" | "-y"));
@@ -1921,28 +1941,32 @@ fn handle_command(
                 // `install` opts in to installing it (detect-then-install). It's
                 // a positional keyword (not the image), so filter it out below.
                 let want_install = args.iter().any(|a| matches!(*a, "install" | "--install"));
+                // `gui` option (`/sbx podman gui`): provision an XFCE/noVNC desktop
+                // in the container and publish it on the host loopback. Keyword, not
+                // an image, so it's filtered out of the positionals like `install`.
+                let want_gui = args.iter().any(|a| matches!(*a, "gui"));
                 let mut pos = args
                     .iter()
                     .copied()
-                    .filter(|a| !a.starts_with('-') && !matches!(*a, "install"));
+                    .filter(|a| !a.starts_with('-') && !matches!(*a, "install" | "gui"));
                 let first = pos.next();
                 if matches!(first, Some("virtualbox") | Some("vbox")) {
                     // VirtualBox runs locally in its own GUI — host & guest each
                     // open their own copy, nothing is relayed. It's independent of
                     // the shared-PTY sandbox, so it bypasses the "already running"
-                    // guard. Grammar: `/sbx launch vbox [gui] <vm> [yes]`; a bare
-                    // `/sbx launch vbox` opens the arrow-navigable VM picker.
+                    // guard. Grammar: `/sbx vbox [gui] <vm> [yes]`; a bare
+                    // `/sbx vbox` opens the arrow-navigable VM picker.
                     let mut rest = pos.peekable();
                     if rest.peek() == Some(&"new") {
-                        // `/sbx launch vbox new [name]` — build a brand-new VM from
+                        // `/sbx vbox new [name]` — build a brand-new VM from
                         // a cloud image (cloud-init toolchain), not an existing one.
                         rest.next();
                         let name = rest.next().unwrap_or("hh-vbox").to_string();
                         launch_vbox_new(app, name, app.me.clone(), app_tx);
                     } else {
-                        if rest.peek() == Some(&"gui") {
-                            rest.next(); // optional `gui` keyword (sugar)
-                        }
+                        // The optional `gui` keyword is already stripped from `pos`
+                        // (it's a global option filter), so the next positional is
+                        // the VM name directly.
                         match rest.next() {
                             Some(vm) => {
                                 let confirmed = rest
@@ -1962,18 +1986,31 @@ fn handle_command(
                         .next()
                         .map(str::to_string)
                         .unwrap_or_else(|| backend.default_image().to_string());
-                    // Is this backend's binary present? Docker/Multipass can be
-                    // installed on consent; Local needs nothing and vbox is
-                    // handled in its own branch above.
+                    // Is this backend's binary present? Docker/Podman/Multipass can
+                    // be installed on consent; Local needs nothing and vbox is
+                    // handled in its own branch above. Podman is daemonless and
+                    // rootless, so unlike Docker it skips the daemon/sudo gates
+                    // below entirely (those are guarded by `== Backend::Docker`).
                     let installed = match backend {
                         sbx::Backend::Docker => sbx::docker_installed(),
+                        sbx::Backend::Podman => sbx::podman_installed(),
                         sbx::Backend::Multipass => sbx::multipass_installed(),
                         _ => true,
                     };
                     let token = first.unwrap_or("docker");
+                    // GUI is a container-only feature (headless containers get a
+                    // published noVNC port). Asking for it on multipass/local is a
+                    // no-op we flag rather than silently drop.
+                    let gui = want_gui && matches!(backend, sbx::Backend::Docker | sbx::Backend::Podman);
+                    if want_gui && !gui {
+                        app.sys(format!(
+                            "`gui` only applies to docker/podman sandboxes — ignoring it for {}",
+                            backend.label()
+                        ));
+                    }
                     if !installed && !want_install {
                         app.err(format!(
-                            "{} is not installed — retry with `/sbx launch {token} install` to install it (needs sudo)",
+                            "{} is not installed — retry with `/sbx {token} install` to install it (needs sudo)",
                             backend.label()
                         ));
                     } else if installed
@@ -1981,7 +2018,7 @@ fn handle_command(
                         && !start_daemon
                         && !sbx::docker_daemon_up()
                     {
-                        app.err("docker daemon is not running — retry with `/sbx launch docker --start` to boot it (sudo), or run ./scripts/ensure-docker.sh in a terminal first");
+                        app.err("docker daemon is not running — retry with `/sbx docker --start` to boot it (sudo), or run ./scripts/ensure-docker.sh in a terminal first");
                     } else {
                         // install_first ⇒ binary missing + consent given: install
                         // it off-thread before provisioning (a fresh Docker
@@ -2014,6 +2051,7 @@ fn handle_command(
                                     cols,
                                     start_daemon,
                                     install_first,
+                                    gui,
                                 },
                             });
                             app.sys("🔒 sudo password needed — type it here (hidden), Enter to launch · Esc cancels. Local only: never sent to the room.");
@@ -2030,6 +2068,12 @@ fn handle_command(
                                     backend.label()
                                 ));
                             }
+                            if gui {
+                                app.sys(format!(
+                                    "🖥 gui sandbox: installing the desktop (heavy first pull) — when it's up, open http://127.0.0.1:{} in a browser (noVNC, default password 'hackhouse')",
+                                    sbx::GUI_PORT
+                                ));
+                            }
                             spawn_launch(
                                 backend,
                                 image,
@@ -2039,6 +2083,7 @@ fn handle_command(
                                 cols,
                                 start_daemon,
                                 install_first,
+                                gui,
                                 None,
                                 pty_tx.clone(),
                                 broker_tx.clone(),
@@ -2109,7 +2154,7 @@ fn handle_command(
                 }
             }
             Some("load") => match p.next() {
-                None => app.sys("usage: /sbx load <label>  (a docker or multipass snapshot saved via /sbx save)"),
+                None => app.sys("usage: /sbx load <label>  (a docker, podman or multipass snapshot saved via /sbx save)"),
                 Some(label) if !is_snap_label(label) => {
                     app.sys("snapshot label must be alphanumerics, '.', '_' or '-'");
                 }
@@ -2141,7 +2186,7 @@ fn handle_command(
                             match kind {
                                 sbx::SnapKind::Docker => {
                                     if !sbx::docker_daemon_up() {
-                                        let _ = atx.send(Net::Err("docker daemon is not running — `/sbx launch docker --start` once to boot it, then retry".into()));
+                                        let _ = atx.send(Net::Err("docker daemon is not running — `/sbx docker --start` once to boot it, then retry".into()));
                                         let _ = btx.send(BrokerMsg::Failed);
                                         return;
                                     }
@@ -2149,7 +2194,17 @@ fn handle_command(
                                     let _ = atx.send(Net::Sys(format!("loading docker sandbox from {image}…")));
                                     spawn_launch(
                                         sbx::Backend::Docker, image, owner, members, rows,
-                                        cols, false, false, None, pty, btx, atx,
+                                        cols, false, false, false, None, pty, btx, atx,
+                                    );
+                                }
+                                sbx::SnapKind::Podman => {
+                                    // Podman is daemonless — no daemon-up check; the
+                                    // committed image reruns directly via the engine.
+                                    let image = format!("{}:{}", sbx::SNAP_REPO, label);
+                                    let _ = atx.send(Net::Sys(format!("loading podman sandbox from {image}…")));
+                                    spawn_launch(
+                                        sbx::Backend::Podman, image, owner, members, rows,
+                                        cols, false, false, false, None, pty, btx, atx,
                                     );
                                 }
                                 sbx::SnapKind::Multipass => {
@@ -2164,7 +2219,7 @@ fn handle_command(
                                             spawn_launch(
                                                 sbx::Backend::Multipass,
                                                 sbx::Backend::Multipass.default_image().to_string(),
-                                                owner, members, rows, cols, false, false, None, pty, btx, atx,
+                                                owner, members, rows, cols, false, false, false, None, pty, btx, atx,
                                             );
                                         }
                                         Ok(Err(e)) => {
@@ -2324,9 +2379,9 @@ fn handle_command(
                 }
             }
             Some("gui") => {
-                // Convenience alias for `/sbx launch vbox gui <vm> [yes]` — opens a
+                // Convenience alias for `/sbx vbox gui <vm> [yes]` — opens a
                 // local VirtualBox VM's GUI on your own machine. Bare `/sbx gui`
-                // opens the VM picker, same as `/sbx launch vbox`.
+                // opens the VM picker, same as `/sbx vbox`.
                 let mut gpos = p.filter(|a| !a.starts_with('-'));
                 match gpos.next() {
                     Some(vm) => {
@@ -2337,9 +2392,17 @@ fn handle_command(
                     None => open_vbox_picker(app),
                 }
             }
-            _ => app.sys(
-                "usage: /sbx launch vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx launch vbox new [name] (fresh VM) · /sbx gui <vm> alias · launch <docker|multipass> [image] (or local) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>",
-            ),
+            other => {
+                let usage = "usage: /sbx <type> <option> — /sbx docker|podman|multipass|local [gui] [image] (gui = noVNC desktop, docker/podman only) · /sbx vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx vbox new [name] (fresh VM) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>";
+                // Bare `/sbx` → usage. An unrecognised subcommand → suggest the
+                // closest documented one before the usage line.
+                match other.and_then(|bad| closest(bad, SBX_SUBCOMMANDS).map(|s| (bad, s))) {
+                    Some((bad, s)) => {
+                        app.sys(format!("unknown `/sbx {bad}` — did you mean `/sbx {s}`?  {usage}"))
+                    }
+                    None => app.sys(usage.to_string()),
+                }
+            }
         }
     } else if let Some(rest) = line.strip_prefix("/unsudo") {
         let target = rest.trim();
@@ -2433,12 +2496,32 @@ fn handle_command(
         if agent.is_some() {
             app.sys("an AI agent is already running from this client — /ai stop first");
         } else {
-            // A trailing `allow` flag auto-grants the agent sandbox drive on launch.
-            let raw = rest.trim();
-            let (raw, grant_sbx) = match raw.strip_suffix("allow") {
-                Some(head) if head.is_empty() || head.ends_with(' ') => (head.trim(), true),
-                _ => (raw, false),
-            };
+            // Trailing flag words (any order): `allow` auto-grants the agent
+            // sandbox drive on launch; `plain` selects the legacy one-shot
+            // injector instead of the default Goose harness.
+            let mut raw = rest.trim();
+            let mut grant_sbx = false;
+            let mut plain = false;
+            loop {
+                if let Some(head) = raw
+                    .strip_suffix("allow")
+                    .filter(|h| h.is_empty() || h.ends_with(' '))
+                {
+                    grant_sbx = true;
+                    raw = head.trim();
+                    continue;
+                }
+                if let Some(head) = raw
+                    .strip_suffix("plain")
+                    .filter(|h| h.is_empty() || h.ends_with(' '))
+                {
+                    plain = true;
+                    raw = head.trim();
+                    continue;
+                }
+                break;
+            }
+            let harness = if plain { Some("simple") } else { None };
             // A bare name (no ':' tag, no '/' path) is a models.toml profile;
             // anything else is treated as a literal Ollama model tag.
             let (profile, model): (Option<&str>, &str) = if raw.is_empty() {
@@ -2452,7 +2535,7 @@ fn handle_command(
             // profile keeps its label; a direct Ollama model uses its tag
             // (e.g. "qwen2.5:3b" — model name + parameter size).
             let name = profile.unwrap_or(model);
-            match spawn_agent(params, &app.password, name, profile, model) {
+            match spawn_agent(params, &app.password, name, profile, model, harness) {
                 Ok(child) => {
                     *agent = Some(child);
                     app.agent_name = Some(name.to_string());
@@ -2461,8 +2544,9 @@ fn handle_command(
                         Some(p) => format!("profile {p}"),
                         None => format!("ollama/{model}"),
                     };
+                    let hdesc = if plain { ", simple harness" } else { "" };
                     app.sys(format!(
-                        "⛧ summoning {name} ({desc})… it will announce when online"
+                        "⛧ summoning {name} ({desc}{hdesc})… it will announce when online"
                     ));
                     if grant_sbx {
                         // Grant now if a sandbox is already running; otherwise the
@@ -2512,6 +2596,21 @@ fn handle_command(
                 let _ = tx.send(Net::Sys(msg));
             });
         }
+    } else if line.starts_with('/') {
+        // Leading slash but no command branch matched. Either a known command
+        // family that intentionally falls through to chat (notably `/ai
+        // <question>`, which a running agent reads from the room), or a typo we
+        // should help with instead of silently broadcasting as a chat message.
+        let cmd = line.split_whitespace().next().unwrap_or(line);
+        if KNOWN_COMMANDS.contains(&cmd) {
+            if app.connected {
+                let _ = out_tx.send(WsMsg::Text(room.encrypt(line.as_bytes())));
+            }
+        } else if let Some(s) = closest(cmd, KNOWN_COMMANDS) {
+            app.sys(format!("unknown command ‘{cmd}’ — did you mean `{s}`?  (/help lists all)"));
+        } else {
+            app.sys(format!("unknown command ‘{cmd}’ — /help lists all commands"));
+        }
     } else if !line.is_empty() && app.connected {
         let _ = out_tx.send(WsMsg::Text(room.encrypt(line.as_bytes())));
     }
@@ -2548,6 +2647,55 @@ fn local_ollama_models() -> Result<Vec<String>, String> {
         })
         .unwrap_or_default();
     Ok(models)
+}
+
+/// Every top-level slash command (the leading token). Used both to recognise a
+/// known command family that legitimately falls through to chat (e.g. `/ai
+/// <question>`) and as the candidate set for the "did you mean" suggester.
+const KNOWN_COMMANDS: &[&str] = &[
+    "/help", "/?", "/clear", "/cls", "/pw", "/password", "/theme", "/layout", "/drive",
+    "/sendroom", "/send", "/accept", "/reject", "/sbx", "/unsudo", "/sudo", "/grant", "/revoke",
+    "/ai",
+];
+
+/// Canonical `/sbx` subcommands (backends + actions) for the subcommand-level
+/// "did you mean". Aliases (`launch`, `virtualbox`, `snapshots`, `gui`) are
+/// omitted so suggestions point at the documented form.
+const SBX_SUBCOMMANDS: &[&str] = &[
+    "docker", "podman", "multipass", "local", "vbox", "stop", "save", "load", "snaps", "vms",
+    "vmsave", "vmload", "vmsnaps",
+];
+
+/// Classic Levenshtein edit distance (insert/delete/substitute, each cost 1).
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The nearest candidate to `input` by edit distance, if one is close enough to
+/// be a plausible typo: distance ≤ 3 and strictly less than the input length (so
+/// a tiny stray token doesn't "match" everything). Case-insensitive; ties go to
+/// the first candidate. Returns `None` when nothing is close.
+fn closest<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let input = input.to_ascii_lowercase();
+    let len = input.chars().count();
+    candidates
+        .iter()
+        .map(|c| (levenshtein(&input, &c.to_ascii_lowercase()), *c))
+        .filter(|(d, _)| *d <= 3 && *d < len)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c)
 }
 
 /// A safe snapshot label — compatible with both a Docker image tag and a
@@ -2597,7 +2745,7 @@ fn find_local_appliance(vm: &str) -> Option<std::path::PathBuf> {
 /// Empty/uninstalled cases steer the user instead of opening an empty list.
 fn open_vbox_picker(app: &mut App) {
     if !sbx::vbox_installed() {
-        app.sys("VirtualBox isn't installed — `/sbx launch vbox gui <vm> yes` installs it, or run ./scripts/ensure-vbox.sh");
+        app.sys("VirtualBox isn't installed — `/sbx vbox gui <vm> yes` installs it, or run ./scripts/ensure-vbox.sh");
         return;
     }
     match sbx::list_vms() {
@@ -2606,7 +2754,7 @@ fn open_vbox_picker(app: &mut App) {
             app.sys("⛧ pick a VM — ↑/↓ move · Enter/Tab choose · Esc dismiss");
         }
         Ok(_) => app.sys(
-            "no VirtualBox VMs registered — a host can /send you a .ova, then `/sbx launch vbox gui <vm> yes` to import it",
+            "no VirtualBox VMs registered — a host can /send you a .ova, then `/sbx vbox gui <vm> yes` to import it",
         ),
         Err(e) => app.err(format!("listing VMs: {e}")),
     }
@@ -2614,7 +2762,7 @@ fn open_vbox_picker(app: &mut App) {
 
 /// Launch (or pull-then-launch) a local VirtualBox VM's GUI on the caller's OWN
 /// machine — nothing is relayed; every member opens their own copy. Shared by
-/// `/sbx launch vbox gui <vm>` and the `/sbx gui <vm>` alias.
+/// `/sbx vbox gui <vm>` and the `/sbx gui <vm>` alias.
 ///
 /// Frictionless for a "host" who already has VirtualBox AND the VM imported with
 /// no other VM holding VT-x: it just boots. A non-host missing VirtualBox or the
@@ -2695,7 +2843,7 @@ fn launch_vbox_gui(
                 Some(p) => steps.push(format!("import {}", p.display())),
                 None => {
                     app.sys(format!(
-                        "no local appliance for ‘{vm}’ yet — have the host export it (`/sbx vmsave {vm} --local`) and /send you the .ova, then `/sbx launch vbox gui {vm} yes`"
+                        "no local appliance for ‘{vm}’ yet — have the host export it (`/sbx vmsave {vm} --local`) and /send you the .ova, then `/sbx vbox gui {vm} yes`"
                     ));
                     return;
                 }
@@ -2705,7 +2853,7 @@ fn launch_vbox_gui(
             steps.push(format!("stop {} other VM(s) holding VT-x", conflicts.len()));
         }
         app.sys(format!(
-            "opening ‘{vm}’ on YOUR machine will {}.  →  `/sbx launch vbox gui {vm} yes` to proceed",
+            "opening ‘{vm}’ on YOUR machine will {}.  →  `/sbx vbox gui {vm} yes` to proceed",
             steps.join(", ")
         ));
         return;
@@ -2714,7 +2862,7 @@ fn launch_vbox_gui(
     // Confirmed. Refuse VT-x holders we can't cleanly restart rather than kill them.
     if let Some(bad) = conflicts.iter().find(|h| !h.stoppable) {
         app.err(format!(
-            "can't free VT-x automatically — {} is running and I won't kill it. Stop it yourself, then retry `/sbx launch vbox gui {vm} yes`.",
+            "can't free VT-x automatically — {} is running and I won't kill it. Stop it yourself, then retry `/sbx vbox gui {vm} yes`.",
             bad.label
         ));
         return;
@@ -2801,6 +2949,9 @@ fn spawn_launch(
     cols: u16,
     start_daemon: bool,
     install_first: bool,
+    // GUI sandbox: publish noVNC on the host loopback and provision the desktop
+    // stack inside the container. Only honoured for Docker/Podman.
+    gui: bool,
     // The sudo password captured by the in-TUI masked prompt, if escalation was
     // needed. Local-only: it is fed to `sudo -S` via stdin inside the blocking
     // install/prepare steps and never enters chat, the PTY, or any outbound frame.
@@ -2817,6 +2968,7 @@ fn spawn_launch(
             let pw = password.clone();
             let res = tokio::task::spawn_blocking(move || match backend {
                 sbx::Backend::Docker => sbx::ensure_docker_install(pw),
+                sbx::Backend::Podman => sbx::ensure_podman_install(),
                 sbx::Backend::Multipass => sbx::ensure_multipass_install(),
                 _ => Ok(()),
             })
@@ -2830,7 +2982,7 @@ fn spawn_launch(
         let name = SBX_NAME.to_string();
         let prep = {
             let (n, img, pw) = (name.clone(), image.clone(), password.clone());
-            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon, pw))
+            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon, pw, gui))
                 .await
         };
         if let Err(e) = prep.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))) {
@@ -2841,7 +2993,7 @@ fn spawn_launch(
         // Provision real unix accounts (owner = sudoer) → the shell's run-user.
         let run_user = {
             let (n, o, ms) = (name.clone(), owner.clone(), members.clone());
-            tokio::task::spawn_blocking(move || sbx::provision(backend, &n, &o, &ms))
+            tokio::task::spawn_blocking(move || sbx::provision(backend, &n, &o, &ms, gui))
                 .await
                 .unwrap_or_default()
         };
@@ -2904,6 +3056,7 @@ fn spawn_agent(
     name: &str,
     profile: Option<&str>,
     model: &str,
+    harness: Option<&str>,
 ) -> std::result::Result<std::process::Child, String> {
     use std::process::{Command, Stdio};
     let root = find_repo_root().ok_or_else(|| {
@@ -2940,6 +3093,11 @@ fn spawn_agent(
                 .arg("--model")
                 .arg(model);
         }
+    }
+    // Override the agent's default `!task` harness (goose) when the launcher
+    // asked for the legacy one-shot injector via `/ai start … plain`.
+    if let Some(h) = harness {
+        cmd.arg("--harness").arg(h);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))

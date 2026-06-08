@@ -49,7 +49,7 @@ for bin in python3 cargo; do
     if have "$bin"; then echo "  ✓ $bin ($($bin --version 2>&1 | head -1))"
     else echo "  ✖ $bin — REQUIRED"; missing=1; fi
 done
-for bin in tmux docker multipass direnv; do
+for bin in tmux docker podman multipass direnv goose; do
     if have "$bin"; then echo "  ✓ $bin (optional)"
     else echo "  · $bin not found (optional)"; fi
 done

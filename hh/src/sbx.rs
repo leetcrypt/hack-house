@@ -16,6 +16,8 @@ use std::sync::mpsc;
 const ENSURE_DOCKER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-docker.sh");
 /// Detect-first Multipass installer (ships in hh/scripts/).
 const ENSURE_MULTIPASS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-multipass.sh");
+/// Detect-first Podman installer (apt; rootless preflight). Ships in hh/scripts/.
+const ENSURE_PODMAN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-podman.sh");
 /// Detect-first VirtualBox installer (ships in hh/scripts/).
 const ENSURE_VBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-vbox.sh");
 /// Baseline dev-toolchain installer run inside Docker sandboxes (hh/scripts/).
@@ -24,6 +26,11 @@ const SBX_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbo
 const SBX_TOOLS_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbox-tools.json");
 /// Creates a fresh, cloud-init-provisioned Ubuntu VirtualBox VM (hh/scripts/).
 const VBOX_NEW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-new.sh");
+
+/// Port a GUI sandbox serves noVNC on, both inside the container and on the host
+/// loopback (`-p 127.0.0.1:6080:6080`). The bootstrap bridges the container's VNC
+/// server (:1 / 5901) to this port via websockify; the owner opens it in a browser.
+pub const GUI_PORT: u16 = 6080;
 
 /// Is the `docker` binary installed? (`docker --version` succeeds.) This is a
 /// weaker check than `docker_daemon_up`: the CLI can be present while the daemon
@@ -42,6 +49,19 @@ pub fn docker_installed() -> bool {
 pub fn docker_daemon_up() -> bool {
     Command::new("docker")
         .arg("info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Is the `podman` binary installed? (`podman --version` succeeds.) Podman is
+/// daemonless, so unlike Docker there is no separate daemon-up check: if the CLI
+/// is present a rootless container can launch immediately (no daemon, no sudo).
+pub fn podman_installed() -> bool {
+    Command::new("podman")
+        .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -141,6 +161,24 @@ pub fn ensure_docker_install(password: Option<String>) -> Result<()> {
     let (ok, err) = run_ensure_docker(&["--install"], password)?;
     if !ok {
         let last = err.lines().last().unwrap_or("could not install Docker");
+        anyhow::bail!("{last}");
+    }
+    Ok(())
+}
+
+/// Install Podman via `ensure-podman.sh --yes` (apt + a rootless subuid/subgid
+/// preflight). Consent is the caller's job (they passed `install`); the script is
+/// idempotent if Podman is already present. Daemonless — nothing to start after.
+/// Returns the script's last error line on failure.
+pub fn ensure_podman_install() -> Result<()> {
+    let out = Command::new("bash")
+        .arg(ENSURE_PODMAN)
+        .arg("--yes")
+        .output()
+        .context("running ensure-podman.sh")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let last = err.lines().last().unwrap_or("could not install Podman");
         anyhow::bail!("{last}");
     }
     Ok(())
@@ -485,11 +523,13 @@ pub fn stop_vtx_holder(h: &VtxHolder) -> Result<()> {
 }
 
 /// Which sandbox to summon. Multipass = strong isolation (default for real use),
-/// Docker = fast, Local = no isolation (dev/testing only).
+/// Podman = daemonless/rootless containers (no sudo), Docker = fast, Local = no
+/// isolation (dev/testing only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Local,
     Docker,
+    Podman,
     Multipass,
 }
 
@@ -498,6 +538,7 @@ impl Backend {
         match s {
             "local" => Some(Backend::Local),
             "docker" => Some(Backend::Docker),
+            "podman" => Some(Backend::Podman),
             "multipass" => Some(Backend::Multipass),
             _ => None,
         }
@@ -506,6 +547,7 @@ impl Backend {
         match self {
             Backend::Local => "local-shell",
             Backend::Docker => "docker",
+            Backend::Podman => "podman",
             Backend::Multipass => "multipass",
         }
     }
@@ -513,9 +555,42 @@ impl Backend {
     pub fn default_image(self) -> &'static str {
         match self {
             Backend::Multipass => "24.04",
-            Backend::Docker => "ubuntu:24.04",
+            // Docker defaults to Parrot OS (Security). Debian/apt-based, so the
+            // apt-only sandbox-bootstrap.sh path works unchanged. `parrotsec/core`
+            // is the minimal base (bootstrap fills the toolchain); swap for
+            // `parrotsec/security` per-launch if you want the full pentest set.
+            Backend::Docker => "parrotsec/core",
+            // Podman defaults to Kali (rolling). Still Debian/apt-based, so the
+            // apt-only sandbox-bootstrap.sh path works unchanged; base is minimal
+            // (no pentest metapackages pulled by default — keep first launch fast).
+            Backend::Podman => "kalilinux/kali-rolling",
             Backend::Local => "",
         }
+    }
+    /// The exec family a co-located agent uses to run a command *inside* this
+    /// sandbox — `docker`/`podman exec`, `multipass exec`, or host `local`.
+    /// Advertised in the `_sbx:status` frame (distinct from `label`, whose Local
+    /// value is the cosmetic "local-shell") so the bridge can build the right
+    /// `goose run` invocation for the backend that holds the sandbox.
+    pub fn engine(self) -> &'static str {
+        match self {
+            Backend::Local => "local",
+            Backend::Docker => "docker",
+            Backend::Podman => "podman",
+            Backend::Multipass => "multipass",
+        }
+    }
+}
+
+/// The container-engine binary for an OCI backend. Docker and Podman share the
+/// same CLI grammar (`run/exec/commit/save/rm/images`), so the container code
+/// path is written once and parameterised by this. Non-container backends have
+/// no engine binary; calling this on them is a logic error (they never reach the
+/// container arms), so we default to "docker" rather than panic.
+fn engine_bin(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Podman => "podman",
+        _ => "docker",
     }
 }
 
@@ -528,6 +603,11 @@ pub fn prepare(
     image: &str,
     start_daemon: bool,
     password: Option<String>,
+    // GUI sandbox: publish the in-container noVNC port (6080) on the host loopback
+    // so a browser can reach the desktop. Containers are headless, so this is the
+    // only way out for a GUI — bound to 127.0.0.1 (never 0.0.0.0) to keep the
+    // surface local. Only meaningful for Docker/Podman; ignored otherwise.
+    gui: bool,
 ) -> Result<()> {
     match backend {
         Backend::Local => Ok(()),
@@ -563,11 +643,13 @@ pub fn prepare(
             }
             Ok(())
         }
-        Backend::Docker => {
-            // The daemon must be up before any `docker` call. Rather than fail
-            // with a raw connection error, start it (the caller confirmed via
-            // `/sbx launch docker --start`).
-            if !docker_daemon_up() {
+        Backend::Docker | Backend::Podman => {
+            let engine = engine_bin(backend);
+            // Docker needs a running daemon before any call; rather than fail with
+            // a raw connection error, start it (the caller confirmed via
+            // `/sbx launch docker --start`). Podman is daemonless — skip the check
+            // and the sudo modal entirely; a rootless container launches as-is.
+            if backend == Backend::Docker && !docker_daemon_up() {
                 if start_daemon {
                     start_docker_daemon(password).context("starting docker daemon")?;
                 } else {
@@ -577,35 +659,42 @@ pub fn prepare(
                 }
             }
             // Persistent container so we can exec in to provision users + shells.
-            let _ = Command::new("docker")
+            let _ = Command::new(engine)
                 .args(["rm", "-f", name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
             // Capture output so a failure can't paint over the TUI; the reason is
             // surfaced through the returned error (shown in the error popup).
-            let out = Command::new("docker")
-                .args([
-                    "run",
-                    "-d",
-                    "--name",
-                    name,
-                    "--hostname",
-                    name,
-                    "-w",
-                    "/root",
-                    image,
-                    "sleep",
-                    "infinity",
-                ])
+            let mut run = Command::new(engine);
+            run.args(["run", "-d", "--name", name, "--hostname", name, "-w", "/root"]);
+            // Goose (and any in-container tool) reaches the host Ollama via a
+            // gateway. Docker maps `host.docker.internal` to the host gateway IP.
+            // For rootless Podman the native `host.containers.internal` resolves to
+            // the host's *LAN* interface, which can't reach an Ollama bound to
+            // 127.0.0.1 (the safe default) — so request slirp4netns host-loopback
+            // forwarding and point the in-container OLLAMA_HOST at the slirp gateway
+            // 10.0.2.2 (see dk_bootstrap). Without this the granted `!task` path dies
+            // with "Could not connect to host.containers.internal:11434".
+            if backend == Backend::Docker {
+                run.arg("--add-host=host.docker.internal:host-gateway");
+            } else if backend == Backend::Podman {
+                run.arg("--network=slirp4netns:allow_host_loopback=true");
+            }
+            // GUI sandbox: publish noVNC (container 6080 → host 127.0.0.1:6080).
+            // Loopback-only so the desktop is reachable from this machine's browser
+            // but not the LAN. The desktop+VNC stack itself is installed by the
+            // bootstrap when HH_SBX_GUI=1 (see dk_bootstrap / sandbox-bootstrap.sh).
+            if gui {
+                run.args(["-p", &format!("127.0.0.1:{GUI_PORT}:{GUI_PORT}")]);
+            }
+            run.args([image, "sleep", "infinity"]);
+            let out = run
                 .output()
-                .context("docker run (is docker installed?)")?;
+                .with_context(|| format!("{engine} run (is {engine} installed?)"))?;
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!(
-                    "docker run failed: {}",
-                    err.lines().last().unwrap_or("").trim()
-                );
+                anyhow::bail!("{engine} run failed: {}", err.lines().last().unwrap_or("").trim());
             }
             Ok(())
         }
@@ -636,8 +725,8 @@ pub fn teardown(backend: Backend, name: &str) {
                 .stderr(Stdio::null())
                 .status();
         }
-        Backend::Docker => {
-            let _ = Command::new("docker")
+        Backend::Docker | Backend::Podman => {
+            let _ = Command::new(engine_bin(backend))
                 .args(["rm", "-f", name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -685,26 +774,24 @@ fn snap_dir() -> Result<std::path::PathBuf> {
 /// Returns a short human description of what was written on success.
 pub fn save_state(backend: Backend, name: &str, label: &str, local: bool) -> Result<String> {
     match backend {
-        Backend::Docker => {
+        Backend::Docker | Backend::Podman => {
+            let engine = engine_bin(backend);
             let tag = format!("{SNAP_REPO}:{label}");
-            let out = Command::new("docker")
+            let out = Command::new(engine)
                 .args(["commit", name, &tag])
                 .output()
-                .context("docker commit (is docker installed?)")?;
+                .with_context(|| format!("{engine} commit (is {engine} installed?)"))?;
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!(
-                    "docker commit failed: {}",
-                    err.lines().last().unwrap_or("").trim()
-                );
+                anyhow::bail!("{engine} commit failed: {}", err.lines().last().unwrap_or("").trim());
             }
             if local {
                 let path = snap_dir()?.join(format!("hh-snap-{label}.tar"));
-                let out = Command::new("docker")
+                let out = Command::new(engine)
                     .args(["save", &tag, "-o"])
                     .arg(&path)
                     .output()
-                    .context("docker save")?;
+                    .with_context(|| format!("{engine} save"))?;
                 if !out.status.success() {
                     let err = String::from_utf8_lossy(&out.stderr);
                     anyhow::bail!(
@@ -881,11 +968,12 @@ pub fn vm_snapshots(vm: &str) -> Result<Vec<String>> {
 /// `hh-snap`, or multipass snapshots of the instance). Blocking.
 pub fn list_snapshots(backend: Backend, name: &str) -> Result<Vec<String>> {
     match backend {
-        Backend::Docker => {
-            let out = Command::new("docker")
+        Backend::Docker | Backend::Podman => {
+            let engine = engine_bin(backend);
+            let out = Command::new(engine)
                 .args(["images", SNAP_REPO, "--format", "{{.Tag}}"])
                 .output()
-                .context("docker images")?;
+                .with_context(|| format!("{engine} images"))?;
             Ok(String::from_utf8_lossy(&out.stdout)
                 .lines()
                 .map(str::trim)
@@ -920,15 +1008,16 @@ pub fn list_snapshots(backend: Backend, name: &str) -> Result<Vec<String>> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SnapKind {
     Docker,
+    Podman,
     Multipass,
     None,
 }
 
 /// Resolve a snapshot label to the backend that holds it. Probes multipass first
-/// (its snapshots are instance-scoped and rarer), then docker's `hh-snap` repo.
-/// Blocking — run off the UI thread. A backend whose CLI is absent simply
-/// reports no match rather than erroring, so a missing multipass doesn't block a
-/// docker load and vice-versa.
+/// (its snapshots are instance-scoped and rarer), then the OCI engines' `hh-snap`
+/// repo (docker, then podman). Blocking — run off the UI thread. A backend whose
+/// CLI is absent simply reports no match rather than erroring, so a missing
+/// multipass doesn't block a docker load and vice-versa.
 pub fn locate_snapshot(name: &str, label: &str) -> SnapKind {
     if list_snapshots(Backend::Multipass, name)
         .map(|s| s.iter().any(|l| l == label))
@@ -942,6 +1031,13 @@ pub fn locate_snapshot(name: &str, label: &str) -> SnapKind {
     {
         return SnapKind::Docker;
     }
+    if podman_installed()
+        && list_snapshots(Backend::Podman, name)
+            .map(|s| s.iter().any(|l| l == label))
+            .unwrap_or(false)
+    {
+        return SnapKind::Podman;
+    }
     SnapKind::None
 }
 
@@ -954,13 +1050,13 @@ fn command_for(backend: Backend, name: &str, run_user: &str) -> CommandBuilder {
             c.arg("-i");
             c
         }
-        Backend::Docker => {
+        Backend::Docker | Backend::Podman => {
             let user = if run_user.is_empty() {
                 "root"
             } else {
                 run_user
             };
-            let mut c = CommandBuilder::new("docker");
+            let mut c = CommandBuilder::new(engine_bin(backend));
             c.args(["exec", "-it", "-u", user, name, "bash", "-il"]);
             c
         }
@@ -998,10 +1094,10 @@ fn mp(name: &str, args: &[&str]) {
         .stderr(Stdio::null())
         .status();
 }
-fn dk(name: &str, args: &[&str]) {
+fn dk(engine: &str, name: &str, args: &[&str]) {
     let mut a = vec!["exec", name];
     a.extend_from_slice(args);
-    let _ = Command::new("docker")
+    let _ = Command::new(engine)
         .args(a)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1041,15 +1137,32 @@ fn sandbox_pkgs() -> String {
 /// Run the sandbox bootstrap inside the container, piping the script to `bash -s`
 /// on stdin (keeps it out of argv) with the resolved package list in the env.
 /// Blocking — provision() is already off the UI thread.
-fn dk_bootstrap(name: &str) {
+fn dk_bootstrap(engine: &str, name: &str, gui: bool) {
     let script = std::fs::read_to_string(SBX_BOOTSTRAP).unwrap_or_else(|_| {
         // Degraded fallback if the script file is missing: still refresh the
         // index and install whatever the env carries (at minimum vim+curl).
         "apt-get update -qq && apt-get install -y --no-install-recommends $HH_SBX_PKGS".into()
     });
-    let env = format!("HH_SBX_PKGS={}", sandbox_pkgs());
-    let child = Command::new("docker")
-        .args(["exec", "-i", "-e", &env, name, "bash", "-s"])
+    let pkgs_env = format!("HH_SBX_PKGS={}", sandbox_pkgs());
+    // The in-container Goose config points OLLAMA_HOST at the host gateway, whose
+    // address depends on the engine. Docker resolves `host.docker.internal` via the
+    // `--add-host` we add at run time. Rootless Podman's `host.containers.internal`
+    // resolves to the host LAN IP and can't reach a loopback-bound Ollama, so we
+    // launch the container with slirp4netns:allow_host_loopback=true (see launch())
+    // and target the slirp host-loopback gateway 10.0.2.2 instead. Pass it through
+    // so sandbox-bootstrap.sh can bake the right URL.
+    let gateway = if engine == "podman" {
+        "HH_OLLAMA_HOST=http://10.0.2.2:11434"
+    } else {
+        "HH_OLLAMA_HOST=http://host.docker.internal:11434"
+    };
+    // HH_SBX_GUI=1 tells the bootstrap to also install + start the XFCE/noVNC
+    // desktop stack (heavy — only when the launcher asked for a GUI sandbox).
+    let gui_env = format!("HH_SBX_GUI={}", if gui { "1" } else { "0" });
+    let child = Command::new(engine)
+        .args([
+            "exec", "-i", "-e", &pkgs_env, "-e", gateway, "-e", &gui_env, name, "bash", "-s",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1092,7 +1205,7 @@ fn mp_revoke_sudo(name: &str, u: &str) {
 /// Provision a real unix account per clergy member inside the VM/container and
 /// make the owner a superuser (sudoer). Returns the unix user the shared shell
 /// should run as. Blocking — call off the UI thread.
-pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) -> String {
+pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String], gui: bool) -> String {
     let run = unix_name(owner);
     match backend {
         Backend::Multipass => {
@@ -1108,17 +1221,18 @@ pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) 
             mp_bootstrap(name); // same baseline dev toolchain as the docker sandbox
             run
         }
-        Backend::Docker => {
+        Backend::Docker | Backend::Podman => {
+            let engine = engine_bin(backend);
             // Install the baseline dev toolchain (editable list in
             // scripts/sandbox-tools.json; vim+curl guaranteed) so a fresh
             // sandbox comes up usable instead of bare. The script also refreshes
             // the apt index (base images ship without /var/lib/apt/lists) and is
             // idempotent + sentinel-guarded, so re-provisions stay fast.
-            dk_bootstrap(name);
+            dk_bootstrap(engine, name, gui);
             for m in members {
                 let u = unix_name(m);
                 if !u.is_empty() {
-                    dk(name, &["useradd", "-m", "-s", "/bin/bash", &u]);
+                    dk(engine, name, &["useradd", "-m", "-s", "/bin/bash", &u]);
                 }
             }
             // Base images usually lack the sudo package; the shared shell runs as
@@ -1150,7 +1264,7 @@ pub fn set_sudo(backend: Backend, name: &str, user: &str, enable: bool) {
 pub fn run_user_for(backend: Backend, owner: &str) -> String {
     match backend {
         Backend::Multipass => unix_name(owner),
-        Backend::Docker => "root".to_string(),
+        Backend::Docker | Backend::Podman => "root".to_string(),
         Backend::Local => String::new(),
     }
 }
@@ -1173,9 +1287,9 @@ pub fn push(
             "local sandbox shares the host filesystem — {} is already reachable",
             local.display()
         ),
-        Backend::Docker => {
+        Backend::Docker | Backend::Podman => {
             // Shell runs as root with $HOME=/root (see `prepare`'s `-w /root`).
-            let mut c = Command::new("docker");
+            let mut c = Command::new(engine_bin(backend));
             c.args(["exec", "-i", name, "tar", "-C", "/root", "-xf", "-"]);
             extract_tar(c, &tar)?;
             Ok(format!("/root/{base}"))

@@ -272,28 +272,32 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
         HelpCluster {
             title: "VIRTUAL MACHINES",
             items: vec![
-                // ── launch (one verb per backend) ──
+                // ── launch: /sbx <type> <option> (one backend token per line) ──
                 kv(
-                    "/sbx launch docker [image] [install]",
-                    "Linux container — shared shell relayed to the room (default ubuntu:24.04 + auto dev toolchain; append install if Docker is missing)",
+                    "/sbx docker [gui] [image] [install]",
+                    "Linux container — shared shell relayed to the room (default parrotsec/core + auto dev toolchain; gui = noVNC desktop; append install if Docker is missing)",
                 ),
                 kv(
-                    "/sbx launch multipass [image] [install]",
+                    "/sbx podman [gui] [image] [install]",
+                    "rootless/daemonless container — no sudo modal (default kalilinux/kali-rolling; gui = noVNC desktop; append install if Podman is missing)",
+                ),
+                kv(
+                    "/sbx multipass [image] [install]",
                     "full Ubuntu VM — shared shell relayed to the room (same dev toolchain; append install if Multipass is missing)",
                 ),
                 kv(
-                    "/sbx launch vbox",
+                    "/sbx vbox",
                     "VirtualBox VM picker — local GUI (↑↓ move · Enter/Tab boot · Esc dismiss)",
                 ),
                 kv(
-                    "/sbx launch vbox new [name]",
+                    "/sbx vbox new [name]",
                     "build a FRESH Ubuntu VM from a cloud image (cloud-init installs the dev toolchain)",
                 ),
                 kv(
-                    "/sbx launch vbox [gui] <vm> [yes]",
+                    "/sbx vbox [gui] <vm> [yes]",
                     "boot a VirtualBox VM's GUI on YOUR machine (non-host appends yes to install/import first)",
                 ),
-                kv("/sbx launch local", "a plain shell on your own machine — no VM"),
+                kv("/sbx local", "a plain shell on your own machine — no VM"),
                 kv("/sbx stop", "tear down the running sandbox (purges the VM/container)"),
                 // ── save (docker/multipass share a verb; vbox has its own) ──
                 kv(
@@ -318,7 +322,7 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "/sbx vms  ·  /sbx vmsnaps <vm>",
                     "list local VirtualBox VMs · a VM's snapshots",
                 ),
-                kv("/sbx gui <vm> [yes]", "alias of /sbx launch vbox gui <vm> [yes]"),
+                kv("/sbx gui <vm> [yes]", "alias of /sbx vbox gui <vm> [yes]"),
                 kv("/drive  ·  F2", "type into the shared shell (F2 releases; Esc reaches vim)"),
             ],
         },

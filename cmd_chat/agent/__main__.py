@@ -30,7 +30,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .bridge import AgentBridge
+from .bridge import GOOSE_MAX_TURNS, AgentBridge
 from .profiles import load_profiles, provider_from_profile
 from .providers import OllamaEmbedder, make_provider, preflight
 
@@ -51,6 +51,8 @@ def _build_provider(args, ap):
             args.system = prof["system"]
         if args.context_window == 12 and prof.get("context_window"):
             args.context_window = int(prof["context_window"])
+        if args.harness is None and prof.get("harness"):
+            args.harness = prof["harness"]
         return provider
 
     opts: dict = {}
@@ -121,6 +123,12 @@ def main() -> None:
                     help="Ollama CPU threads (default: Ollama's own ≈ physical cores; benchmark 4/6/8)")
     ap.add_argument("--num-predict", type=int, default=None,
                     help="Ollama max reply tokens (default 512)")
+    ap.add_argument("--harness", choices=["goose", "simple"], default=None,
+                    help="sandbox !task harness: goose (agentic loop run inside the "
+                         "sandbox; default) or simple (legacy one-shot injector). "
+                         "Goose auto-degrades to simple if its binary isn't in the sandbox.")
+    ap.add_argument("--goose-max-turns", type=int, default=GOOSE_MAX_TURNS,
+                    help="max turns for a Goose agentic run (default %(default)s)")
     ap.add_argument("--system", default=None, help="override the system prompt")
     ap.add_argument("--context-window", type=int, default=12,
                     help="max prior messages fed to the model per reply")
@@ -193,7 +201,8 @@ def main() -> None:
         password=args.password, insecure=args.insecure, no_tls=args.no_tls,
         system_prompt=args.system, context_window=args.context_window,
         token_budget=args.token_budget, embedder=embedder, rag_top_k=args.rag_top_k,
-        code_provider=code_provider,
+        code_provider=code_provider, harness=args.harness or "goose",
+        goose_max_turns=args.goose_max_turns,
     )
     try:
         bridge.run()
