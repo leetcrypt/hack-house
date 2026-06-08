@@ -23,6 +23,11 @@ class Msg:
     content: str
 
 
+class ToolsUnsupported(RuntimeError):
+    """Raised by ``complete_with_tools`` when the backend model can't do function
+    calling — the native harness catches it and degrades to the simple injector."""
+
+
 @runtime_checkable
 class Provider(Protocol):
     name: str
@@ -56,6 +61,11 @@ class OllamaProvider:
         self.num_predict = num_predict
         self.num_thread = num_thread
         self.keep_alive = keep_alive
+        # Tri-state tool-calling capability cache: None=unprobed, True/False once a
+        # real /api/chat with `tools` either succeeds or is rejected by the model.
+        # The native harness reads this to skip retrying tools on a model that
+        # can't do them (and fall straight to the simple injector).
+        self._tools_ok: bool | None = None
 
     def _options(self) -> dict:
         opts = {"num_ctx": self.num_ctx, "num_predict": self.num_predict}
@@ -104,6 +114,53 @@ class OllamaProvider:
         r = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
         self._raise_for_status(r)
         return (r.json().get("message", {}).get("content") or "").strip()
+
+    def supports_tools(self) -> bool | None:
+        """Cached tool-calling capability: None until the first ``complete_with_tools``
+        call has either succeeded or been rejected by the model."""
+        return self._tools_ok
+
+    def complete_with_tools(
+        self, system: str, messages: list[dict], tools: list[dict]
+    ) -> tuple[str, list[dict]]:
+        """One non-streaming ``/api/chat`` turn carrying a ``tools`` schema. Used by
+        the native harness loop. ``messages`` are raw Ollama wire dicts (so the
+        caller can round-trip assistant ``tool_calls`` and ``tool`` results across
+        turns); ``system`` is prepended. Returns ``(text, tool_calls)`` where each
+        call is ``{"name": str, "arguments": dict}``. Raises ``ToolsUnsupported`` if
+        the model can't do function calling so the bridge can fall back to simple."""
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "keep_alive": self.keep_alive,
+            "options": self._options(),
+            "tools": tools,
+            "messages": [{"role": "system", "content": system}] + messages,
+        }
+        r = requests.post(f"{self.host}/api/chat", json=payload, timeout=self.timeout)
+        if not r.ok:
+            try:
+                detail = (r.json().get("error") or "").strip()
+            except ValueError:
+                detail = (r.text or "").strip()
+            if "does not support tools" in detail.lower():
+                self._tools_ok = False
+                raise ToolsUnsupported(detail or f"{self.model} does not support tools")
+            self._raise_for_status(r)
+        self._tools_ok = True
+        msg = r.json().get("message", {}) or {}
+        text = (msg.get("content") or "").strip()
+        calls: list[dict] = []
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = {}
+            calls.append({"name": fn.get("name", ""), "arguments": args or {}})
+        return text, calls
 
     def stream(self, system: str, messages: list[Msg]):
         """Yield reply text incrementally as Ollama generates it. On CPU the

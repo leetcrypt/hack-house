@@ -201,7 +201,7 @@ def main() -> None:
         password=args.password, insecure=args.insecure, no_tls=args.no_tls,
         system_prompt=args.system, context_window=args.context_window,
         token_budget=args.token_budget, embedder=embedder, rag_top_k=args.rag_top_k,
-        code_provider=code_provider, harness=args.harness or "simple",
+        code_provider=code_provider, harness=args.harness or "native",
         max_turns=args.max_turns,
     )
     try:
