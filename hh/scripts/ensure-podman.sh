@@ -17,20 +17,34 @@
 #   ./ensure-podman.sh --yes     # install without prompting
 #   ./ensure-podman.sh --check   # test only; exit 0 if present, 1 if missing
 #   ./ensure-podman.sh --plan    # show the install plan; change nothing
+#   ./ensure-podman.sh --stdin-pass  # read a sudo password from stdin (sudo -S)
 set -uo pipefail
 
 ASSUME_YES=0
 CHECK_ONLY=0
 PLAN_ONLY=0
+STDIN_PASS=0
 for arg in "$@"; do
     case "$arg" in
         -y|--yes)         ASSUME_YES=1 ;;
         --check)          CHECK_ONLY=1 ;;
         --plan|--dry-run) PLAN_ONLY=1 ;;
+        # A sudo password is waiting on stdin (the hack-house TUI feeds it). Use
+        # `sudo -S` so escalation reads that, never the controlling tty.
+        --stdin-pass)     STDIN_PASS=1 ;;
         -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "✖ unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
+
+# How to escalate (mirrors ensure-docker.sh):
+#   * --stdin-pass: a password is on stdin → `sudo -S -p ''` (reads stdin, never
+#     the tty; a raw-mode TUI would corrupt a tty prompt). First sudo caches it.
+#   * --yes alone: `sudo -n` — fails fast if creds aren't cached, never hangs.
+#   * interactive shell: plain `sudo` (a real terminal can prompt normally).
+SUDO="sudo"
+[[ $ASSUME_YES -eq 1 ]] && SUDO="sudo -n"
+[[ $STDIN_PASS -eq 1 ]] && SUDO="sudo -S -p ''"
 
 installed() { command -v podman >/dev/null 2>&1 && podman --version >/dev/null 2>&1; }
 pm_version() { podman --version 2>/dev/null | head -1; }
@@ -67,7 +81,9 @@ manual_note=""
 case "$(uname -s)" in
     Linux)
         if command -v apt-get >/dev/null 2>&1; then
-            install_cmd="apt-get update && apt-get install -y podman"
+            # Wrapped in `sh -c` so a single `$SUDO …` escalation covers BOTH the
+            # update and the install (a bare `$SUDO a && b` would only sudo `a`).
+            install_cmd="sh -c 'apt-get update && apt-get install -y podman'"
             plan_cmd="apt-cache policy podman"
             need_sudo=1
         elif command -v dnf >/dev/null 2>&1; then
@@ -99,7 +115,7 @@ if [[ -z "$install_cmd" ]]; then
     echo "✖ don't know how to install Podman here — get it from https://podman.io/docs/installation" >&2
     exit 1
 fi
-[[ $need_sudo -eq 1 ]] && install_cmd="sudo $install_cmd"
+[[ $need_sudo -eq 1 ]] && install_cmd="$SUDO $install_cmd"
 [[ -n "$manual_note" ]] && echo "ⓘ $manual_note" >&2
 
 # --plan: show the real plan and change nothing.

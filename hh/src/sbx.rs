@@ -32,6 +32,94 @@ const VBOX_NEW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-new.sh
 /// server (:1 / 5901) to this port via websockify; the owner opens it in a browser.
 pub const GUI_PORT: u16 = 6080;
 
+/// A process currently bound to a TCP port we want to use.
+pub struct PortHolder {
+    pub pid: i32,
+    pub name: String,
+}
+
+/// Find the process listening on `port` (host loopback/any), if any.
+///
+/// Parses `ss -H -ltnp` — one listening socket per line, e.g.
+/// `LISTEN 0 4096 127.0.0.1:6080 0.0.0.0:* users:(("websockify",pid=3395944,fd=3))`.
+/// We match the local-address column (index 3) ending in `:port` and pull the
+/// first `("name",pid=N` out of the `users:(...)` column. Returns `None` if the
+/// port is free or `ss` can't report the owner (no `-p` perms → no name/pid).
+pub fn port_holder(port: u16) -> Option<PortHolder> {
+    let out = Command::new("ss")
+        .args(["-H", "-ltnp"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let suffix = format!(":{port}");
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        // Local address is the 4th column (Recv-Q is dropped by some ss builds,
+        // so guard by scanning for the column that ends in `:<port>`).
+        let local_match = cols.iter().any(|c| c.ends_with(&suffix));
+        if !local_match {
+            continue;
+        }
+        // users:(("websockify",pid=3395944,fd=3),...)
+        let users = match line.split_once("users:(") {
+            Some((_, rest)) => rest,
+            None => continue,
+        };
+        let name = users
+            .split_once("(\"")
+            .and_then(|(_, r)| r.split_once('"'))
+            .map(|(n, _)| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let pid = users
+            .split_once("pid=")
+            .and_then(|(_, r)| {
+                let end = r.find(|c: char| !c.is_ascii_digit()).unwrap_or(r.len());
+                r[..end].parse::<i32>().ok()
+            });
+        if let Some(pid) = pid {
+            return Some(PortHolder { pid, name });
+        }
+    }
+    None
+}
+
+/// Kill the process holding `port` and wait for the port to free up.
+///
+/// Sends SIGTERM first (graceful), then SIGKILL if it lingers, polling
+/// `port_holder` until the port is free or a short timeout elapses. Returns
+/// `true` once the port is free. Used by the GUI-launch consent gate after the
+/// owner confirms killing the named pid.
+pub fn kill_port_holder(port: u16, pid: i32) -> bool {
+    let _ = Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    for _ in 0..15 {
+        if port_holder(port).is_none() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    // Still bound after SIGTERM — escalate to SIGKILL.
+    let _ = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    for _ in 0..15 {
+        if port_holder(port).is_none() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    port_holder(port).is_none()
+}
+
 /// Is the `docker` binary installed? (`docker --version` succeeds.) This is a
 /// weaker check than `docker_daemon_up`: the CLI can be present while the daemon
 /// is down. We need both before a Docker sandbox can launch.
@@ -98,18 +186,25 @@ pub fn sudo_ready() -> bool {
         .unwrap_or(false)
 }
 
-/// Run `ensure-docker.sh --yes` with the given extra args, optionally feeding a
-/// sudo password to the script's `sudo -S` via stdin.
+/// Run an `ensure-*.sh` installer `--yes` with the given extra args, optionally
+/// feeding a sudo password to the script's `sudo -S` via stdin. Shared by every
+/// backend installer (docker/podman/multipass/vbox) so sudo capture is uniform.
 ///
-/// Secret handling: the password (if any) is written to the child's stdin and
-/// then the local buffer is wiped. It only ever travels parent→child stdin; it
-/// is NEVER echoed, logged, or surfaced — sudo never prints the password, so the
-/// captured stderr (used for error messages) can't contain it. With no password
-/// we close stdin and the script uses `sudo -n` (fails fast if creds aren't
-/// cached) so it can never block on an interactive tty prompt.
-fn run_ensure_docker(extra: &[&str], password: Option<String>) -> Result<(bool, String)> {
+/// Sudo ladder (the scripts honour all three):
+///   * password present ⇒ `--stdin-pass` ⇒ the script uses `sudo -S -p ''`,
+///     reading the secret from stdin — never the controlling tty (a raw-mode TUI
+///     would corrupt a tty prompt). The first sudo caches the credential.
+///   * no password ⇒ stdin closed; the script's `--yes` selects `sudo -n`, which
+///     fails fast (clear error) if creds aren't cached rather than hanging on a
+///     tty prompt the TUI can't host.
+///
+/// Secret handling: the password (if any) only ever travels parent→child stdin;
+/// the local buffer is wiped immediately after. It is NEVER echoed, logged, or
+/// surfaced — sudo never prints the password, so the captured stderr (used for
+/// error messages) can't contain it.
+fn run_ensure(script: &str, extra: &[&str], password: Option<String>) -> Result<(bool, String)> {
     let mut cmd = Command::new("bash");
-    cmd.arg(ENSURE_DOCKER).arg("--yes");
+    cmd.arg(script).arg("--yes");
     for a in extra {
         cmd.arg(a);
     }
@@ -119,7 +214,9 @@ fn run_ensure_docker(extra: &[&str], password: Option<String>) -> Result<(bool, 
         cmd.stdin(Stdio::null());
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("running ensure-docker.sh")?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("running {script}"))?;
     if let Some(mut pw) = password {
         if let Some(mut stdin) = child.stdin.take() {
             // Feed the password to the first `sudo -S`; it caches the credential
@@ -134,7 +231,9 @@ fn run_ensure_docker(extra: &[&str], password: Option<String>) -> Result<(bool, 
         }
         pw.clear();
     }
-    let out = child.wait_with_output().context("ensure-docker.sh")?;
+    let out = child
+        .wait_with_output()
+        .with_context(|| format!("{script}"))?;
     Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
 }
 
@@ -142,7 +241,7 @@ fn run_ensure_docker(extra: &[&str], password: Option<String>) -> Result<(bool, 
 /// ready. With `password`, escalation goes through `sudo -S` (read from stdin);
 /// without it the script uses `sudo -n` and fails fast if creds aren't cached.
 fn start_docker_daemon(password: Option<String>) -> Result<()> {
-    let (ok, err) = run_ensure_docker(&[], password)?;
+    let (ok, err) = run_ensure(ENSURE_DOCKER, &[], password)?;
     if !ok {
         let last = err
             .lines()
@@ -158,7 +257,7 @@ fn start_docker_daemon(password: Option<String>) -> Result<()> {
 /// job (they passed `install`); the script is idempotent if Docker is present.
 /// `password` feeds `sudo -S` as above.
 pub fn ensure_docker_install(password: Option<String>) -> Result<()> {
-    let (ok, err) = run_ensure_docker(&["--install"], password)?;
+    let (ok, err) = run_ensure(ENSURE_DOCKER, &["--install"], password)?;
     if !ok {
         let last = err.lines().last().unwrap_or("could not install Docker");
         anyhow::bail!("{last}");
@@ -169,15 +268,11 @@ pub fn ensure_docker_install(password: Option<String>) -> Result<()> {
 /// Install Podman via `ensure-podman.sh --yes` (apt + a rootless subuid/subgid
 /// preflight). Consent is the caller's job (they passed `install`); the script is
 /// idempotent if Podman is already present. Daemonless — nothing to start after.
-/// Returns the script's last error line on failure.
-pub fn ensure_podman_install() -> Result<()> {
-    let out = Command::new("bash")
-        .arg(ENSURE_PODMAN)
-        .arg("--yes")
-        .output()
-        .context("running ensure-podman.sh")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+/// `password` feeds the script's `sudo -S` (apt needs root); without it the
+/// script's `sudo -n` fails fast rather than hanging. Returns the last error line.
+pub fn ensure_podman_install(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure(ENSURE_PODMAN, &[], password)?;
+    if !ok {
         let last = err.lines().last().unwrap_or("could not install Podman");
         anyhow::bail!("{last}");
     }
@@ -199,14 +294,9 @@ pub fn multipass_installed() -> bool {
 /// install (the only supported channel). Consent is the caller's job; the
 /// script is idempotent if Multipass is already present. Returns the script's
 /// last error line on failure (e.g. snapd missing, or needs sudo).
-pub fn ensure_multipass_install() -> Result<()> {
-    let out = Command::new("bash")
-        .arg(ENSURE_MULTIPASS)
-        .arg("--yes")
-        .output()
-        .context("running ensure-multipass.sh")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+pub fn ensure_multipass_install(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure(ENSURE_MULTIPASS, &[], password)?;
+    if !ok {
         let last = err.lines().last().unwrap_or("could not install Multipass");
         anyhow::bail!("{last}");
     }
@@ -241,15 +331,12 @@ pub fn vbox_version() -> Option<String> {
 
 /// Install VirtualBox via `ensure-vbox.sh --yes`. Consent is the caller's job
 /// (they passed `--install`); detection is the script's (idempotent if present).
-/// Returns the script's last error line on failure (e.g. needs sudo).
-pub fn ensure_vbox_install() -> Result<()> {
-    let out = Command::new("bash")
-        .arg(ENSURE_VBOX)
-        .arg("--yes")
-        .output()
-        .context("running ensure-vbox.sh")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+/// `password` feeds the script's `sudo -S` (apt needs root); without it the
+/// script's `sudo -n` fails fast rather than hanging on a tty prompt the TUI
+/// can't host. Returns the script's last error line on failure.
+pub fn ensure_vbox_install(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure(ENSURE_VBOX, &[], password)?;
+    if !ok {
         let last = err.lines().last().unwrap_or("could not install VirtualBox");
         anyhow::bail!("{last}");
     }

@@ -197,6 +197,31 @@ pub struct SudoPrompt {
     pub pending: PendingSudoLaunch,
 }
 
+/// Launch parameters captured when a GUI sandbox's noVNC port is already bound
+/// by another process. Held aside while the port-consent modal asks whether to
+/// kill the holder; the launch fires once the owner confirms. Carries the
+/// (already-collected) sudo password, if any, so the gate works on both the
+/// no-sudo and sudo-submit launch paths.
+pub struct PendingGuiLaunch {
+    pub backend: sbx::Backend,
+    pub image: String,
+    pub members: Vec<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub start_daemon: bool,
+    pub install_first: bool,
+    pub gui: bool,
+    pub password: Option<String>,
+}
+
+/// Active "port in use — kill it?" consent prompt for a GUI sandbox launch.
+/// While `Some`, y/n keystrokes resolve this instead of feeding chat.
+pub struct PortPrompt {
+    pub pid: i32,
+    pub holder: String,
+    pub pending: PendingGuiLaunch,
+}
+
 pub struct App {
     pub me: String,
     pub lines: Vec<ChatLine>,
@@ -260,6 +285,10 @@ pub struct App {
     /// and creds aren't cached). While `Some`, keystrokes feed this masked
     /// buffer instead of chat — the secret never leaves the client.
     pub sudo_prompt: Option<SudoPrompt>,
+    /// Active "noVNC port already in use — kill the holder?" consent prompt for a
+    /// GUI sandbox launch (None unless the port is busy). While `Some`, y/n keys
+    /// resolve it instead of feeding chat.
+    pub port_prompt: Option<PortPrompt>,
 }
 
 impl App {
@@ -296,6 +325,7 @@ impl App {
             layout: Layout::default(),
             focused_pane: None,
             sudo_prompt: None,
+            port_prompt: None,
         }
     }
 
@@ -1025,6 +1055,32 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                         app.sudo_prompt.take().unwrap();
                                     if password.is_empty() {
                                         app.sys("⛧ cancelled — empty password");
+                                    } else if let Some(h) =
+                                        if pending.gui { sbx::port_holder(sbx::GUI_PORT) } else { None }
+                                    {
+                                        // Root's now authenticated, but the noVNC port
+                                        // is taken — carry the password into the
+                                        // port-consent gate so the launch can still fire
+                                        // (with sudo) once the holder is cleared.
+                                        app.sys(format!(
+                                            "⚠ port {} (noVNC) in use by pid {} ({}) — kill it and proceed? [y/N] · Esc cancels",
+                                            sbx::GUI_PORT, h.pid, h.name
+                                        ));
+                                        app.port_prompt = Some(PortPrompt {
+                                            pid: h.pid,
+                                            holder: h.name,
+                                            pending: PendingGuiLaunch {
+                                                backend: pending.backend,
+                                                image: pending.image,
+                                                members: pending.members,
+                                                rows: pending.rows,
+                                                cols: pending.cols,
+                                                start_daemon: pending.start_daemon,
+                                                install_first: pending.install_first,
+                                                gui: pending.gui,
+                                                password: Some(password),
+                                            },
+                                        });
                                     } else {
                                         launching = true;
                                         app.sys("🔒 authenticating + launching…");
@@ -1058,6 +1114,50 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     if let Some(p) = app.sudo_prompt.as_mut() {
                                         p.password.push(c);
                                     }
+                                }
+                                _ => {}
+                            }
+                        } else if app.port_prompt.is_some() {
+                            // GUI-launch port-consent modal: the noVNC port is held
+                            // by another process. y/Y kills the named pid then fires
+                            // the held launch; n/N/Esc aborts. Swallows keys so the
+                            // y/n never lands in chat.
+                            match k.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    let PortPrompt { pid, holder, pending } =
+                                        app.port_prompt.take().unwrap();
+                                    app.sys(format!(
+                                        "⛧ killing {holder} (pid {pid}) to free port {}…",
+                                        sbx::GUI_PORT
+                                    ));
+                                    if sbx::kill_port_holder(sbx::GUI_PORT, pid) {
+                                        launching = true;
+                                        app.sys("🖥 port freed — launching…");
+                                        spawn_launch(
+                                            pending.backend,
+                                            pending.image,
+                                            app.me.clone(),
+                                            pending.members,
+                                            pending.rows,
+                                            pending.cols,
+                                            pending.start_daemon,
+                                            pending.install_first,
+                                            pending.gui,
+                                            pending.password,
+                                            pty_tx.clone(),
+                                            broker_tx.clone(),
+                                            app_tx.clone(),
+                                        );
+                                    } else {
+                                        app.sys(format!(
+                                            "⚠ couldn't free port {} — launch aborted",
+                                            sbx::GUI_PORT
+                                        ));
+                                    }
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                    app.port_prompt = None;
+                                    app.sys("⛧ launch aborted — port left untouched");
                                 }
                                 _ => {}
                             }
@@ -2055,6 +2155,29 @@ fn handle_command(
                                 },
                             });
                             app.sys("🔒 sudo password needed — type it here (hidden), Enter to launch · Esc cancels. Local only: never sent to the room.");
+                        } else if let Some(h) = if gui { sbx::port_holder(sbx::GUI_PORT) } else { None } {
+                            // The noVNC port is already bound (a stale sandbox, a
+                            // leftover websockify, etc.). Don't blindly collide —
+                            // ask the owner whether to kill the holder, then launch.
+                            app.sys(format!(
+                                "⚠ port {} (noVNC) in use by pid {} ({}) — kill it and proceed? [y/N] · Esc cancels",
+                                sbx::GUI_PORT, h.pid, h.name
+                            ));
+                            app.port_prompt = Some(PortPrompt {
+                                pid: h.pid,
+                                holder: h.name,
+                                pending: PendingGuiLaunch {
+                                    backend,
+                                    image,
+                                    members,
+                                    rows,
+                                    cols,
+                                    start_daemon,
+                                    install_first,
+                                    gui,
+                                    password: None,
+                                },
+                            });
                         } else {
                             *launching = true;
                             if install_first {
@@ -2867,6 +2990,16 @@ fn launch_vbox_gui(
         ));
         return;
     }
+    // Installing VirtualBox needs root. This GUI path runs off-thread with no
+    // in-TUI password modal, so it relies on `sudo -n` (cached creds). If they
+    // aren't cached the apt step would fail fast mid-launch — preempt that with
+    // a clear, actionable message rather than a cryptic install error.
+    if needs_install && !sbx::sudo_ready() {
+        app.err(format!(
+            "installing VirtualBox needs sudo, but it isn't cached. Run `!sudo -v` here (caches your password ~15 min), then retry `/sbx vbox gui {vm} yes`."
+        ));
+        return;
+    }
     spawn_vm_execute(vm, conflicts, needs_install, needs_import, app, app_tx, out_tx, room);
 }
 
@@ -2914,7 +3047,12 @@ fn spawn_vm_execute(
                 sbx::stop_vtx_holder(h).map_err(|e| format!("freeing VT-x: {e}"))?;
             }
             if needs_install && !sbx::vbox_installed() {
-                sbx::ensure_vbox_install().map_err(|e| format!("install failed: {e}"))?;
+                // VirtualBox install needs root. No in-TUI password was captured
+                // on this path, so `ensure_vbox_install(None)` uses `sudo -n`:
+                // it succeeds if creds are cached (the confirm step asks the user
+                // to run `sudo -v` first) and fails fast with a clear message
+                // otherwise — never hanging on a tty prompt the TUI can't host.
+                sbx::ensure_vbox_install(None).map_err(|e| format!("install failed: {e}"))?;
             }
             // Pull the shared appliance in if the VM still isn't registered.
             if needs_import && !sbx::vm_registered(&vm) {
@@ -2968,8 +3106,8 @@ fn spawn_launch(
             let pw = password.clone();
             let res = tokio::task::spawn_blocking(move || match backend {
                 sbx::Backend::Docker => sbx::ensure_docker_install(pw),
-                sbx::Backend::Podman => sbx::ensure_podman_install(),
-                sbx::Backend::Multipass => sbx::ensure_multipass_install(),
+                sbx::Backend::Podman => sbx::ensure_podman_install(pw),
+                sbx::Backend::Multipass => sbx::ensure_multipass_install(pw),
                 _ => Ok(()),
             })
             .await;
