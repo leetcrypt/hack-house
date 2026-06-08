@@ -188,13 +188,34 @@ pub struct PendingSudoLaunch {
     pub gui: bool,
 }
 
+/// Launch parameters captured when installing VirtualBox needs root but sudo
+/// isn't cached. Held aside while the masked password modal collects the secret;
+/// the install + VM boot fires (with the password) once it's submitted. Mirrors
+/// `PendingSudoLaunch` for the VirtualBox GUI path.
+pub struct PendingVboxInstall {
+    pub vm: String,
+    pub conflicts: Vec<sbx::VtxHolder>,
+    pub needs_install: bool,
+    pub needs_import: bool,
+    pub room: Arc<fernet::Fernet>,
+}
+
+/// What a submitted sudo password authorizes. The masked modal is shared; this
+/// records which privileged action to fire once the password is entered.
+pub enum PendingPrivileged {
+    /// Launch a container sandbox that needs root (binary install / daemon start).
+    Launch(PendingSudoLaunch),
+    /// Install VirtualBox (apt needs root), then boot the requested VM's GUI.
+    VboxInstall(PendingVboxInstall),
+}
+
 /// A local, masked sudo-password prompt. The typed password lives ONLY here —
 /// it never enters `App::input` (chat), a `ChatLine`, the PTY stream, or any
-/// outbound frame — until it's handed to `sudo -S` for the pending launch.
+/// outbound frame — until it's handed to `sudo -S` for the pending action.
 /// Deliberately no `Debug` derive so the secret can't be logged by accident.
 pub struct SudoPrompt {
     pub password: String,
-    pub pending: PendingSudoLaunch,
+    pub pending: PendingPrivileged,
 }
 
 /// Launch parameters captured when a GUI sandbox's noVNC port is already bound
@@ -1055,50 +1076,75 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                         app.sudo_prompt.take().unwrap();
                                     if password.is_empty() {
                                         app.sys("⛧ cancelled — empty password");
-                                    } else if let Some(h) =
-                                        if pending.gui { sbx::port_holder(sbx::GUI_PORT) } else { None }
-                                    {
-                                        // Root's now authenticated, but the noVNC port
-                                        // is taken — carry the password into the
-                                        // port-consent gate so the launch can still fire
-                                        // (with sudo) once the holder is cleared.
-                                        app.sys(format!(
-                                            "⚠ port {} (noVNC) in use by pid {} ({}) — kill it and proceed? [y/N] · Esc cancels",
-                                            sbx::GUI_PORT, h.pid, h.name
-                                        ));
-                                        app.port_prompt = Some(PortPrompt {
-                                            pid: h.pid,
-                                            holder: h.name,
-                                            pending: PendingGuiLaunch {
-                                                backend: pending.backend,
-                                                image: pending.image,
-                                                members: pending.members,
-                                                rows: pending.rows,
-                                                cols: pending.cols,
-                                                start_daemon: pending.start_daemon,
-                                                install_first: pending.install_first,
-                                                gui: pending.gui,
-                                                password: Some(password),
-                                            },
-                                        });
                                     } else {
-                                        launching = true;
-                                        app.sys("🔒 authenticating + launching…");
-                                        spawn_launch(
-                                            pending.backend,
-                                            pending.image,
-                                            app.me.clone(),
-                                            pending.members,
-                                            pending.rows,
-                                            pending.cols,
-                                            pending.start_daemon,
-                                            pending.install_first,
-                                            pending.gui,
-                                            Some(password),
-                                            pty_tx.clone(),
-                                            broker_tx.clone(),
-                                            app_tx.clone(),
-                                        );
+                                        match pending {
+                                        PendingPrivileged::Launch(pending) => {
+                                        if let Some(h) =
+                                            if pending.gui { sbx::port_holder(sbx::GUI_PORT) } else { None }
+                                        {
+                                            // Root's now authenticated, but the noVNC port
+                                            // is taken — carry the password into the
+                                            // port-consent gate so the launch can still fire
+                                            // (with sudo) once the holder is cleared.
+                                            app.sys(format!(
+                                                "⚠ port {} (noVNC) in use by pid {} ({}) — kill it and proceed? [y/N] · Esc cancels",
+                                                sbx::GUI_PORT, h.pid, h.name
+                                            ));
+                                            app.port_prompt = Some(PortPrompt {
+                                                pid: h.pid,
+                                                holder: h.name,
+                                                pending: PendingGuiLaunch {
+                                                    backend: pending.backend,
+                                                    image: pending.image,
+                                                    members: pending.members,
+                                                    rows: pending.rows,
+                                                    cols: pending.cols,
+                                                    start_daemon: pending.start_daemon,
+                                                    install_first: pending.install_first,
+                                                    gui: pending.gui,
+                                                    password: Some(password),
+                                                },
+                                            });
+                                        } else {
+                                            launching = true;
+                                            app.sys("🔒 authenticating + launching…");
+                                            spawn_launch(
+                                                pending.backend,
+                                                pending.image,
+                                                app.me.clone(),
+                                                pending.members,
+                                                pending.rows,
+                                                pending.cols,
+                                                pending.start_daemon,
+                                                pending.install_first,
+                                                pending.gui,
+                                                Some(password),
+                                                pty_tx.clone(),
+                                                broker_tx.clone(),
+                                                app_tx.clone(),
+                                            );
+                                        }
+                                        }
+                                        PendingPrivileged::VboxInstall(p) => {
+                                            // Root authenticated → install VirtualBox
+                                            // (sudo -S reads this password) then boot
+                                            // the VM. The password is dropped inside
+                                            // spawn_vm_execute after stdin is fed.
+                                            app.sys("🔒 authenticating + installing VirtualBox…");
+                                            let room = p.room.clone();
+                                            spawn_vm_execute(
+                                                p.vm,
+                                                p.conflicts,
+                                                p.needs_install,
+                                                p.needs_import,
+                                                &mut app,
+                                                &app_tx,
+                                                &out_tx,
+                                                &room,
+                                                Some(password),
+                                            );
+                                        }
+                                        }
                                     }
                                 }
                                 KeyCode::Esc => {
@@ -2143,7 +2189,7 @@ fn handle_command(
                             // `sudo -S`. The launch fires on submit (see the run loop).
                             app.sudo_prompt = Some(SudoPrompt {
                                 password: String::new(),
-                                pending: PendingSudoLaunch {
+                                pending: PendingPrivileged::Launch(PendingSudoLaunch {
                                     backend,
                                     image,
                                     members,
@@ -2152,7 +2198,7 @@ fn handle_command(
                                     start_daemon,
                                     install_first,
                                     gui,
-                                },
+                                }),
                             });
                             app.sys("🔒 sudo password needed — type it here (hidden), Enter to launch · Esc cancels. Local only: never sent to the room.");
                         } else if let Some(h) = if gui { sbx::port_holder(sbx::GUI_PORT) } else { None } {
@@ -2950,7 +2996,7 @@ fn launch_vbox_gui(
     // Host path: VirtualBox + this VM already present and nothing to stop → boot
     // immediately, no confirmation.
     if installed && have_vm && conflicts.is_empty() {
-        spawn_vm_execute(vm, conflicts, false, false, app, app_tx, out_tx, room);
+        spawn_vm_execute(vm, conflicts, false, false, app, app_tx, out_tx, room, None);
         return;
     }
 
@@ -2990,17 +3036,25 @@ fn launch_vbox_gui(
         ));
         return;
     }
-    // Installing VirtualBox needs root. This GUI path runs off-thread with no
-    // in-TUI password modal, so it relies on `sudo -n` (cached creds). If they
-    // aren't cached the apt step would fail fast mid-launch — preempt that with
-    // a clear, actionable message rather than a cryptic install error.
+    // Installing VirtualBox needs root. If creds aren't cached, capture the
+    // password in the same masked, local-only modal the container path uses —
+    // sudo can't prompt on the tty from inside the raw-mode TUI. The install +
+    // VM boot fires on submit (see the run loop's sudo handler).
     if needs_install && !sbx::sudo_ready() {
-        app.err(format!(
-            "installing VirtualBox needs sudo, but it isn't cached. Run `!sudo -v` here (caches your password ~15 min), then retry `/sbx vbox gui {vm} yes`."
-        ));
+        app.sudo_prompt = Some(SudoPrompt {
+            password: String::new(),
+            pending: PendingPrivileged::VboxInstall(PendingVboxInstall {
+                vm,
+                conflicts,
+                needs_install,
+                needs_import,
+                room: room.clone(),
+            }),
+        });
+        app.sys("🔒 sudo password needed to install VirtualBox — type it here (hidden), Enter to proceed · Esc cancels. Local only: never sent to the room.");
         return;
     }
-    spawn_vm_execute(vm, conflicts, needs_install, needs_import, app, app_tx, out_tx, room);
+    spawn_vm_execute(vm, conflicts, needs_install, needs_import, app, app_tx, out_tx, room, None);
 }
 
 /// Final step of the gauntlet: off-thread, stop any VT-x holders (reversibly),
@@ -3020,6 +3074,10 @@ fn spawn_vm_execute(
     app_tx: &UnboundedSender<Net>,
     out_tx: &UnboundedSender<WsMsg>,
     room: &Arc<fernet::Fernet>,
+    // sudo password captured by the masked modal when VBox install needed root
+    // and creds weren't cached. Fed to the install's `sudo -S` over stdin; `None`
+    // means creds are already cached (the install step uses `sudo -n`).
+    password: Option<String>,
 ) {
     // Resolve the appliance path now (on the app thread) so the blocking task
     // doesn't have to re-scan; None is fine unless an import actually proves
@@ -3041,18 +3099,18 @@ fn spawn_vm_execute(
     let out = out_tx.clone();
     let room = room.clone();
     let announce_vm = vm.clone();
+    let pw = password; // moved into the blocking install step below
     tokio::spawn(async move {
         let res = tokio::task::spawn_blocking(move || {
             for h in &conflicts {
                 sbx::stop_vtx_holder(h).map_err(|e| format!("freeing VT-x: {e}"))?;
             }
             if needs_install && !sbx::vbox_installed() {
-                // VirtualBox install needs root. No in-TUI password was captured
-                // on this path, so `ensure_vbox_install(None)` uses `sudo -n`:
-                // it succeeds if creds are cached (the confirm step asks the user
-                // to run `sudo -v` first) and fails fast with a clear message
-                // otherwise — never hanging on a tty prompt the TUI can't host.
-                sbx::ensure_vbox_install(None).map_err(|e| format!("install failed: {e}"))?;
+                // VirtualBox install needs root. `pw` is `Some` when the masked
+                // modal captured a password (creds weren't cached) → fed to
+                // `sudo -S`; `None` means creds are cached → `sudo -n`. Either way
+                // it never hangs on a tty prompt the raw-mode TUI can't host.
+                sbx::ensure_vbox_install(pw).map_err(|e| format!("install failed: {e}"))?;
             }
             // Pull the shared appliance in if the VM still isn't registered.
             if needs_import && !sbx::vm_registered(&vm) {
