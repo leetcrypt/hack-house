@@ -670,18 +670,42 @@ fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme
     f.render_widget(Paragraph::new(bar), area);
 }
 
-fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
-    if l.system {
-        // System lines carry the canonical ⛧ as a placeholder for "the house
-        // sigil"; swap it for the active theme's sigil so e.g. crypt shows ✝,
-        // never a pentagram. User messages (l.system == false) are left as typed.
-        let text = l.text.replace('⛧', &theme.sigil);
-        return Line::from(Span::styled(
-            format!("  {} {}", theme.sigil, text),
-            Style::default()
-                .fg(theme.system)
-                .add_modifier(Modifier::ITALIC),
-        ));
+/// Render one chat record into one-or-more visual lines. A record may carry
+/// embedded newlines (e.g. an AI agent's multi-line answer or injected plan);
+/// ratatui treats a `Line` as a single visual row, so we split on `\n` ourselves
+/// and indent the continuations to align under the first line's text.
+fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Vec<Line<'a>> {
+    // "Action" lines — client system notices and AI agent output (which marks
+    // itself with a leading †) — read better as dim, italic, sigil-marked blocks
+    // than as ordinary chatter, so the eye can skip them or zero in on them.
+    let is_action = l.system || l.text.starts_with('†');
+    if is_action {
+        // Swap the canonical † placeholder for the active theme's sigil so each
+        // vestment renders its own glyph (e.g. crypt shows ✝).
+        let body = l
+            .text
+            .strip_prefix('†')
+            .unwrap_or(&l.text)
+            .trim_start()
+            .replace('†', &theme.sigil);
+        let style = Style::default()
+            .fg(theme.system)
+            .add_modifier(Modifier::ITALIC);
+        // Attribute an agent's action to it (system notices stay anonymous).
+        let head = if l.system || l.username.is_empty() {
+            format!("  {} ", theme.sigil)
+        } else {
+            format!("  {} {}: ", theme.sigil, l.username)
+        };
+        let indent = " ".repeat(head.chars().count());
+        return body
+            .split('\n')
+            .enumerate()
+            .map(|(i, seg)| {
+                let prefix = if i == 0 { head.clone() } else { indent.clone() };
+                Line::from(Span::styled(format!("{prefix}{seg}"), style))
+            })
+            .collect();
     }
     let name_color = if l.username == app.me {
         theme.me
@@ -691,7 +715,7 @@ fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
     // Author's current badge inline, so a message's authority is legible right
     // in the transcript — not only in the clergy panel.
     let badges = role_badges(app, &l.username, theme);
-    Line::from(vec![
+    let head: Vec<Span> = vec![
         Span::styled(format!("{} ", l.ts), Style::default().fg(theme.dim)),
         Span::styled(format!("{badges} "), Style::default().fg(theme.dim)),
         Span::styled(
@@ -699,14 +723,34 @@ fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
             Style::default().fg(name_color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(": ", Style::default().fg(theme.dim)),
-        Span::styled(l.text.as_str(), Style::default().fg(theme.title)),
-    ])
+    ];
+    let mut segs = l.text.split('\n');
+    let first = segs.next().unwrap_or("");
+    let mut spans = head;
+    spans.push(Span::styled(first.to_string(), Style::default().fg(theme.title)));
+    let mut out = vec![Line::from(spans)];
+    // Continuation rows indent under the message body so a multi-line message
+    // reads as one coherent block under its author.
+    let indent = " ".repeat(
+        l.ts.chars().count() + 1 + badges.chars().count() + 1 + l.username.chars().count() + 2,
+    );
+    for seg in segs {
+        out.push(Line::from(Span::styled(
+            format!("{indent}{seg}"),
+            Style::default().fg(theme.title),
+        )));
+    }
+    out
 }
 
 fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let inner_h = area.height.saturating_sub(2) as usize; // rows inside the border
     let text_w = area.width.saturating_sub(2).max(1); // wrap width inside the border
-    let mut lines: Vec<Line> = app.lines.iter().map(|l| fmt_line(l, app, theme)).collect();
+    let mut lines: Vec<Line> = app
+        .lines
+        .iter()
+        .flat_map(|l| fmt_line(l, app, theme))
+        .collect();
 
     // Live preview bubbles for agents currently streaming a reply, rendered
     // below the committed history. Dim + italic so they read as in-progress;
@@ -758,7 +802,7 @@ fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Them
     f.render_widget(chat, area);
 }
 
-/// Glyph for a single role. The host sigil is theme-dependent (✝ for crypt, ⛧
+/// Glyph for a single role. The host sigil is theme-dependent (✝ for crypt, †
 /// for the default), the rest are fixed.
 fn role_glyph(role: Role, theme: &Theme) -> &str {
     match role {
@@ -769,7 +813,7 @@ fn role_glyph(role: Role, theme: &Theme) -> &str {
     }
 }
 
-/// The stacked badge string for `name` — e.g. `⛧⚡◆` for a host who summoned a
+/// The stacked badge string for `name` — e.g. `†⚡◆` for a host who summoned a
 /// sandbox and can drive, or a lone `•` for a plain member. Single source of
 /// truth shared by the roster and the chat author prefix so both always agree
 /// with each other and with what the broker enforces.
