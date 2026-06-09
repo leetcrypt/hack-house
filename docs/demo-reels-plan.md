@@ -63,7 +63,7 @@ stats:
   ["GUI",     "browser"]
 ```
 Spoken/caption outro: "A shared Kali rig your whole crew drives — saved, restored,
-end-to-end encrypted. ⛧ link in bio."
+end-to-end encrypted. † link in bio."
 
 ---
 
@@ -94,7 +94,7 @@ stats:
   ["bind",    "loopbk"]
 ```
 Outro: "A portable Parrot desktop you can hand to a teammate as a single file —
-no host mounts, loopback-only. ⛧"
+no host mounts, loopback-only. †"
 
 ---
 
@@ -127,7 +127,7 @@ stats:
   ["model",   "local"]
 ```
 Outro: "An autonomous agent whose blast radius is one container — gated by a single
-grant, running a local model. ⛧"
+grant, running a local model. †"
 
 ---
 
@@ -157,7 +157,7 @@ cd tools/video-forge
 # 4. Vertical reframe + ship
 cd ~/coding/video-toolkit
 bin/social-reframe.sh output/hh-<reel>-cut.mp4 --out output/hh-<reel>-reel.mp4 --size 1080x1920
-bin/tg-send.sh output/hh-<reel>-reel.mp4 andre "hack-house — <reel> ⛧"
+bin/tg-send.sh output/hh-<reel>-reel.mp4 andre "hack-house — <reel> †"
 ```
 
 ### Gotchas (from prior demo work)

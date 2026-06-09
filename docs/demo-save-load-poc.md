@@ -41,7 +41,7 @@ the chat provider is Ollama and a `qwen2.5-coder` is present (it is — pulled).
    → agent drives the shared shell; `fib.py` is written and executed; the
    sandbox pane shows the Fibonacci output.
 5. **Freeze it** — alice: `/sbx save buildbox` →
-   `⛧ saved sandbox → image hh-snap:buildbox · reload with /sbx load buildbox`.
+   `† saved sandbox → image hh-snap:buildbox · reload with /sbx load buildbox`.
 6. **Walk away** — alice: `/sbx stop` (or quits the client entirely). Container is
    purged; prove it: `docker ps -a` shows no `hack-house`, but
    `docker images hh-snap` still lists `buildbox`.

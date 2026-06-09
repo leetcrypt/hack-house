@@ -160,7 +160,7 @@ fi
 
 # cloudimg: the existing, tested unattended path.
 if [[ "$KIND" == "cloudimg" ]]; then
-    echo "⛧ building '$NAME' via vbox-new.sh (cloud-init, unattended)…" >&2
+    echo "† building '$NAME' via vbox-new.sh (cloud-init, unattended)…" >&2
     args=(--name "$NAME" --release "${VERSION:-24.04}" --cpus "$CPUS" --mem "$MEM" --disk "$DISK")
     [[ $ASSUME_YES -eq 1 ]] && args+=(--yes)
     [[ $DO_BOOT -eq 0 ]] && args+=(--no-boot)
@@ -216,7 +216,7 @@ fi
 
 # ── ova: import the appliance and we're done ─────────────────────────────────
 if [[ "$KIND" == "ova" ]]; then
-    echo "⛧ importing appliance '$NAME' …" >&2
+    echo "† importing appliance '$NAME' …" >&2
     if VBoxManage import "$SRC" >/dev/null; then
         echo "✓ imported '$NAME' — boot it with /sbx vbox \"$NAME\"" >&2
         exit 0
@@ -225,7 +225,7 @@ if [[ "$KIND" == "ova" ]]; then
 fi
 
 # ── iso: create a VM, attach the installer, boot it ──────────────────────────
-echo "⛧ creating VM '$NAME' (${OSTYPE:-Other_64}) …" >&2
+echo "† creating VM '$NAME' (${OSTYPE:-Other_64}) …" >&2
 VBoxManage createvm --name "$NAME" --ostype "${OSTYPE:-Other_64}" --register >/dev/null
 
 # Roll the half-built VM back if any step below fails.
@@ -259,7 +259,7 @@ echo "✓ VM '$NAME' created — the installer ISO is attached." >&2
 echo "  finish setup inside the VirtualBox window (it boots into the installer)." >&2
 
 if [[ $DO_BOOT -eq 1 ]]; then
-    echo "⛧ booting '$NAME' (GUI) …" >&2
+    echo "† booting '$NAME' (GUI) …" >&2
     VBoxManage startvm "$NAME" --type gui >/dev/null
     echo "✓ launched $NAME" >&2
 else

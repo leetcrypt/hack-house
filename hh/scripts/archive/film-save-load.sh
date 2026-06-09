@@ -133,7 +133,7 @@ sleep 2
 ok "recording → $CAST"
 
 # ---- 3. title + join --------------------------------------------------------
-say "echo '⛧ hack-house — ephemeral by default, persistent on demand'"
+say "echo '† hack-house — ephemeral by default, persistent on demand'"
 sleep 1.2
 say "$BIN connect 127.0.0.1 $PORT alice --password '$PW' --no-tls"
 wait_for 'alice|roster|hack-house|owner' 20 && ok "alice joined" || fail "alice never joined"
@@ -196,7 +196,7 @@ docker images "$SNAP" --format '{{.Tag}}' | grep -qx "$LABEL" && ok "image survi
 sleep 1
 say "docker ps -a --format '{{.Names}}' | grep hack-house || echo '(no hack-house container — purged)'"
 sleep 1.5
-say "docker images hh-snap --format '⛧ {{.Repository}}:{{.Tag}}'"
+say "docker images hh-snap --format '† {{.Repository}}:{{.Tag}}'"
 sleep 2
 
 # ---- 9. fresh client → load -------------------------------------------------

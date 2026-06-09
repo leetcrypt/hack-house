@@ -57,7 +57,7 @@ HOST="${HOST:-$DEFAULT_HOST}"
 
 # No password yet? Prompt with no echo — straight into RAM, out of history.
 if [[ -z "$PASSWORD" ]]; then
-  read -rsp "⛧ room password: " PASSWORD < /dev/tty
+  read -rsp "† room password: " PASSWORD < /dev/tty
   echo
 fi
 [[ -n "$PASSWORD" ]] || { echo "✖ a password is required" >&2; exit 1; }
@@ -71,7 +71,7 @@ if [[ "$SYNC" -eq 1 ]]; then
   TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 10"
   for remote in gitea origin; do
     if git remote get-url "$remote" >/dev/null 2>&1; then
-      echo "⛧ syncing $BRANCH from $remote…" >&2
+      echo "† syncing $BRANCH from $remote…" >&2
       GIT_TERMINAL_PROMPT=0 $TO git pull --ff-only "$remote" "$BRANCH" 2>&1 \
         || echo "  (skipped — couldn't fast-forward from $remote/$BRANCH)" >&2
     fi
@@ -83,7 +83,7 @@ fi
 # runs a prebuilt binary as-is (handy for remote joiners without a toolchain),
 # preferring release, then debug.
 if [[ "$NO_BUILD" -eq 0 ]]; then
-  echo "⛧ building client (use --no-build to skip)…" >&2
+  echo "† building client (use --no-build to skip)…" >&2
   cargo build --quiet || { echo "✖ build failed" >&2; exit 1; }
   BIN=./target/debug/hack-house
 else

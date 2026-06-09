@@ -430,7 +430,7 @@ impl App {
                 self.users = users;
                 self.connected = true;
                 self.chat_scroll = 0;
-                self.sys(format!("joined as {} ⛧", self.me));
+                self.sys(format!("joined as {} †", self.me));
                 self.sys("/sbx <docker|podman|multipass|vbox|local> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => self.push_line(l),
@@ -487,7 +487,7 @@ impl App {
                                 parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
                                 backend: backend.clone(),
                             });
-                            self.sys(format!("⛧ sandbox summoned ({backend}) — F2 to drive"));
+                            self.sys(format!("† sandbox summoned ({backend}) — F2 to drive"));
                         }
                     }
                 } else {
@@ -497,7 +497,7 @@ impl App {
                     self.owner = None;
                     self.drivers.clear();
                     self.sudoers.clear();
-                    self.sys("⛧ sandbox dismissed");
+                    self.sys("† sandbox dismissed");
                 }
             }
             Net::SbxResize { rows, cols } => {
@@ -519,22 +519,22 @@ impl App {
                 let new: std::collections::HashSet<String> = drivers.into_iter().collect();
                 let sudo: std::collections::HashSet<String> = sudoers.into_iter().collect();
                 if !owner.is_empty() && self.owner.as_deref() != Some(owner.as_str()) {
-                    self.sys(format!("⛧ {owner} is the superuser (sandbox owner)"));
+                    self.sys(format!("† {owner} is the superuser (sandbox owner)"));
                 }
                 if new.contains(&self.me)
                     && !self.drivers.contains(&self.me)
                     && self.owner.is_some()
                 {
-                    self.sys("⛧ you were granted drive (F2 to take the shell)");
+                    self.sys("† you were granted drive (F2 to take the shell)");
                 } else if !new.contains(&self.me) && self.drivers.contains(&self.me) {
                     self.driving = false;
-                    self.sys("⛧ your drive permission was revoked");
+                    self.sys("† your drive permission was revoked");
                 }
                 if sudo.contains(&self.me)
                     && !self.sudoers.contains(&self.me)
                     && self.owner.is_some()
                 {
-                    self.sys("⛧ you were granted sudo (superuser) in the VM");
+                    self.sys("† you were granted sudo (superuser) in the VM");
                 }
                 self.owner = Some(owner).filter(|o| !o.is_empty());
                 self.drivers = new;
@@ -548,7 +548,7 @@ impl App {
                 // Skip our own echo — we already saw the local "launched" line.
                 if by != self.me {
                     self.sys(format!(
-                        "⛧ {by} opened ‘{vm}’ locally — `/sbx gui {vm}` to open your own copy"
+                        "† {by} opened ‘{vm}’ locally — `/sbx gui {vm}` to open your own copy"
                     ));
                 }
             }
@@ -771,7 +771,7 @@ fn handle_ft(
                 }
             }
             app.sys(format!(
-                "⛧ {} offers {} ({}{}){} — /accept or /reject",
+                "† {} offers {} ({}{}){} — /accept or /reject",
                 o.from,
                 o.name,
                 ft::human(o.size as usize),
@@ -868,7 +868,7 @@ fn handle_ft(
                                     match ft::commit(downloads, &t.meta, &tmp) {
                                         Ok(p) => {
                                             app.sys(format!(
-                                                "⛧ saved {} ({}) — verified ✓",
+                                                "† saved {} ({}) — verified ✓",
                                                 p.display(),
                                                 ft::human(t.meta.size as usize)
                                             ));
@@ -1044,7 +1044,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     let SudoPrompt { password, pending } =
                                         app.sudo_prompt.take().unwrap();
                                     if password.is_empty() {
-                                        app.sys("⛧ cancelled — empty password");
+                                        app.sys("† cancelled — empty password");
                                     } else {
                                         match pending {
                                         PendingPrivileged::Launch(pending) => {
@@ -1089,7 +1089,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 }
                                 KeyCode::Esc => {
                                     app.sudo_prompt = None;
-                                    app.sys("⛧ sudo cancelled — launch aborted");
+                                    app.sys("† sudo cancelled — launch aborted");
                                 }
                                 KeyCode::Backspace => {
                                     if let Some(p) = app.sudo_prompt.as_mut() {
@@ -1121,7 +1121,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 app.agent_sbx_allow = false;
                                 let _ = sb.write_input(&[0x03]); // Ctrl-C into the shell
                                 broadcast_acl(&out_tx, &session.room, &app);
-                                app.sys("⛧ kill switch — revoked all drive + interrupted the shell");
+                                app.sys("† kill switch — revoked all drive + interrupted the shell");
                             } else {
                                 app.sys("kill switch is for the sandbox owner (you don't hold the PTY)");
                             }
@@ -1144,7 +1144,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             // stays responsive, then re-attach the websocket on success.
                             if !app.reconnecting {
                                 app.reconnecting = true;
-                                app.sys("⛧ reconnecting…");
+                                app.sys("† reconnecting…");
                                 let p = params.clone();
                                 let rtx = recon_tx.clone();
                                 tokio::task::spawn_blocking(move || {
@@ -1186,7 +1186,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 }
                                 KeyCode::Esc => {
                                     app.vbox_picker = None;
-                                    app.sys("⛧ picker dismissed");
+                                    app.sys("† picker dismissed");
                                 }
                                 _ => {} // ignore other keys so the picker stays put
                             }
@@ -1260,7 +1260,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             if app.sandbox.is_some() {
                                 app.layout.cycle_zoom();
                                 announced_dims = None; // re-sync PTY to the new height
-                                app.sys(format!("⛧ {}", app.layout.describe()));
+                                app.sys(format!("† {}", app.layout.describe()));
                             } else {
                                 app.sys("no sandbox to fullscreen — /sbx <type> first");
                             }
@@ -1271,10 +1271,10 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             app.cycle_focus();
                             match app.focused_pane {
                                 Some(p) => app.sys(format!(
-                                    "⛧ editing {} — arrows resize · Esc done",
+                                    "† editing {} — arrows resize · Esc done",
                                     pane_label(p)
                                 )),
-                                None => app.sys("⛧ layout editing off"),
+                                None => app.sys("† layout editing off"),
                             }
                         } else if app.focused_pane.is_some() && !app.driving {
                             // Interactive layout editing: a pane is selected (via click
@@ -1293,7 +1293,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             match k.code {
                                 KeyCode::Esc | KeyCode::Enter => {
                                     app.focused_pane = None;
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                    app.sys(format!("† {}", app.layout.describe()));
                                 }
                                 _ if dir.is_some() => {
                                     // Every pane is resizable on both axes wherever a
@@ -1305,7 +1305,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                             // rect (height *or* width now), so force a
                                             // PTY re-sync to rebroadcast the new grid.
                                             announced_dims = None;
-                                            app.sys(format!("⛧ {}", app.layout.describe()));
+                                            app.sys(format!("† {}", app.layout.describe()));
                                         }
                                         Resize::NoAxisHere => {
                                             app.sys(
@@ -1426,7 +1426,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                         Some(p) if p != Pane::Input => {
                                             app.focused_pane = Some(p);
                                             app.sys(format!(
-                                                "⛧ editing {} — arrows resize · Esc done",
+                                                "† editing {} — arrows resize · Esc done",
                                                 pane_label(p)
                                             ));
                                         }
@@ -1489,7 +1489,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                         .await;
                                         let _ = match res {
                                             Ok(Ok(vm)) => tx.send(Net::Sys(format!(
-                                                "⛧ imported VM ‘{vm}’ — `/sbx vbox gui {vm}` to boot it"
+                                                "† imported VM ‘{vm}’ — `/sbx vbox gui {vm}` to boot it"
                                             ))),
                                             Ok(Err(e)) => tx.send(Net::Sys(format!(
                                                 "(received .ova not auto-imported: {e})"
@@ -1513,7 +1513,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                             .await;
                                             let _ = match res {
                                                 Ok(Ok(dest)) => tx.send(Net::Sys(format!(
-                                                    "⛧ bridged into sandbox → {dest}"
+                                                    "† bridged into sandbox → {dest}"
                                                 ))),
                                                 Ok(Err(e)) => tx.send(Net::Sys(format!(
                                                     "(received file not bridged into sandbox: {e})"
@@ -1594,7 +1594,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
                             backend: backend.label().to_string(),
                         });
-                        app.sys(format!("⛧ sandbox summoned ({}) — /drive to take the shell", backend.label()));
+                        app.sys(format!("† sandbox summoned ({}) — /drive to take the shell", backend.label()));
                         app.owner = Some(app.me.clone());
                         app.drivers.clear();
                         app.drivers.insert(app.me.clone());
@@ -1625,7 +1625,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             match net::open(&session, tx.clone()).await {
                                 Ok(w) => {
                                     let _ = sink_tx.send(w);
-                                    app.sys("⛧ websocket re-attached — syncing…");
+                                    app.sys("† websocket re-attached — syncing…");
                                     // If we host the sandbox, re-announce it so the
                                     // rest of the house re-syncs the shared shell.
                                     if let Some((be, sbx_name)) = &broker_meta {
@@ -1774,15 +1774,15 @@ fn handle_command(
         // room — other peers keep their own history.
         app.lines.clear();
         app.chat_scroll = 0;
-        app.sys("⛧ chat cleared");
+        app.sys("† chat cleared");
     } else if line == "/pw" || line == "/password" {
         // Show the room password locally (never broadcast). Handy when the
         // server's password was autogenerated and you need to read it off / share
         // it out-of-band to invite someone into the room.
         if app.password.is_empty() {
-            app.sys("⛧ no room password (joined without one)");
+            app.sys("† no room password (joined without one)");
         } else {
-            app.sys(format!("⛧ room password: {}", app.password));
+            app.sys(format!("† room password: {}", app.password));
         }
     } else if let Some(rest) = line.strip_prefix("/theme") {
         // Live vestment switch: `/theme <name>`, or bare `/theme` to list options.
@@ -1842,7 +1842,7 @@ fn handle_command(
         let mut resized = false;
         match cmd {
             "" => {
-                app.sys(format!("⛧ layout: {}", app.layout.describe()));
+                app.sys(format!("† layout: {}", app.layout.describe()));
                 app.sys("  resize live: F4 fullscreen · F5 or click a pane, then arrows · Esc done");
                 app.sys(format!(
                     "  presets: {} — /layout save <name> · load <name> · rm <name>",
@@ -1854,11 +1854,11 @@ fn handle_command(
                 app.layout = Layout::default();
                 app.layout.set_roster_width(roster); // keep your roster choice on reset
                 resized = true;
-                app.sys(format!("⛧ layout reset — {}", app.layout.describe()));
+                app.sys(format!("† layout reset — {}", app.layout.describe()));
             }
             "save" if !arg.is_empty() => match app.layout.save(arg) {
                 Ok(slug) => app.sys(format!(
-                    "⛧ saved layout '{slug}' — re-apply anytime with /layout load {slug}"
+                    "† saved layout '{slug}' — re-apply anytime with /layout load {slug}"
                 )),
                 Err(e) => app.err(format!("couldn't save layout: {e}")),
             },
@@ -1866,7 +1866,7 @@ fn handle_command(
                 Ok(l) => {
                     app.layout = l;
                     resized = true;
-                    app.sys(format!("⛧ loaded layout '{arg}' — {}", app.layout.describe()));
+                    app.sys(format!("† loaded layout '{arg}' — {}", app.layout.describe()));
                 }
                 Err(_) => app.err(format!(
                     "no saved layout '{arg}' — saved: {}",
@@ -1874,10 +1874,10 @@ fn handle_command(
                 )),
             },
             "list" | "presets" | "ls" => {
-                app.sys(format!("⛧ saved layouts: {}", once_or_none(Layout::available())));
+                app.sys(format!("† saved layouts: {}", once_or_none(Layout::available())));
             }
             "rm" | "delete" | "del" if !arg.is_empty() => match Layout::remove(arg) {
-                Ok(()) => app.sys(format!("⛧ deleted layout '{arg}'")),
+                Ok(()) => app.sys(format!("† deleted layout '{arg}'")),
                 Err(e) => app.err(format!("{e}")),
             },
             // Bare `/layout <name>` → load a saved preset if it exists.
@@ -1885,7 +1885,7 @@ fn handle_command(
                 Ok(l) => {
                     app.layout = l;
                     resized = true;
-                    app.sys(format!("⛧ loaded layout '{name}' — {}", app.layout.describe()));
+                    app.sys(format!("† loaded layout '{name}' — {}", app.layout.describe()));
                 }
                 Err(_) => app.sys(
                     "usage: /layout [save <name>|load <name>|list|rm <name>|reset] — resize live with F4/F5 or click",
@@ -1901,7 +1901,7 @@ fn handle_command(
             app.sys("no sandbox running — /sbx <type> first");
         } else if app.can_drive() {
             app.driving = true;
-            app.sys("⛧ drive mode ON — type into the shell (Esc reaches vim etc.) · press F2 to release");
+            app.sys("† drive mode ON — type into the shell (Esc reaches vim etc.) · press F2 to release");
         } else {
             app.sys("you don't have drive permission — the owner can /grant you");
         }
@@ -2167,7 +2167,7 @@ fn handle_command(
                         let res = tokio::task::spawn_blocking(move || sbx::save_state(be, &name, &label, local)).await;
                         let _ = match res {
                             Ok(Ok(desc)) => tx.send(Net::Sys(format!(
-                                "⛧ saved sandbox → {desc} · reload with `/sbx load {lbl}`"))),
+                                "† saved sandbox → {desc} · reload with `/sbx load {lbl}`"))),
                             Ok(Err(e)) => tx.send(Net::Err(format!("save failed: {e}"))),
                             Err(e) => tx.send(Net::Err(format!("save task: {e}"))),
                         };
@@ -2238,7 +2238,7 @@ fn handle_command(
                                     .await;
                                     match res {
                                         Ok(Ok(desc)) => {
-                                            let _ = atx.send(Net::Sys(format!("⛧ {desc} · booting…")));
+                                            let _ = atx.send(Net::Sys(format!("† {desc} · booting…")));
                                             spawn_launch(
                                                 sbx::Backend::Multipass,
                                                 sbx::Backend::Multipass.default_image().to_string(),
@@ -2341,7 +2341,7 @@ fn handle_command(
                                 })
                                 .await;
                                 let _ = match res {
-                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ saved VM → {desc}"))),
+                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("† saved VM → {desc}"))),
                                     Ok(Err(e)) => tx.send(Net::Err(format!("vmsave failed: {e}"))),
                                     Err(e) => tx.send(Net::Err(format!("vmsave task: {e}"))),
                                 };
@@ -2400,7 +2400,7 @@ fn handle_command(
                                 })
                                 .await;
                                 let _ = match res {
-                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
+                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("† {desc}"))),
                                     Ok(Err(e)) => tx.send(Net::Err(format!("vmload failed: {e}"))),
                                     Err(e) => tx.send(Net::Err(format!("vmload task: {e}"))),
                                 };
@@ -2463,7 +2463,7 @@ fn handle_command(
                                 })
                                 .await;
                                 let _ = match res {
-                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
+                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("† {desc}"))),
                                     Ok(Err(e)) => tx.send(Net::Err(format!("vmlib install failed: {e}"))),
                                     Err(e) => tx.send(Net::Err(format!("vmlib install task: {e}"))),
                                 };
@@ -2596,7 +2596,7 @@ fn handle_command(
         if let Some(mut child) = agent.take() {
             let _ = child.kill();
             let _ = child.wait();
-            app.sys("⛧ dismissed the AI agent");
+            app.sys("† dismissed the AI agent");
             // Drop any sandbox drive the agent held so a dead handle can't act.
             app.agent_sbx_allow = false;
             let revoked = app
@@ -2680,7 +2680,7 @@ fn handle_command(
                         None => String::new(),
                     };
                     app.sys(format!(
-                        "⛧ summoning {name} ({desc}{hdesc})… it will announce when online"
+                        "† summoning {name} ({desc}{hdesc})… it will announce when online"
                     ));
                     if grant_sbx {
                         // Grant now if a sandbox is already running; otherwise the
@@ -2690,7 +2690,7 @@ fn handle_command(
                             broadcast_acl(out_tx, room, app);
                         }
                         app.sys(format!(
-                            "⛧ {name} will get sandbox drive — Ctrl-X kills all drive in a pinch"
+                            "† {name} will get sandbox drive — Ctrl-X kills all drive in a pinch"
                         ));
                     }
                 }
@@ -2885,7 +2885,7 @@ fn open_vbox_picker(app: &mut App) {
     match sbx::list_vms() {
         Ok(vms) if !vms.is_empty() => {
             app.vbox_picker = Some(VboxPicker { vms, selected: 0 });
-            app.sys("⛧ pick a VM — ↑/↓ move · Enter/Tab choose · Esc dismiss");
+            app.sys("† pick a VM — ↑/↓ move · Enter/Tab choose · Esc dismiss");
         }
         Ok(_) => app.sys(
             "no VirtualBox VMs registered — a host can /send you a .ova, then `/sbx vbox gui <vm> yes` to import it",
@@ -2931,7 +2931,7 @@ fn launch_vbox_new(app: &mut App, name: String, user: String, app_tx: &Unbounded
         let (n, u) = (name.clone(), user);
         let res = tokio::task::spawn_blocking(move || sbx::vbox_new(&n, &u)).await;
         let _ = match res {
-            Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
+            Ok(Ok(desc)) => tx.send(Net::Sys(format!("† {desc}"))),
             Ok(Err(e)) => tx.send(Net::Err(format!("vbox new failed: {e}"))),
             Err(e) => tx.send(Net::Err(format!("vbox new task: {e}"))),
         };
@@ -3092,7 +3092,7 @@ fn spawn_vm_execute(
                 // Tell the room the shared VM is live (others can open their own).
                 let frame = json!({"_sbx": "vm", "vm": announce_vm});
                 let _ = out.send(WsMsg::Text(room.encrypt(frame.to_string().as_bytes())));
-                tx.send(Net::Sys(format!("⛧ {desc}")))
+                tx.send(Net::Sys(format!("† {desc}")))
             }
             Ok(Err(e)) => tx.send(Net::Err(e)),
             Err(e) => tx.send(Net::Err(format!("gui task: {e}"))),
