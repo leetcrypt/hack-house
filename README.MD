@@ -32,11 +32,12 @@ Encrypted chat that runs in your terminal. You host the server, you control the 
 - **SRP authentication** — the password is never sent over the network (zero-knowledge proof)
 - **Zero-knowledge server** — relays only ciphertext; cannot read messages, files, or terminal output
 - **RAM only** — nothing persisted on the server; close it and history is gone
-- **Shared sandbox** — summon a disposable `local` / `docker` / `multipass` box the whole room can watch and drive
+- **Shared sandbox** — summon a disposable `local` / `docker` / `podman` / `multipass` box the whole room can watch and drive. Docker defaults to **Parrot OS Security** (`parrotsec/core`) and Podman to **Kali** (`kalilinux/kali-rolling`) — pentest distros out of the box; Podman is rootless & daemonless, so **no sudo** to launch
 - **Snapshot save/load** — freeze a sandbox to a named snapshot and restore it later (`/sbx save` · `/sbx load` · `/sbx snaps`)
 - **Local VirtualBox VMs** — `/sbx vms` detects VirtualBox and lists your VMs; `/sbx gui <vm>` opens a desktop VM locally for the room to gather around — per-user consent gate, with automatic resolution of VT-x conflicts (Docker Desktop / multipass)
 - **Real permissions** — the host grants/revokes *drive* (keyboard) and *sudo* (VM superuser) per user; **stacking roster badges** show exactly who holds what, both in the clergy panel and inline on every chat message
 - **Local-first AI agent** — `/ai start` summons an in-room AI that runs against *your own* [Ollama](https://ollama.com) (no API key, nothing leaves your machine); replies **stream token-by-token** with **in-RAM semantic recall** of the conversation for context; model-agnostic, addressed-only, end-to-end encrypted like every other client
+- **AI that acts in the sandbox** — grant an agent *drive* and address it with `/ai <name> !<task>`; it works the shared box through a bounded, host-side **tool-calling loop** (run shell, write/read files, inspecting each result before the next step) and you watch its commands land live in the shared terminal. Ungranted, it stays **advisory-only** (tells you the commands, runs nothing); destructive commands are gated behind an explicit `/ai <name> confirm`
 - **Encrypted file transfer** — `/send` → `/accept` with SHA-256 verification
 - **TLS** — self-signed by default, or bring your own cert; `--no-tls` for local/Tailscale use
 - **Themes** — seven switchable "vestments" (`crypt` default · `church` · `neon` · `blush` · `matrix` · `wraith` · `goldcrypt`), plus a live randomizer
@@ -153,16 +154,18 @@ Type to chat. Slash commands and keys:
 | `/sendroom <path>` | Offer a file (or directory) to the whole room |
 | `/accept` · `/reject` | Respond to a pending file offer |
 | `/clear` | Wipe your chat scrollback (local only) |
-| `/ai start [model\|profile]` | Summon a local AI agent (default `ollama/qwen2.5:3b`; a bare name is a `models.toml` profile) |
+| `/ai start [model\|profile] [allow]` | Summon a local AI agent (default `ollama/qwen2.5:3b`; a bare name is a `models.toml` profile). `allow` auto-grants it sandbox drive at spawn |
 | `/ai stop` | Dismiss the agent you summoned |
 | `/ai <question>` | Ask the agent (`/ai <name> <question>` if several present) |
+| `/ai <name> !<task>` | Have a *granted* agent act in the shared sandbox (advisory-only if it has no drive) |
+| `/ai <name> confirm` | Approve a gated (destructive) command the agent proposed |
 | `/ai list` | List the agents present (or hint to `/ai start` if none) |
 | `/ai models` | Models the active agent can serve — or, with no agent, your local Ollama tags |
-| `/sbx launch [local\|docker\|multipass] [image] [install]` | Summon the shared sandbox (`install` fetches a missing backend; `--start` boots a stopped Docker daemon) |
+| `/sbx <local\|docker\|podman\|multipass> [image] [install]` | Summon the shared sandbox — the backend leads (`/sbx launch …` still works). Docker → **Parrot OS** (`parrotsec/core`), Podman → **Kali** (`kalilinux/kali-rolling`, rootless, no sudo). `install` fetches a missing backend; `docker --start` boots a stopped daemon |
 | `/sbx stop` | Tear down the sandbox you host |
 | `/sbx save [label]` · `/sbx load <label>` · `/sbx snaps` | Snapshot the sandbox, restore one, or list snapshots |
 | `/sbx vms` | Detect VirtualBox and list local VMs |
-| `/sbx launch vbox [new [name]]` | Open the local VirtualBox VM picker, or build a fresh VM via cloud-init |
+| `/sbx vbox [new [name]]` | Open the local VirtualBox VM picker, or build a fresh VM via cloud-init |
 | `/sbx gui <vm> [--install]` | Open a local VirtualBox desktop VM for the room (consent-gated) |
 | `/drive` · `F2` | Take the shared shell (`Esc` releases) |
 | `/grant <user>` · `/revoke <user>` | Owner: delegate/withdraw drive |
@@ -176,7 +179,7 @@ Type to chat. Slash commands and keys:
 
 ### The shared sandbox
 
-Anyone in the room can summon a disposable Linux box with `/sbx launch`. The
+Anyone in the room can summon a disposable Linux box with `/sbx <backend>`. The
 person who summons it is the **owner/host**: their client runs the real PTY
 locally and relays its output to everyone else as encrypted frames, so the
 server only ever sees ciphertext (same trust model as chat).
@@ -184,10 +187,15 @@ server only ever sees ciphertext (same trust model as chat).
 | Backend | Isolation | Notes |
 |---|---|---|
 | `local` | none | a `bash` shell on the host — fast, for dev/testing only |
-| `docker` | container | `ubuntu:24.04` by default; `/sbx launch docker --start` boots the daemon (or run `hh/scripts/ensure-docker.sh`) |
+| `docker` | container | **Parrot OS Security** (`parrotsec/core`) by default — swap `parrotsec/security` per-launch for the full pentest set; `/sbx docker --start` boots the daemon (or run `hh/scripts/ensure-docker.sh`) |
+| `podman` | container | **Kali rolling** (`kalilinux/kali-rolling`) by default — **rootless & daemonless, no sudo to launch** (add `kali-linux-headless` for the toolset); `hh/scripts/ensure-podman.sh` installs it |
 | `multipass` | full VM | `24.04` by default; strongest isolation, ~30 s to boot, the choice for real use |
 
-Tear it down with `/sbx stop` (purges the VM/container).
+The backend leads the command — `/sbx podman`, `/sbx docker`, `/sbx multipass`,
+`/sbx local` (the older `/sbx launch <backend>` still works). Override the image
+positionally, e.g. `/sbx docker parrotsec/security` or `/sbx podman ubuntu:24.04`.
+Both container engines are Debian/apt-based, so the dev-toolchain bootstrap runs
+unchanged. Tear it down with `/sbx stop` (purges the VM/container).
 
 **Snapshots.** Freeze the current sandbox to a named checkpoint with `/sbx save
 [label]`, list what you've stored with `/sbx snaps`, and restore one later with
@@ -256,6 +264,15 @@ when you quit). Pick a model at summon time with `/ai start <model>`.
 - **Addressed-only.** The agent reads room traffic like any client but forwards
   to the model *only* the messages that trigger it (`/ai …`) — no passive
   surveillance, no cost or noise when idle.
+- **Can drive the sandbox.** Grant an agent *drive* (`/grant <name>`, or summon it
+  pre-granted with `/ai start <name> allow`) and ask it to act with
+  `/ai <name> !<task>`. It works the shared box through a bounded **host-side
+  tool-calling loop** — run shell commands, write and read files — inspecting each
+  result before the next step, and you watch its commands appear live in the
+  shared terminal. Every command runs *inside the sandbox* (the container/VM is the
+  blast radius), capped in count and time. Without drive it stays **advisory-only**
+  (it spells out the commands, runs nothing). Destructive commands are blocked
+  pending an explicit `/ai <name> confirm`.
 - **Model-agnostic.** Swap the backend without touching the client: bundled
   adapters for `ollama` (default), `anthropic`, and any OpenAI-compatible
   endpoint (OpenAI, Groq, Together, local vLLM…), plus a `module:Class` hook for
@@ -360,10 +377,11 @@ supports `-h` / `--help`** for full usage.
 
 | Script | What it does |
 |---|---|
-| `ensure-docker.sh` | Install Docker and/or start its daemon (idempotent; `--check`/`--plan`/`--yes`). Invoked by `/sbx launch docker`. |
-| `ensure-multipass.sh` | Install Multipass. Invoked by `/sbx launch multipass`. |
-| `ensure-vbox.sh` | Install VirtualBox (warns on Secure Boot). Invoked by `/sbx launch virtualbox` and `/sbx gui`. |
-| `vbox-new.sh` | Create + boot a fresh Ubuntu VirtualBox VM via cloud-init. Invoked by `/sbx launch virtualbox`. |
+| `ensure-docker.sh` | Install Docker and/or start its daemon (idempotent; `--check`/`--plan`/`--yes`). Invoked by `/sbx docker`. |
+| `ensure-podman.sh` | Install Podman (rootless; sets up subuid/subgid). Daemonless — nothing to start. Invoked by `/sbx podman`. |
+| `ensure-multipass.sh` | Install Multipass. Invoked by `/sbx multipass`. |
+| `ensure-vbox.sh` | Install VirtualBox (warns on Secure Boot). Invoked by `/sbx vbox` and `/sbx gui`. |
+| `vbox-new.sh` | Create + boot a fresh Ubuntu VirtualBox VM via cloud-init. Invoked by `/sbx vbox new`. |
 | `sandbox-bootstrap.sh` | Baseline dev-tool install piped into a Docker sandbox at provision time (package list from `sandbox-tools.json`). |
 | `sandbox-tools.json` | Editable package list consumed by `sandbox-bootstrap.sh`. |
 
