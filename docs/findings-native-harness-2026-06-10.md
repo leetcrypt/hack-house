@@ -125,3 +125,39 @@ Changes in `_run_native` (bridge.py):
 Fixes mapped to observed failures: 3B early-stall → nudged to continue; give-up on
 error (both sizes) → nudged with the exit-code-aware message; over-nudging finished
 tasks → avoided by the `DONE:` fast path + safe-side accept.
+
+## Live validation (qwen2.5:3b, post-implementation)
+
+Ran the two prior failure cases against the freshly-built loop; ground truth via
+`podman exec hack-house`.
+
+- **Multi-step (`mkdir proj3 → write notes.txt → list`): PASS — fixed.** Previously
+  stalled after step 1; now chained write_file → `ls -1 proj3` to completion.
+  Ground truth: `proj3/notes.txt` exists, contents `hello world`. The 3B's dominant
+  failure mode is resolved by the loop alone (no model upgrade needed).
+- **Nudge fires on non-zero exit: confirmed.** On the `greet.sh` case the PTY mirror
+  showed `▸ (nudge: finish the task or reply DONE:)` after a 126, i.e. the
+  output-aware re-prompt triggered structurally as designed.
+- **Give-up-on-error is model-bound, not loop-bound.** The 3B still can't *recover*
+  the greet.sh task even when nudged: across runs it wrote self-referential content
+  (`echo "Hello, world!" > greet.sh`), its `chmod +x` didn't stick (file left 644),
+  and in one run it leaked a bare `write_file proj3/greet.sh …` tool call **as
+  summary text** (not the `<tool_call>` JSON form `_extract_text_tool_calls`
+  handles). These are 3B capability limits, consistent with the 3B-vs-7B table —
+  the loop's job is to detect and report them honestly, not to make a weak model
+  competent.
+
+### Honesty hardening added after live test
+
+The weak 3B routinely *claims* success it didn't achieve ("written, made executable,
+and run successfully" after a 126; "Created greet.sh… ran it" with nothing on disk).
+Echoing that prose as the final summary is actively misleading, so the nudge-budget
+exhaustion path no longer trusts it blindly:
+
+- never ran a tool → `[stopped — model described the task but never ran a tool]`
+- left a non-zero exit → `[stopped — last command exited {rc}; task likely
+  incomplete] …`
+- clean, action-backed turn → the model's summary (unchanged).
+
+Offline unit coverage: 23 assertions on `_completion_verdict` / `_parse_exit` /
+`_strip_done` / `_nudge_message`, all pass.
