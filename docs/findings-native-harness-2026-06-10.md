@@ -214,9 +214,52 @@ Dominant failure modes the summaries exposed, and where they point next:
 | path hallucination | `/home/qwen253b/conf_count.txt`, `~/` unexpanded | partly (model) |
 | content fabrication | wrote literal `dell` instead of running whoami | no (model capability) |
 
-The first row is the clear top priority — it is the single biggest score sink across
-all four models, and it is purely a harness parse gap. The benchmark now exists to
-prove whether fixing it moves the number.
+The first row was hypothesised as the top priority — a pure harness parse gap. The
+benchmark now exists to prove whether fixing it moves the number.
+
+### Parser fix — what the benchmark actually proved (2026-06-10)
+
+Generalised `OllamaProvider._extract_text_tool_calls` to recover a tool-call JSON
+object regardless of wrapper — qwen's `<tool_call>` tags, bare JSON, ```json fences,
+alternate tags (`<tools>`, `<function_call>`), OpenAI `{"function":{…}}` nesting, and
+`parameters`-vs-`arguments`. Gated on the known tool-name set (derived from the
+`tools` schema) so a stray JSON blob in prose — or a hallucinated `make_dir` — can
+never be coerced into an action. 11-case unit check: 8 leak shapes recover, 3
+negatives (prose / unknown tool / random config JSON) ignored.
+
+**Result: it does NOT move the weak-model pass rate.** Three 3b passes went 2 / 1 / 0
+of 12 (prior baseline 1/12 — pure noise); two 0.5b passes went 0 / 0 (prior 1/12).
+
+A direct `/api/chat` probe of 0.5b shows *why* — the hypothesis was wrong about the
+**form** of the leak. The weak models do not emit a JSON tool-call as text. They emit
+either:
+
+  * **malformed structured `tool_calls`** — e.g. `write_file` with `content: null`
+    (the field IS populated; the arguments are just wrong → model capability, not a
+    parse gap); or
+  * **a fenced shell/code block in prose with NO tool call at all** — e.g. content
+    `"…let's proceed:\n```bash\nmkdir -p a/b/c\n```"`, `tool_calls: None`. This is the
+    "[stopped — model described the task but never ran a tool]" case that dominates
+    the 0.5b table.
+
+So the structured-JSON recovery is a correct, safe hardening (it WILL catch a real
+JSON-in-text leak from any model that produces one, and cannot fabricate an action),
+but the failure it was meant to fix is not the failure these CPU models actually have.
+
+**The real harness-addressable lever the data now points to:** recover **fenced code
+blocks** (```bash … ``` / ```python … ```) as `run_shell` calls when the turn carried
+no structured call. That is the genuine form of the weak-model leak. It is a bigger
+safety call than JSON recovery (it executes a block the model wrote as prose, which
+may be illustrative rather than an action), so it is left as an explicit decision, not
+folded in silently.
+
+| failure mode | example | harness-addressable? |
+|---|---|---|
+| malformed structured args | `write_file` with `content:null` | no (model capability) |
+| fenced code in prose, no call | ```` ```bash\nmkdir -p a/b/c\n``` ````, `tool_calls:None` | **yes, but a safety call** — parse fences → run_shell |
+| JSON tool-call leaked as text | `<tools>{"name":…}` | yes — **now handled** (no weak-model effect) |
+| path hallucination | `/home/qwen253b/…`, `/ai/a/b/c`, `~/` unexpanded | partly (model) |
+| content fabrication | wrote literal `octocat`/`dell` instead of running whoami | no (model capability) |
 
 **Other models worth pulling for a non-qwen data point** (different family → different
 failure modes, both with strong native tool-calling): `llama3.2:3b` (~2 GB, peer to

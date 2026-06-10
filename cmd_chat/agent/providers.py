@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -164,56 +165,104 @@ class OllamaProvider:
                     args = {}
             calls.append({"name": fn.get("name", ""), "arguments": args or {}})
         # Small/quantized models (notably qwen2.5 on CPU) intermittently emit a valid
-        # tool call as literal `<tool_call>{…}</tool_call>` text in `content` instead
-        # of the structured `tool_calls` field. Recover those so a correct action
-        # isn't silently dropped (and strip the tags from the chat-facing text).
-        if not calls and "<tool_call>" in text:
-            text, calls = self._extract_text_tool_calls(text)
+        # tool call as literal text in `content` instead of the structured `tool_calls`
+        # field — qwen's `<tool_call>{…}</tool_call>`, but also bare/fenced JSON and
+        # alternate wrappers (`<tools>`, `<function_call>`). This is the single biggest
+        # score sink in the native-harness benchmark, so recover any well-formed JSON
+        # call here. Gate on the known tool names from `tools` so a stray JSON blob in
+        # prose can never be coerced into an action the model didn't structurally ask
+        # for. Only adopt the recovery when it actually found a call (a plain `DONE:`
+        # or prose turn is left untouched).
+        if not calls and text:
+            valid = {(t.get("function") or {}).get("name") for t in (tools or [])}
+            valid.discard(None)
+            recovered_text, recovered = self._extract_text_tool_calls(text, valid)
+            if recovered:
+                text, calls = recovered_text, recovered
         return text, calls
 
-    @staticmethod
-    def _extract_text_tool_calls(text: str) -> tuple[str, list[dict]]:
-        """Pull `<tool_call>{json}</tool_call>` blocks out of model text (qwen's
-        text-mode tool calls). Uses a JSON decoder (not regex) so nested braces in
-        arguments parse correctly; tolerates a missing closing tag. Returns the text
-        with the blocks removed and the recovered calls."""
+    # Wrapper tags a weak model wraps a leaked call (or its prose) in; stripped
+    # from the chat-facing text once the JSON inside is recovered.
+    _WRAP_TAGS = re.compile(
+        r"</?(?:tool_call|tool_calls|function_call|function|tools|native)>",
+        re.I,
+    )
+
+    @classmethod
+    def _coerce_call(cls, obj, valid_names) -> dict | None:
+        """Turn a decoded JSON object into a `{"name","arguments"}` call IF it
+        structurally is one for a KNOWN tool — else None. Unwraps the OpenAI-style
+        `{"function": {...}}` / `{"tool_call": {...}}` nesting and accepts either
+        `arguments` or qwen's `parameters` key. The `valid_names` gate is what makes
+        scanning arbitrary text safe: a random JSON blob in prose has no known tool
+        name, so it can never be coerced into an action."""
+        if not isinstance(obj, dict):
+            return None
+        inner = obj.get("function") or obj.get("tool_call")
+        if isinstance(inner, dict):
+            obj = inner
+        name = obj.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        if valid_names and name not in valid_names:
+            return None
+        args = obj.get("arguments")
+        if args is None:
+            args = obj.get("parameters")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        return {"name": name, "arguments": args}
+
+    @classmethod
+    def _extract_text_tool_calls(
+        cls, text: str, valid_names: set | None = None
+    ) -> tuple[str, list[dict]]:
+        """Recover tool calls a small/quantized model emitted as TEXT in `content`
+        instead of the structured `tool_calls` field. Handles qwen's
+        `<tool_call>{json}</tool_call>` blocks plus the looser CPU-model leaks: bare
+        JSON, ```json fenced blocks, and alternate wrapper tags (`<tools>`,
+        `<function_call>`). Scans for every JSON object via a decoder (so nested
+        braces in arguments parse correctly) and keeps ONLY those that `_coerce_call`
+        accepts as a known tool — never freeform prose, so it can't fabricate an
+        action the model didn't structurally request. Returns the text with the
+        recovered JSON (and now-orphaned wrapper tags / code fences) stripped, plus
+        the calls."""
         dec = json.JSONDecoder()
         calls: list[dict] = []
         spans: list[tuple[int, int]] = []
-        idx = 0
-        while True:
-            tag = text.find("<tool_call>", idx)
-            if tag == -1:
-                break
-            brace = text.find("{", tag)
+        i, n = 0, len(text)
+        while i < n:
+            brace = text.find("{", i)
             if brace == -1:
                 break
             try:
                 obj, end = dec.raw_decode(text, brace)
             except ValueError:
-                idx = tag + len("<tool_call>")
+                i = brace + 1
                 continue
-            if isinstance(obj, dict) and obj.get("name"):
-                args = obj.get("arguments")
-                if args is None:
-                    args = obj.get("parameters")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except ValueError:
-                        args = {}
-                calls.append({"name": obj["name"], "arguments": args or {}})
-            close = text.find("</tool_call>", end)
-            span_end = close + len("</tool_call>") if close != -1 else end
-            spans.append((tag, span_end))
-            idx = span_end
+            call = cls._coerce_call(obj, valid_names)
+            if call is not None:
+                calls.append(call)
+                spans.append((brace, end))
+            i = end
         if spans:
             kept, last = [], 0
             for start, stop in spans:
                 kept.append(text[last:start])
                 last = stop
             kept.append(text[last:])
-            text = "".join(kept).strip()
+            text = "".join(kept)
+            # The JSON is gone; drop the wrapper tags and any now-empty code fences
+            # it sat in so the chat summary reads as clean prose.
+            text = cls._WRAP_TAGS.sub("", text)
+            text = re.sub(r"```[a-zA-Z]*\s*```", "", text)
+            text = re.sub(r"```[a-zA-Z]*|```", "", text)
+            text = text.strip()
         return text, calls
 
     def stream(self, system: str, messages: list[Msg]):
