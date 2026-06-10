@@ -255,6 +255,10 @@ pub struct App {
     pub password: String,
     /// AI agents currently generating a reply — drives the "thinking" spinner.
     pub ai_typing: std::collections::HashSet<String>,
+    /// Every room member we've identified as an AI agent (via its `_ai` frames
+    /// or its `(ai) online` announce). Lets `/grant ai` grant drive to all of
+    /// them at once; pruned when a member leaves.
+    pub ai_agents: std::collections::HashSet<String>,
     /// Live, in-progress reply text per streaming agent, shown as a transient
     /// preview bubble until the final message lands. Keyed by agent name.
     pub ai_stream: std::collections::HashMap<String, String>,
@@ -309,6 +313,7 @@ impl App {
             error: None,
             password: String::new(),
             ai_typing: std::collections::HashSet::new(),
+            ai_agents: std::collections::HashSet::new(),
             ai_stream: std::collections::HashMap::new(),
             spin: 0,
             agent_sbx_allow: false,
@@ -433,7 +438,14 @@ impl App {
                 self.sys(format!("joined as {} †", self.me));
                 self.sys("/sbx <docker|podman|multipass|vbox|local> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
             }
-            Net::Message(l) => self.push_line(l),
+            Net::Message(l) => {
+                // An agent announces itself with "<name> (ai) online …" — record
+                // it as an AI member so `/grant ai` can reach it before it acts.
+                if !l.system && l.text.starts_with(&format!("{} (ai) ", l.username)) {
+                    self.ai_agents.insert(l.username.clone());
+                }
+                self.push_line(l);
+            }
             Net::Roster { users, capacity } => {
                 self.users = users;
                 self.capacity = capacity;
@@ -443,11 +455,13 @@ impl App {
                 if let Some(p) = self.users.iter().position(|u| u.user_id == uid) {
                     let name = self.users.remove(p).username;
                     self.ai_typing.remove(&name); // a departed agent isn't thinking
+                    self.ai_agents.remove(&name); // …nor an AI member any more
                     self.ai_stream.remove(&name); // …nor streaming a reply
                     self.sys(format!("{name} left"));
                 }
             }
             Net::AiTyping { name, on } => {
+                self.ai_agents.insert(name.clone()); // an `_ai` frame ⇒ AI member
                 if on {
                     self.ai_typing.insert(name);
                 } else {
@@ -455,6 +469,7 @@ impl App {
                 }
             }
             Net::AiStream { name, text, done } => {
+                self.ai_agents.insert(name.clone()); // an `_ai` frame ⇒ AI member
                 if done {
                     self.ai_stream.remove(&name);
                 } else {
@@ -2566,7 +2581,26 @@ fn handle_command(
         if !app.is_owner() {
             app.sys("only the sandbox owner can /grant");
         } else if target.is_empty() {
-            app.sys("usage: /grant <user>");
+            app.sys("usage: /grant <user>  (or /grant ai for every AI agent)");
+        } else if target == "ai" {
+            // Grant drive to every AI agent in the room in one shot, so the owner
+            // never has to name each model. Intersect the known-AI set with the
+            // live roster so departed agents are skipped.
+            let agents: Vec<String> = app
+                .users
+                .iter()
+                .map(|u| u.username.clone())
+                .filter(|n| app.ai_agents.contains(n))
+                .collect();
+            if agents.is_empty() {
+                app.sys("no AI agents in the room to grant — /ai start one first");
+            } else {
+                for n in &agents {
+                    app.drivers.insert(n.clone());
+                }
+                broadcast_acl(out_tx, room, app);
+                app.sys(format!("granted drive to all AI agents: {}", agents.join(", ")));
+            }
         } else {
             app.drivers.insert(target.to_string());
             broadcast_acl(out_tx, room, app);

@@ -364,6 +364,7 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "/grant <user|agent>",
                     "let a member OR an AI agent drive the shell",
                 ),
+                kv("/grant ai", "grant drive to every AI agent at once"),
                 kv("/revoke <user|agent>", "take back sandbox drive permission"),
                 kv("/sudo <user>", "delegate VM superuser (real sudo)"),
                 kv("/unsudo <user>", "revoke VM superuser"),
