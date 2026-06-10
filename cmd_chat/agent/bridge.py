@@ -14,6 +14,7 @@ import asyncio
 import base64
 import json
 import re
+import uuid
 
 import websockets
 
@@ -163,6 +164,10 @@ NATIVE_TOOLS = [
 NATIVE_TOOL_TIMEOUT = 60.0   # per-exec wall-clock cap (seconds)
 NATIVE_OUTPUT_CAP = 4096     # bytes of captured output fed back per tool call
 MIRROR_MAX_LINES = 12        # result lines mirrored into the shared PTY per step
+NATIVE_CONTEXT = 4           # recent transcript msgs the ACTION loop sees (tight:
+                             # chat chatter + semantic recall derail a weak model
+                             # off the actual instruction, so don't feed the full
+                             # Q&A window here)
 
 
 class AgentBridge(Client):
@@ -552,12 +557,15 @@ class AgentBridge(Client):
             text = text[:NATIVE_OUTPUT_CAP] + "\n[output truncated]"
         return text, proc.returncode if proc.returncode is not None else -1
 
-    async def _exec_tool(self, prefix: list[str], call: dict) -> str:
+    async def _exec_tool(self, ws, prefix: list[str], call: dict) -> str:
         """Dispatch one model tool call to the sandbox and return the result text
-        that gets fed back as the `tool` message. Destructive `run_shell` commands
-        are blocked (no execution) — the native loop has no human in it, so we
-        refuse rather than run; the simple harness + `/ai confirm` is the path for
-        intentionally destructive work."""
+        that gets fed back as the `tool` message. `run_shell` runs in the REAL
+        shared PTY (visible live to the whole room) via `_run_shell_in_pty`;
+        `write_file`/`read_file` exec out-of-band (their content is plumbing, not
+        a spectacle). Destructive `run_shell` commands are blocked (no execution)
+        — the native loop has no human in it, so we refuse rather than run; the
+        simple harness + `/ai confirm` is the path for intentionally destructive
+        work."""
         name = call.get("name", "")
         args = call.get("arguments") or {}
         if name == "run_shell":
@@ -566,8 +574,7 @@ class AgentBridge(Client):
                 return "[run_shell: empty command]"
             if DESTRUCTIVE.search(cmd):
                 return "[blocked: destructive command needs human approval — do not retry]"
-            out, rc = await self._exec_capture(prefix + ["sh", "-c", cmd])
-            return f"exit={rc}\n{out}".rstrip() if out.strip() else f"exit={rc} (no output)"
+            return await self._run_shell_in_pty(ws, prefix, cmd)
         if name == "write_file":
             path = str(args.get("path", "")).strip()
             content = str(args.get("content", ""))
@@ -588,6 +595,54 @@ class AgentBridge(Client):
             out, rc = await self._exec_capture(prefix + ["cat", "--", path])
             return out if rc == 0 else f"[read_file failed exit={rc}]\n{out}".rstrip()
         return f"[unknown tool {name}]"
+
+    async def _run_shell_in_pty(self, ws, prefix: list[str], cmd: str) -> str:
+        """Run a `run_shell` command in the REAL shared PTY so the whole room
+        watches it execute live, while still capturing output + exit code for the
+        model loop.
+
+        The untrusted command is staged to a temp file and run with `sh <file>`.
+        The wrapper line we type into the PTY contains ONLY our own fixed temp
+        paths (a random hex token) — room text never reaches the interactive
+        shell's parser, so there's no injection surface beyond the `sh <file>` we
+        already intend. Combined output is `tee`'d to a file we read out-of-band;
+        the staged command's exit code lands in a sentinel file we poll for
+        completion (the PTY shell runs asynchronously to us — we never read the
+        relayed `_sbx:data`, so the serve loop can't deadlock on this). Temp files
+        are cleaned up after."""
+        tok = uuid.uuid4().hex[:8]
+        base = f"/tmp/.hh_{tok}"
+        cmdf, rcf, outf = base + ".cmd", base + ".rc", base + ".out"
+        # Stage the command out-of-band (content on stdin, never shell-parsed).
+        _, rc = await self._exec_capture(
+            prefix + ["sh", "-c", 'cat > "$1"', "hh-stage", cmdf], stdin=cmd.encode())
+        if rc != 0:
+            return f"[run_shell: could not stage command (exit={rc})]"
+        # Type the wrapper into the shared PTY: run the staged command, record its
+        # exit code, tee combined output to a file. Visible to every member.
+        wrapper = f"{{ sh {cmdf}; echo $? > {rcf}; }} 2>&1 | tee {outf}\n"
+        await self._send_sbx_input(ws, wrapper.encode())
+        # Poll out-of-band for the sentinel rc file; the PTY shell runs async to us.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + NATIVE_TOOL_TIMEOUT
+        rc_text = ""
+        while loop.time() < deadline:
+            await asyncio.sleep(0.3)
+            probe, prc = await self._exec_capture(
+                prefix + ["sh", "-c", 'test -f "$1" && cat "$1" || true', "hh-poll", rcf])
+            if prc == 0 and probe.strip():
+                rc_text = probe.strip()
+                break
+        # rcf is written as the last step of the brace group; give tee a moment to
+        # flush outf before we read it, then clean up (best-effort).
+        await asyncio.sleep(0.1)
+        out, _ = await self._exec_capture(prefix + ["cat", "--", outf])
+        await self._exec_capture(prefix + ["rm", "-f", cmdf, rcf, outf])
+        body = out.rstrip()
+        if not rc_text:
+            return f"[run_shell: timed out after {int(NATIVE_TOOL_TIMEOUT)}s]\n{body}".rstrip()
+        rc_val = rc_text.split()[0]
+        return f"exit={rc_val}\n{body}".rstrip() if body.strip() else f"exit={rc_val} (no output)"
 
     async def _sandbox_facts(self, prefix: list[str]) -> str:
         """Probe the live sandbox for ground truth — current working directory, the
@@ -644,10 +699,15 @@ class AgentBridge(Client):
         facts = await self._sandbox_facts(prefix)
         if facts:
             system += "\n\nLIVE SANDBOX STATE (authoritative — never contradict it):\n" + facts
-        window = await self._model_messages(task)
+        # Action tasks get a TIGHT, RAG-free context. Unlike Q&A (`_model_messages`,
+        # which adds the full window + semantic recall), an execution task wants the
+        # instruction to dominate: a weak model fed prior chat chatter ("/grant"
+        # banter, side tangents) latches onto that nearby noise instead of the task
+        # (e.g. it wrote a "grant permissions" script for "write a bash script").
+        # Feed only the last few turns so prior *actions* still chain — no recall.
         messages: list[dict] = [
             {"role": m.role if m.role in ("user", "assistant") else "user", "content": m.content}
-            for m in window
+            for m in self.transcript[-NATIVE_CONTEXT:]
         ]
         messages.append({"role": "user", "content": f"{asker} wants this done in the sandbox: {task}"})
 
@@ -694,9 +754,9 @@ class AgentBridge(Client):
                     if shell_calls > MAX_COMMANDS:
                         result = "[blocked: command budget exhausted for this task]"
                     else:
-                        result = await self._exec_tool(prefix, call)
+                        result = await self._exec_tool(ws, prefix, call)
                 else:
-                    result = await self._exec_tool(prefix, call)
+                    result = await self._exec_tool(ws, prefix, call)
                 messages.append({"role": "tool", "content": result[:NATIVE_OUTPUT_CAP]})
         else:
             final = final or "[stopped at the turn cap — task may be incomplete]"
