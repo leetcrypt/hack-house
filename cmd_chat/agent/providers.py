@@ -47,11 +47,14 @@ class OllamaProvider:
 
     name = "ollama"
 
-    def __init__(self, model: str = "llama3", host: str | None = None, timeout: int = 120,
+    def __init__(self, model: str = "llama3", host: str | None = None, timeout: int = 240,
                  num_ctx: int = 4096, num_predict: int = 512, num_thread: int | None = None,
                  keep_alive: str = "30m"):
         self.model = model
         self.host = (host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
+        # Default 240s: the native tool-calling turn is NON-streaming, so on a
+        # contended CPU box a long write_file turn can exceed a tighter cap and
+        # surface as `[ai error: read timed out]`. Generous here, bounded loop above.
         self.timeout = timeout
         # On CPU, time-to-first-token is O(num_ctx) prefill, so keep the window
         # modest (4096) rather than a GPU-mindset 8192. keep_alive pins the model
@@ -160,6 +163,57 @@ class OllamaProvider:
                 except ValueError:
                     args = {}
             calls.append({"name": fn.get("name", ""), "arguments": args or {}})
+        # Small/quantized models (notably qwen2.5 on CPU) intermittently emit a valid
+        # tool call as literal `<tool_call>{…}</tool_call>` text in `content` instead
+        # of the structured `tool_calls` field. Recover those so a correct action
+        # isn't silently dropped (and strip the tags from the chat-facing text).
+        if not calls and "<tool_call>" in text:
+            text, calls = self._extract_text_tool_calls(text)
+        return text, calls
+
+    @staticmethod
+    def _extract_text_tool_calls(text: str) -> tuple[str, list[dict]]:
+        """Pull `<tool_call>{json}</tool_call>` blocks out of model text (qwen's
+        text-mode tool calls). Uses a JSON decoder (not regex) so nested braces in
+        arguments parse correctly; tolerates a missing closing tag. Returns the text
+        with the blocks removed and the recovered calls."""
+        dec = json.JSONDecoder()
+        calls: list[dict] = []
+        spans: list[tuple[int, int]] = []
+        idx = 0
+        while True:
+            tag = text.find("<tool_call>", idx)
+            if tag == -1:
+                break
+            brace = text.find("{", tag)
+            if brace == -1:
+                break
+            try:
+                obj, end = dec.raw_decode(text, brace)
+            except ValueError:
+                idx = tag + len("<tool_call>")
+                continue
+            if isinstance(obj, dict) and obj.get("name"):
+                args = obj.get("arguments")
+                if args is None:
+                    args = obj.get("parameters")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {}
+                calls.append({"name": obj["name"], "arguments": args or {}})
+            close = text.find("</tool_call>", end)
+            span_end = close + len("</tool_call>") if close != -1 else end
+            spans.append((tag, span_end))
+            idx = span_end
+        if spans:
+            kept, last = [], 0
+            for start, stop in spans:
+                kept.append(text[last:start])
+                last = stop
+            kept.append(text[last:])
+            text = "".join(kept).strip()
         return text, calls
 
     def stream(self, system: str, messages: list[Msg]):
