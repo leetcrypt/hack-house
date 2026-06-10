@@ -1,0 +1,114 @@
+{
+  "ts": "2026-06-10T08:48:26",
+  "model": "qwen2.5-coder:7b",
+  "rows": [
+    {
+      "id": "shell-easy",
+      "category": "shell",
+      "tier": "easy",
+      "result": "PASS",
+      "secs": 70.9,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "shell-medium",
+      "category": "shell",
+      "tier": "medium",
+      "result": "FAIL",
+      "secs": 67.0,
+      "summary": "",
+      "verify_out": "cat: /root/a/b/c/marker.txt: No such file or directory"
+    },
+    {
+      "id": "shell-hard",
+      "category": "shell",
+      "tier": "hard",
+      "result": "FAIL",
+      "secs": 60.9,
+      "summary": "(done)                                                                         \u2502\u2502                    \u2502 \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+      "verify_out": "cat: /root/conf_count.txt: No such file or directory"
+    },
+    {
+      "id": "code-easy",
+      "category": "code",
+      "tier": "easy",
+      "result": "FAIL",
+      "secs": 210.0,
+      "summary": "",
+      "verify_out": "cat: /root/add.out: No such file or directory"
+    },
+    {
+      "id": "code-medium",
+      "category": "code",
+      "tier": "medium",
+      "result": "FAIL",
+      "secs": 274.3,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "code-hard",
+      "category": "code",
+      "tier": "hard",
+      "result": "FAIL",
+      "secs": 109.0,
+      "summary": "<tools>                                                                        \u2502\u2502                    \u2502 \u2502                      {\"type\": \"function\", \"function\": {",
+      "verify_out": "cat: /root/fib.out: No such file or directory"
+    },
+    {
+      "id": "git-easy",
+      "category": "git",
+      "tier": "easy",
+      "result": "FAIL",
+      "secs": 103.3,
+      "summary": "[stopped \u2014 model described the task but never ran a tool]                      \u2502\u2502                    \u2502 \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+      "verify_out": ""
+    },
+    {
+      "id": "git-medium",
+      "category": "git",
+      "tier": "medium",
+      "result": "FAIL",
+      "secs": 204.0,
+      "summary": "",
+      "verify_out": "grep: /root/readme.txt: No such file or directory"
+    },
+    {
+      "id": "git-hard",
+      "category": "git",
+      "tier": "hard",
+      "result": "FAIL",
+      "secs": 103.4,
+      "summary": "<tools>                                                                        \u2502\u2502                    \u2502 \u2502                      {\"type\": \"function\", \"function\": {",
+      "verify_out": ""
+    },
+    {
+      "id": "multi-easy",
+      "category": "multi",
+      "tier": "easy",
+      "result": "PASS",
+      "secs": 101.8,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "multi-medium",
+      "category": "multi",
+      "tier": "medium",
+      "result": "FAIL",
+      "secs": 191.3,
+      "summary": "(native) .                                                                     \u2502\u2502                    \u2502 \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500",
+      "verify_out": ""
+    },
+    {
+      "id": "multi-hard",
+      "category": "multi",
+      "tier": "hard",
+      "result": "FAIL",
+      "secs": 192.8,
+      "summary": "",
+      "verify_out": ""
+    }
+  ]
+}

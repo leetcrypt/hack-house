@@ -58,19 +58,19 @@ TASKS = [
     # ───────────────────────── shell ─────────────────────────
     Task(
         "shell-easy", "shell", "easy",
-        "run whoami and write its output to a file named who.txt in your home directory",
+        "run whoami and write its output to a file named who.txt",
         f'test "$(cat {HOME}/who.txt)" = root',
     ),
     Task(
         "shell-medium", "shell", "medium",
-        "create the nested directory a/b/c in your home directory and write the "
-        "text OK into a/b/c/marker.txt",
+        "create the nested directory a/b/c and write the text OK into "
+        "a/b/c/marker.txt",
         f'test "$(cat {HOME}/a/b/c/marker.txt)" = OK',
     ),
     Task(
         "shell-hard", "shell", "hard",
         "count how many files under /etc end in .conf and write just that number "
-        "to conf_count.txt in your home directory",
+        "to a file conf_count.txt",
         f'test "$(cat {HOME}/conf_count.txt)" = "$(find /etc -name "*.conf" -type f 2>/dev/null | wc -l | tr -d " ")"',
     ),
 

@@ -178,19 +178,50 @@ The first detector diffed a `@user` reply count and hung once old replies scroll
 out of view. Fixed by keying completion off the **`is thinking…` footer** (engage →
 sustained-absence), which is viewport-independent.
 
-**Baseline — qwen2.5:3b, 2/12 PASS** (`bench/results/baseline-qwen2.5_3b.json`).
-Pass: shell-medium (nested mkdir+write), multi-easy (mkdir→write→list). The run is
-**high-variance** — across two runs git-easy and shell-medium each flipped PASS↔FAIL
-— so treat a single run as a smoke signal, not a precise score; average several (or
-move to the 7B) for a stable number. Dominant failure modes the summaries exposed,
-and where they point next:
+**Prompt-fairness fix (found via the benchmark):** "…in your home directory" made
+literal-minded models create a `home/` subdir (`/root/home/a/b/c/marker.txt`) or use
+`~/who.txt`; dropped the phrase — bare filenames land in the agent's cwd (`/root`).
+
+### Baselines — four local CPU models (all tool-capable; fixed prompts)
+
+Every candidate was probed first: `qwen2.5(-coder)` at 0.5b/1.5b/3b/7b all accept
+Ollama's `tools` field; `deepseek-r1` and `westenfelder/NL2SH` reject it (HTTP 400 →
+degrade to the simple harness, useless for the native loop), `llava` is vision-only.
+One run each, shared room, CPU-only box:
+
+| model | size | PASS | avg / median s | passed |
+|---|---|---|---|---|
+| qwen2.5:0.5b | 397 MB | 1/12 | 55 / 49 | shell-hard |
+| qwen2.5-coder:1.5b | 986 MB | 1/12 | 67 / 53 | shell-medium |
+| **qwen2.5:3b** | 1.9 GB | 1/12 | **51 / 46** | code-easy |
+| qwen2.5-coder:7b | 4.7 GB | 2/12 | 141 / 106 | shell-easy, multi-easy |
+
+**Takeaways.** All four cluster at **1–2/12 with high variance** (which task passes
+flips run-to-run) — none reliably drives multi-step sandbox tasks in a shared room.
+The **7B doubles nothing**: same pass band at ~3× the latency, so it is not worth it
+on this CPU box. **qwen2.5:3b is the sweet spot** (best speed, no worse quality) and
+stays the default. The low absolute scores are inflated downward by self-contamination
+(each task's `NATIVE_CONTEXT=4` window pulls the previous task's command/summary) — a
+real deployment effect, but it means the suite's job is *relative* regression
+detection, not an absolute capability grade.
+
+Dominant failure modes the summaries exposed, and where they point next:
 
 | failure mode | example | harness-addressable? |
 |---|---|---|
-| `<native>` tag leak in summary | `<native> Cloned repository…` | yes — strip the tag |
-| bare tool-call-as-text | `write_file ./wc.py`, `writeFile "…"` | yes — extend `_extract_text_tool_calls` beyond `<tool_call>` JSON |
+| bare tool-call-as-text | `write_file ./who.txt`, `mkdir proj`, `git clone …` (esp. 0.5b — nearly every turn) | **yes** — extend `_extract_text_tool_calls` beyond `<tool_call>` JSON |
+| `<native>` / `<tools>` tag leak in summary | `<native> Cloned repository…`, `<tools>` | yes — strip the tag |
 | path hallucination | `/home/qwen253b/conf_count.txt`, `~/` unexpanded | partly (model) |
 | content fabrication | wrote literal `dell` instead of running whoami | no (model capability) |
+
+The first row is the clear top priority — it is the single biggest score sink across
+all four models, and it is purely a harness parse gap. The benchmark now exists to
+prove whether fixing it moves the number.
+
+**Other models worth pulling for a non-qwen data point** (different family → different
+failure modes, both with strong native tool-calling): `llama3.2:3b` (~2 GB, peer to
+the 3B) and `llama3.1:8b` (~4.7 GB, peer to the 7B but general-purpose). Probe the
+`tools` field first, then `bench/run.py --model <name>`.
 
 The first two are the clear next harness improvements; the benchmark now exists to
 prove whether they move the number.

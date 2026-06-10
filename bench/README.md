@@ -66,3 +66,20 @@ A PASS/FAIL table with per-task latency, plus a JSON record under
 `bench/results/` (gitignored — these are runtime artifacts). Commit a curated
 baseline explicitly (e.g. `--out bench/results/baseline-<model>.json` then
 `git add -f`) when you want one tracked for comparison.
+
+## Tracked baselines (2026-06-10, CPU-only, shared room)
+
+| model | size | PASS | avg/med s |
+|---|---|---|---|
+| qwen2.5:0.5b | 397 MB | 1/12 | 55 / 49 |
+| qwen2.5-coder:1.5b | 986 MB | 1/12 | 67 / 53 |
+| **qwen2.5:3b** | 1.9 GB | 1/12 | 51 / 46 |
+| qwen2.5-coder:7b | 4.7 GB | 2/12 | 141 / 106 |
+
+All cluster at 1–2/12 with high run-to-run variance — treat as a *relative*
+regression yardstick, not an absolute grade. The 7B buys no pass-rate gain at
+~3× latency; **qwen2.5:3b stays the default**. The biggest score sink across
+every model is bare tool-call-as-text leaks (a harness parse gap, not model
+capability) — see `docs/findings-native-harness-2026-06-10.md`. Only
+qwen2.5(-coder) sizes 0.5b–7b are usable here; `deepseek-r1` and
+`westenfelder/NL2SH` reject Ollama's `tools` field.
