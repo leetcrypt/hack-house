@@ -31,6 +31,9 @@ err.log
 # Heavy / superseded demo-build kit (real demos live in video-toolkit)
 /docs/demo/
 
+# Benchmark runtime results (commit a curated baseline with `git add -f`)
+/bench/results/
+
 # Project scratch
 /i-try/
 test_rsa.py

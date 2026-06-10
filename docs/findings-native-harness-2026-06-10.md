@@ -161,3 +161,36 @@ exhaustion path no longer trusts it blindly:
 
 Offline unit coverage: 23 assertions on `_completion_verdict` / `_parse_exit` /
 `_strip_done` / `_nudge_message`, all pass.
+
+## Benchmark suite + first baseline (`bench/`)
+
+To compare harness/model changes **systematically** instead of eyeballing one-off
+runs, added a ground-truth-graded benchmark: `bench/tasks.py` (a 4-category ×
+easy/medium/hard matrix — shell, code, git, multi) and `bench/run.py` (drives the
+live TUI via tmux, grades each task by a `podman exec` verify snippet, exit 0 ==
+PASS). Tasks run in the agent's real cwd (`/root`) with bare filenames; pinning an
+absolute path instead just measured the weak model's absolute-path discipline and
+drowned out every other signal.
+
+**Runner gotcha (cost real time):** the TUI is a full-screen (alt-screen) app, so
+`tmux capture-pane -S` does NOT yield chat history — only the current viewport.
+The first detector diffed a `@user` reply count and hung once old replies scrolled
+out of view. Fixed by keying completion off the **`is thinking…` footer** (engage →
+sustained-absence), which is viewport-independent.
+
+**Baseline — qwen2.5:3b, 2/12 PASS** (`bench/results/baseline-qwen2.5_3b.json`).
+Pass: shell-medium (nested mkdir+write), multi-easy (mkdir→write→list). The run is
+**high-variance** — across two runs git-easy and shell-medium each flipped PASS↔FAIL
+— so treat a single run as a smoke signal, not a precise score; average several (or
+move to the 7B) for a stable number. Dominant failure modes the summaries exposed,
+and where they point next:
+
+| failure mode | example | harness-addressable? |
+|---|---|---|
+| `<native>` tag leak in summary | `<native> Cloned repository…` | yes — strip the tag |
+| bare tool-call-as-text | `write_file ./wc.py`, `writeFile "…"` | yes — extend `_extract_text_tool_calls` beyond `<tool_call>` JSON |
+| path hallucination | `/home/qwen253b/conf_count.txt`, `~/` unexpanded | partly (model) |
+| content fabrication | wrote literal `dell` instead of running whoami | no (model capability) |
+
+The first two are the clear next harness improvements; the benchmark now exists to
+prove whether they move the number.
