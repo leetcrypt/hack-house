@@ -69,6 +69,8 @@ baseline explicitly (e.g. `--out bench/results/baseline-<model>.json` then
 
 ## Tracked baselines (2026-06-10, CPU-only, shared room)
 
+Original-harness baselines (default sampling, structured `tool_calls` only):
+
 | model | size | PASS | avg/med s |
 |---|---|---|---|
 | qwen2.5:0.5b | 397 MB | 1/12 | 55 / 49 |
@@ -76,10 +78,24 @@ baseline explicitly (e.g. `--out bench/results/baseline-<model>.json` then
 | **qwen2.5:3b** | 1.9 GB | 1/12 | 51 / 46 |
 | qwen2.5-coder:7b | 4.7 GB | 2/12 | 141 / 106 |
 
-All cluster at 1–2/12 with high run-to-run variance — treat as a *relative*
-regression yardstick, not an absolute grade. The 7B buys no pass-rate gain at
-~3× latency; **qwen2.5:3b stays the default**. The biggest score sink across
-every model is bare tool-call-as-text leaks (a harness parse gap, not model
-capability) — see `docs/findings-native-harness-2026-06-10.md`. Only
-qwen2.5(-coder) sizes 0.5b–7b are usable here; `deepseek-r1` and
-`westenfelder/NL2SH` reject Ollama's `tools` field.
+After the harness work (split-tag recovery + `temperature:0` for the tool loop +
+fenced-prose recovery — see `docs/findings-native-harness-2026-06-10.md`):
+
+| model | size | PASS (2 runs) | avg s | note |
+|---|---|---|---|---|
+| **qwen2.5:0.5b** | 397 MB | **4/12, 3/12** | ~50 | split-tag leak dominates → 3× lift |
+| qwen2.5:3b | 1.9 GB | 2/12, 0/12 | ~50 | emits proper calls → unchanged |
+| llama3.2:3b | 2.0 GB | 1/12 | 55 | leaks positional prose (`run_shell "x"`) — unparseable |
+| qwen2.5-coder:3b | 1.9 GB | 1/12 | 53 | coder gains nothing on these tasks |
+
+Takeaways: the parser fixes lift exactly the **weakest** model (0.5b), which leaks
+malformed text instead of structured calls; a 3B-class model emits proper calls and
+fails on capability/content, which no parser can fix, so it stays in the 0–2/12 noise
+band. **qwen2.5:3b stays the default** (best capability/latency); 0.5b is now a viable
+floor option for trivial tasks. Treat absolute scores as a *relative* regression
+yardstick, not a grade.
+
+Usable models: qwen2.5(-coder) 0.5b–7b, llama3.2:3b (all tool-capable). Rejected:
+`deepseek-r1` and `westenfelder/NL2SH` reject Ollama's `tools` field;
+`granite3.1-dense:2b` errors (`model not supported by your version of Ollama` — needs
+a newer Ollama).
