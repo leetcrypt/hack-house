@@ -71,10 +71,12 @@ class OllamaProvider:
         # can't do them (and fall straight to the simple injector).
         self._tools_ok: bool | None = None
 
-    def _options(self) -> dict:
+    def _options(self, extra: dict | None = None) -> dict:
         opts = {"num_ctx": self.num_ctx, "num_predict": self.num_predict}
         if self.num_thread is not None:
             opts["num_thread"] = self.num_thread
+        if extra:
+            opts.update(extra)
         return opts
 
     def _raise_for_status(self, r: requests.Response) -> None:
@@ -133,11 +135,18 @@ class OllamaProvider:
         turns); ``system`` is prepended. Returns ``(text, tool_calls)`` where each
         call is ``{"name": str, "arguments": dict}``. Raises ``ToolsUnsupported`` if
         the model can't do function calling so the bridge can fall back to simple."""
+        # Greedy decode (temperature 0) for the tool loop: at Ollama's default 0.8 a
+        # weak model "creatively" narrates the next step in prose or fabricates file
+        # content instead of emitting a deterministic structured call. The nudge loop
+        # changes the prompt between turns, so temp 0 still escapes a failing state on
+        # retry — it just stops sampling away from the correct tool-call format. This
+        # override is scoped to complete_with_tools; chat (complete/stream) keeps the
+        # model's default sampling so replies stay natural.
         payload = {
             "model": self.model,
             "stream": False,
             "keep_alive": self.keep_alive,
-            "options": self._options(),
+            "options": self._options({"temperature": 0.0}),
             "tools": tools,
             "messages": [{"role": "system", "content": system}] + messages,
         }
@@ -188,6 +197,16 @@ class OllamaProvider:
         re.I,
     )
 
+    # The SPLIT-form leak (qwen2.5:0.5b at temp 0, ~half its turns): the tool NAME in
+    # a `<tools>` tag and the arguments in a SEPARATE bare JSON object with no `name`
+    # key — `<tools>write_file</tools>{"path":…,"content":…}`. Captures the name; the
+    # decoder reads the args object that follows from the trailing `{`.
+    _NAMED_TAG = re.compile(
+        r"<(tool_call|tool_calls|function_call|function|tools)>\s*"
+        r"([a-zA-Z_]\w*)\s*</\1>\s*(?=\{)",
+        re.I,
+    )
+
     @classmethod
     def _coerce_call(cls, obj, valid_names) -> dict | None:
         """Turn a decoded JSON object into a `{"name","arguments"}` call IF it
@@ -225,16 +244,20 @@ class OllamaProvider:
         """Recover tool calls a small/quantized model emitted as TEXT in `content`
         instead of the structured `tool_calls` field. Handles qwen's
         `<tool_call>{json}</tool_call>` blocks plus the looser CPU-model leaks: bare
-        JSON, ```json fenced blocks, and alternate wrapper tags (`<tools>`,
-        `<function_call>`). Scans for every JSON object via a decoder (so nested
-        braces in arguments parse correctly) and keeps ONLY those that `_coerce_call`
-        accepts as a known tool — never freeform prose, so it can't fabricate an
-        action the model didn't structurally request. Returns the text with the
-        recovered JSON (and now-orphaned wrapper tags / code fences) stripped, plus
-        the calls."""
+        JSON, ```json fenced blocks, alternate wrapper tags (`<tools>`,
+        `<function_call>`), and the SPLIT form where the name sits in a tag and the
+        args follow as a separate object (`<tools>write_file</tools>{"path":…}`).
+        Scans for every JSON object via a decoder (so nested braces in arguments parse
+        correctly) and keeps ONLY those that resolve to a KNOWN tool — never freeform
+        prose, so it can't fabricate an action the model didn't structurally request.
+        Returns the text with the recovered JSON (and now-orphaned wrapper tags / code
+        fences) stripped, plus the calls."""
         dec = json.JSONDecoder()
         calls: list[dict] = []
         spans: list[tuple[int, int]] = []
+        # Split-form index: the `{` that opens an args object → (tool_name, tag_start),
+        # so the scan pairs that JSON as arguments and strips the whole tag+object.
+        split = {m.end(): (m.group(2), m.start()) for m in cls._NAMED_TAG.finditer(text)}
         i, n = 0, len(text)
         while i < n:
             brace = text.find("{", i)
@@ -245,10 +268,17 @@ class OllamaProvider:
             except ValueError:
                 i = brace + 1
                 continue
-            call = cls._coerce_call(obj, valid_names)
-            if call is not None:
-                calls.append(call)
-                spans.append((brace, end))
+            if brace in split:
+                # `<tag>NAME</tag>{args}` — name from the tag, this object is the args.
+                name, tag_start = split[brace]
+                if (not valid_names or name in valid_names) and isinstance(obj, dict):
+                    calls.append({"name": name, "arguments": obj})
+                    spans.append((tag_start, end))
+            else:
+                call = cls._coerce_call(obj, valid_names)
+                if call is not None:
+                    calls.append(call)
+                    spans.append((brace, end))
             i = end
         if spans:
             kept, last = [], 0

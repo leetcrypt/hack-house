@@ -268,3 +268,39 @@ the 3B) and `llama3.1:8b` (~4.7 GB, peer to the 7B but general-purpose). Probe t
 
 The first two are the clear next harness improvements; the benchmark now exists to
 prove whether they move the number.
+
+### The win — split-tag recovery + greedy decode (2026-06-10)
+
+Two more harness changes, and the first to actually move the number:
+
+1. **Greedy decode for the tool loop** — `complete_with_tools` now sends
+   `temperature: 0` (scoped to the tool loop; chat keeps default sampling). At
+   Ollama's default 0.8 the weak model sampled away from the tool-call format into
+   prose/fabrication. The nudge prompt changes between turns, so temp 0 still escapes
+   a failed state on retry — it just stops the creative drift.
+
+2. **Split-tag recovery** — temp 0 made 0.5b's leak *deterministic*, which exposed its
+   real shape: NOT a JSON object with a `name` key, but the name in a tag and the args
+   in a SEPARATE object — `<tools>write_file</tools>{"path":…,"content":…}`,
+   `<tools>run_shell</tools>{"command":…}` — ~5 of 12 tasks per run. `_NAMED_TAG` in
+   the provider now pairs that tag-name with the following args object (gated on the
+   known tool set, so it still can't fabricate an action).
+
+3. **Fenced recovery** (bridge) — recover a `` ```bash `` block narrated in prose as a
+   run_shell call, non-destructive only (`FENCE_DESTRUCTIVE` guard). Fires on the
+   prose-leak turns; a no-op where the model emits structured calls.
+
+**Result — the effect is concentrated on the weakest model, as theory predicts** (the
+smaller the model, the more it leaks malformed text instead of structured calls; a
+bigger model emits proper calls and fails on capability/content, which no parser can
+fix):
+
+| model | baseline | optimized (2 runs) | note |
+|---|---|---|---|
+| qwen2.5:0.5b | 1/12 | **4/12, 3/12** | split-tag leak dominates → big lift |
+| qwen2.5:3b | 1/12 | 2/12, 0/12 | emits proper calls → unchanged (noise) |
+
+Ablation on 0.5b: structured-JSON-only `0/0` → fenced+temp0 `2/0` → +split-tag `4/3`.
+Split-tag recovery is the dominant contributor; temp 0 is what made the leak
+consistent enough to parse. Net: the harness now extracts ~3× more signal from the
+0.5b, and temp 0 is a sound default for the tool loop on any model.

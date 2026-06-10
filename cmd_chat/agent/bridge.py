@@ -182,6 +182,25 @@ NUDGE_FILLER = re.compile(
     r"\b(next step|proceed|let me|i['’]ll|i will|now i|first[,: ]|then i|"
     r"continuing|moving on|go ahead)\b|:\s*$", re.I)
 
+# The weak CPU models' dominant leak is NOT a JSON tool-call in text (the provider
+# already recovers those) — it is a shell command narrated inside a ```bash fence
+# with NO structured call at all ("…let's proceed:\n```bash\nmkdir -p a/b/c\n```").
+# Recover the FIRST shell-tagged fence as a run_shell call so that intent isn't
+# dropped. Only explicit shell tags (never an unlabelled ``` block, which is just as
+# often example OUTPUT) and never a python/other-lang fence (it isn't a shell line).
+FENCE_SHELL = re.compile(r"```(?:bash|sh|shell|zsh|console)\s*\n(.*?)```", re.I | re.S)
+
+# Refuse to auto-run a recovered block that looks destructive. The block came from
+# model PROSE (possibly illustrative, not an action), so the bar to execute it is
+# higher than for a structured call the model deliberately emitted. Matches stay
+# coarse on purpose — on a hit we DON'T execute, we fall through to the nudge path.
+FENCE_DESTRUCTIVE = re.compile(
+    r"\brm\s+-[a-z]*[rf][a-z]*\s+(?:-[a-z]+\s+)*(?:/|~|\$HOME|\*|\.)"
+    r"|\bmkfs\b|\bdd\s+if=|\b(?:shutdown|reboot|halt|poweroff|init\s+0)\b"
+    r"|:\s*\(\)\s*\{|>\s*/dev/|\bchmod\s+-R\s+0*777\s+/"
+    r"|\bmv\s+\S+\s+/dev/null\b|\b(?:wget|curl)\b[^\n]*\|\s*(?:ba)?sh\b",
+    re.I)
+
 
 class AgentBridge(Client):
     def __init__(self, server: str, port: int, name: str, provider: Provider,
@@ -707,6 +726,25 @@ class AgentBridge(Client):
         """Drop a leading `DONE:` marker so the chat summary reads cleanly."""
         return re.sub(r"^\s*DONE:?\s*", "", text or "", flags=re.I).strip()
 
+    @staticmethod
+    def _recover_fenced_call(text: str) -> dict | None:
+        """Recover a run_shell call from a model turn that narrated the command in a
+        ```bash fence instead of emitting a structured tool call (the weak-CPU-model
+        leak the benchmark exposed). Returns a `{name,arguments}` run_shell call for
+        the FIRST shell-tagged fence whose command is non-empty and not destructive,
+        else None. Caller must already have ruled out a real call and a DONE signal.
+        The destructive guard is the safety gate: a prose block may be illustrative,
+        so anything matching FENCE_DESTRUCTIVE is refused (fall through to a nudge)."""
+        m = FENCE_SHELL.search(text or "")
+        if not m:
+            return None
+        cmd = m.group(1).strip()
+        # Drop a leading shell prompt sigil the model sometimes includes ("$ ls").
+        cmd = re.sub(r"(?m)^\s*[$#]\s+", "", cmd).strip()
+        if not cmd or FENCE_DESTRUCTIVE.search(cmd):
+            return None
+        return {"name": "run_shell", "arguments": {"command": cmd}}
+
     @classmethod
     def _completion_verdict(cls, text: str, did_action: bool, last_rc: int | None) -> str:
         """Disambiguate a text-only (no tool call) turn into 'done' vs 'stalled'.
@@ -804,6 +842,17 @@ class AgentBridge(Client):
                 await self._send_chat(ws, f"{asker}: [ai error: {e}]")
                 return
             await self._send_typing(ws, False)
+
+            if not calls and not self._is_done_signal(text):
+                # The weak models' dominant failure is narrating the next command in a
+                # ```bash fence instead of calling run_shell. Recover that as a real
+                # call (non-destructive only) so the turn does an ACTION instead of
+                # tripping the "described but never ran a tool" stall. A DONE turn is
+                # excluded above so a fenced EXAMPLE in a completion isn't re-run.
+                fenced = self._recover_fenced_call(text)
+                if fenced is not None:
+                    calls = [fenced]
+                    await self._mirror_to_pty(ws, "▸ (recovered command from prose)")
 
             if not calls:
                 # A text-only turn is ambiguous: genuine completion, or a mid-task
