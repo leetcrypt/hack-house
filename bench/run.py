@@ -33,20 +33,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tasks as T  # noqa: E402
+from tui import agent_online, capture, clear_input, send_command  # noqa: E402
 
 
 def sh(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
-
-
-def tmux(*args):
-    return sh(["tmux", *args])
-
-
-def capture(target, lines=4000):
-    """Full scrollback of the TUI pane as text."""
-    r = tmux("capture-pane", "-t", target, "-p", "-S", f"-{lines}")
-    return r.stdout
 
 
 def podman(container, snippet):
@@ -55,22 +46,15 @@ def podman(container, snippet):
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
-def agent_online(target, model):
-    return f"{model} (ai) online" in capture(target) or "online — ollama" in capture(target)
-
-
 def is_thinking(buf):
     return "is thinking" in buf
 
 
 def send_task(target, model, prompt):
-    """Clear the input box, then type the /ai command and submit it."""
-    # The TUI has no kill-line; clear with backspaces (harmless when empty).
-    tmux("send-keys", "-t", target, *(["BSpace"] * 6))
-    time.sleep(0.3)
-    tmux("send-keys", "-t", target, "-l", f"/ai {model} !{prompt}")
-    time.sleep(0.3)
-    tmux("send-keys", "-t", target, "Enter")
+    """Robustly clear the input box, then type and submit the /ai command. The
+    box is fully backspace-cleared and the Enter is verified (see tui.py), so a
+    dropped keystroke can't leave a half-typed prompt to corrupt the next task."""
+    send_command(target, f"/ai {model} !{prompt}")
 
 
 def scrape_summary(target, user):
@@ -197,11 +181,16 @@ def main():
     print(f"running {len(selected)} task(s) against {args.model} "
           f"(container={args.container}, tui={args.target})")
     rows = []
-    for i, task in enumerate(selected, 1):
-        print(f"[{i}/{len(selected)}] {task.id} … ", end="", flush=True)
-        r = run_task(args, task)
-        print(f"{r['result']} ({r['secs']}s)")
-        rows.append(r)
+    try:
+        for i, task in enumerate(selected, 1):
+            print(f"[{i}/{len(selected)}] {task.id} … ", end="", flush=True)
+            r = run_task(args, task)
+            print(f"{r['result']} ({r['secs']}s)")
+            rows.append(r)
+    finally:
+        # Leave the input box empty so the next action (e.g. an agent restart)
+        # isn't corrupted by a lingering prompt.
+        clear_input(args.target)
 
     print_table(rows)
 
