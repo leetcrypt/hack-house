@@ -95,7 +95,29 @@ band. **qwen2.5:3b stays the default** (best capability/latency); 0.5b is now a 
 floor option for trivial tasks. Treat absolute scores as a *relative* regression
 yardstick, not a grade.
 
-Usable models: qwen2.5(-coder) 0.5b–7b, llama3.2:3b (all tool-capable). Rejected:
+### Candidate screening (2026-06-13) — can anything beat qwen?
+
+Pulled and benchmarked three more tool-capable models to look for a better
+default. None did — all 0/12, worse than qwen2.5:3b. The pattern repeats: in the
+multi-turn agent loop the weak models leak a **positional-in-tags** dialect
+(`<tools>run_shell 'cmd'</tools>`) that the parser can't recover, even when they
+emit clean structured `tool_calls` on a single-turn probe.
+
+| model | size | PASS | avg s | note |
+|---|---|---|---|---|
+| smollm2:1.7b | 1.8 GB | 0/12 | ~50 | wedges into a repeating fabricated summary |
+| hermes3:3b | 2.0 GB | 0/12 | ~47 | leaks `<tools>NAME "arg"</tools>` positional form |
+| mistral:7b | 4.1 GB | 0/12 | ~70 | clean call on probe, leaks prose-tags live; then wedges |
+
+`qwen3:4b` could not be pulled — **Ollama 0.3.9 is too old** (HTTP 412, "requires a
+newer version of Ollama"), same root cause as `granite3.1-dense:2b`. Upgrading
+Ollama would unlock the qwen3 / granite3.x generation and is the highest-leverage
+next step if we want to retest newer architectures.
+
+**Conclusion: qwen2.5:3b remains the default.** No CPU-runnable model on this
+Ollama version beats it.
+
+Usable models: qwen2.5(-coder) 0.5b–7b, llama3.2:3b, smollm2:1.7b, hermes3:3b,
+mistral:7b (all tool-capable; the last three still score 0/12 here). Rejected:
 `deepseek-r1` and `westenfelder/NL2SH` reject Ollama's `tools` field;
-`granite3.1-dense:2b` errors (`model not supported by your version of Ollama` — needs
-a newer Ollama).
+`granite3.1-dense:2b` and `qwen3:4b` need a newer Ollama (0.3.9 installed).

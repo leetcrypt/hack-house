@@ -1,0 +1,114 @@
+{
+  "ts": "2026-06-13T03:04:51",
+  "model": "hermes3:3b",
+  "rows": [
+    {
+      "id": "shell-easy",
+      "category": "shell",
+      "tier": "easy",
+      "result": "TIMEOUT",
+      "secs": 45.8,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "shell-medium",
+      "category": "shell",
+      "tier": "medium",
+      "result": "TIMEOUT",
+      "secs": 47.0,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "shell-hard",
+      "category": "shell",
+      "tier": "hard",
+      "result": "TIMEOUT",
+      "secs": 47.5,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "code-easy",
+      "category": "code",
+      "tier": "easy",
+      "result": "TIMEOUT",
+      "secs": 47.1,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "code-medium",
+      "category": "code",
+      "tier": "medium",
+      "result": "TIMEOUT",
+      "secs": 47.4,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "code-hard",
+      "category": "code",
+      "tier": "hard",
+      "result": "TIMEOUT",
+      "secs": 46.9,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "git-easy",
+      "category": "git",
+      "tier": "easy",
+      "result": "TIMEOUT",
+      "secs": 47.0,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "git-medium",
+      "category": "git",
+      "tier": "medium",
+      "result": "TIMEOUT",
+      "secs": 47.0,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "git-hard",
+      "category": "git",
+      "tier": "hard",
+      "result": "TIMEOUT",
+      "secs": 46.9,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "multi-easy",
+      "category": "multi",
+      "tier": "easy",
+      "result": "TIMEOUT",
+      "secs": 46.9,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "multi-medium",
+      "category": "multi",
+      "tier": "medium",
+      "result": "TIMEOUT",
+      "secs": 46.8,
+      "summary": "",
+      "verify_out": ""
+    },
+    {
+      "id": "multi-hard",
+      "category": "multi",
+      "tier": "hard",
+      "result": "TIMEOUT",
+      "secs": 46.8,
+      "summary": "",
+      "verify_out": ""
+    }
+  ]
+}

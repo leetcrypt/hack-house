@@ -1,0 +1,114 @@
+{
+  "ts": "2026-06-13T03:23:46",
+  "model": "mistral:7b",
+  "rows": [
+    {
+      "id": "shell-easy",
+      "category": "shell",
+      "tier": "easy",
+      "result": "FAIL",
+      "secs": 216.8,
+      "summary": "<tools>run_shell 'mkdir proj'</tools>",
+      "verify_out": ""
+    },
+    {
+      "id": "shell-medium",
+      "category": "shell",
+      "tier": "medium",
+      "result": "FAIL",
+      "secs": 81.0,
+      "summary": "<tools>run_shell './mkdir -p a/b/c</tools>",
+      "verify_out": "cat: /root/a/b/c/marker.txt: No such file or directory"
+    },
+    {
+      "id": "shell-hard",
+      "category": "shell",
+      "tier": "hard",
+      "result": "FAIL",
+      "secs": 87.0,
+      "summary": "<tools>run_shell 'find /etc -name \"*.conf\" | wc -l</tools>",
+      "verify_out": "cat: /root/conf_count.txt: No such file or directory"
+    },
+    {
+      "id": "code-easy",
+      "category": "code",
+      "tier": "easy",
+      "result": "FAIL",
+      "secs": 97.0,
+      "summary": "<tools>write_file path=add.py content='print(2+3)\\n'</tools>",
+      "verify_out": "cat: /root/add.out: No such file or directory"
+    },
+    {
+      "id": "code-medium",
+      "category": "code",
+      "tier": "medium",
+      "result": "TIMEOUT",
+      "secs": 46.7,
+      "summary": "<tools>write_file path=add.py content='print(2+3)\\n'</tools>",
+      "verify_out": ""
+    },
+    {
+      "id": "code-hard",
+      "category": "code",
+      "tier": "hard",
+      "result": "TIMEOUT",
+      "secs": 46.8,
+      "summary": "<tools>write_file path=add.py content='print(2+3)\\n'</tools>",
+      "verify_out": ""
+    },
+    {
+      "id": "git-easy",
+      "category": "git",
+      "tier": "easy",
+      "result": "TIMEOUT",
+      "secs": 46.8,
+      "summary": "<tools>write_file path=add.py content='print(2+3)\\n'</tools>",
+      "verify_out": ""
+    },
+    {
+      "id": "git-medium",
+      "category": "git",
+      "tier": "medium",
+      "result": "TIMEOUT",
+      "secs": 46.9,
+      "summary": "<tools>write_file path=add.py content='print(2+3)\\n'</tools>",
+      "verify_out": ""
+    },
+    {
+      "id": "git-hard",
+      "category": "git",
+      "tier": "hard",
+      "result": "TIMEOUT",
+      "secs": 46.8,
+      "summary": "<tools>write_file path=add.py content='print(2+3)\\n'</tools>",
+      "verify_out": ""
+    },
+    {
+      "id": "multi-easy",
+      "category": "multi",
+      "tier": "easy",
+      "result": "TIMEOUT",
+      "secs": 46.9,
+      "summary": "<tools>write_file path=add.py content='print(2+3)\\n'</tools>",
+      "verify_out": ""
+    },
+    {
+      "id": "multi-medium",
+      "category": "multi",
+      "tier": "medium",
+      "result": "TIMEOUT",
+      "secs": 46.8,
+      "summary": "<tools>write_file path=add.py content='print(2+3)\\n'</tools>",
+      "verify_out": ""
+    },
+    {
+      "id": "multi-hard",
+      "category": "multi",
+      "tier": "hard",
+      "result": "TIMEOUT",
+      "secs": 46.9,
+      "summary": "<tools>write_file path=add.py content='print(2+3)\\n'</tools>",
+      "verify_out": ""
+    }
+  ]
+}
