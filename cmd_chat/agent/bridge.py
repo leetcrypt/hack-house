@@ -108,6 +108,9 @@ NATIVE_SYSTEM = (
     "4. Do not guess interpreter locations — invoke 'bash <script>' or 'sh <script>', "
     "never an absolute path like /usr/bin/bash or /ai/bin/bash.\n"
     "5. Prefer non-interactive commands. Never run destructive commands.\n"
+    "6. To create or change a file, call write_file with its COMPLETE new contents. "
+    "Never emit a unified diff, patch, or '@@' hunk — only whole-file writes are "
+    "applied, so a diff will be ignored.\n"
     "When (and only when) the task is FULLY complete, reply with a single line that "
     "starts with 'DONE:' followed by a one-sentence summary of what you did, and do "
     "NOT call another tool. If the task is not finished — including after a command "
@@ -201,6 +204,41 @@ FENCE_DESTRUCTIVE = re.compile(
     r"|\bmv\s+\S+\s+/dev/null\b|\b(?:wget|curl)\b[^\n]*\|\s*(?:ba)?sh\b",
     re.I)
 
+# Lines worth keeping when a FAILING tool result is too long to feed back whole:
+# the ones that actually explain the failure (the real error usually sits at the
+# TAIL, which a blind head-cut at NATIVE_OUTPUT_CAP would drop). Used by
+# `_relevant_excerpt` — clean-room counterpart to NightShift's failure excerpt.
+ERROR_LINE_RE = re.compile(
+    r"error|fail|traceback|exception|denied|not found|no such|cannot|unable|"
+    r"fatal|undefined|unexpected|invalid|missing|syntax|exit=|exit code|timed out",
+    re.I)
+
+# Native-loop context budgeting (clean-room counterpart to Exoshell's context
+# engine). Unlike the chat path (`_window`), the ACTION loop's `messages` list
+# grows unbounded across turns — each turn appends an assistant tool-call plus a
+# tool result (up to NATIVE_OUTPUT_CAP). Over the 7-turn ceiling the OLDEST turns
+# (including the task itself) silently fall out of a weak model's effective ctx.
+# We keep the running estimate under this soft budget by deterministically dropping
+# the oldest removable turn messages first (`_prune_native_messages`).
+NATIVE_TOKEN_BUDGET = 1500   # approx-token soft cap on the whole native message list
+NATIVE_KEEP_RECENT = 6       # most-recent messages never pruned (≈ last 2-3 turns)
+
+# Pinned-goal marker (Exoshell's "goal as a discrete, never-pruned block"). The task
+# message carries this prefix so pruning can identify and preserve it by content
+# rather than by fragile positional index, and the weak model gets a clear anchor.
+TASK_MARKER = "TASK (do not lose sight of this):"
+
+# Recovery posture swapped into the system prompt once the loop has hit a failure
+# (Exoshell's stances, recovery flavour). A weak model weights the SYSTEM prompt
+# highest (we already exploit that for LIVE SANDBOX STATE), so re-framing the whole
+# turn beats only appending a nudge line.
+REPAIR_STANCE = (
+    "RECOVERY MODE — you have already failed at least once. STOP and diagnose "
+    "before acting: read the relevant file or the error output, state the cause in "
+    "one short line, then make ONE minimal corrective action and re-verify. Do NOT "
+    "repeat a previous command unchanged."
+)
+
 
 class AgentBridge(Client):
     def __init__(self, server: str, port: int, name: str, provider: Provider,
@@ -208,7 +246,8 @@ class AgentBridge(Client):
                  system_prompt: str | None = None, context_window: int = 12,
                  token_budget: int = 2000, embedder=None, rag_top_k: int = 4,
                  rag_min_score: float = 0.35, code_provider: Provider | None = None,
-                 harness: str = "native", max_turns: int = 5):
+                 harness: str = "native", max_turns: int = 5,
+                 native_token_budget: int = NATIVE_TOKEN_BUDGET):
         super().__init__(server, port, username=name, password=password,
                          insecure=insecure, no_tls=no_tls)
         self.name = name
@@ -243,6 +282,11 @@ class AgentBridge(Client):
         # the model can't do tool calls, so it's a safe default.
         self.harness = harness if harness in ("native", "simple") else "native"
         self.max_turns = max_turns  # turn cap for the native loop
+        # Soft approx-token budget on the native loop's growing message list. When
+        # exceeded, `_prune_native_messages` drops the oldest removable turns (the
+        # task + freshest turns are pinned) so the goal never falls out of a weak
+        # model's effective context mid-task.
+        self.native_token_budget = native_token_budget
         # Where the shared sandbox lives, learned from the broker's `_sbx:status`
         # frame so we can exec into it. None until a sandbox is announced.
         self.sbx_engine: str | None = None   # docker|podman|multipass|local
@@ -748,33 +792,156 @@ class AgentBridge(Client):
     @classmethod
     def _completion_verdict(cls, text: str, did_action: bool, last_rc: int | None) -> str:
         """Disambiguate a text-only (no tool call) turn into 'done' vs 'stalled'.
-        Structural first (the explicit DONE: marker), then output-aware (an
-        unresolved non-zero exit, or no action at all, or stall/filler language all
-        mean keep going). Otherwise accept — a substantive turn after real work with
-        no dangling error is a finished task that just forgot the marker; nudging it
-        would only tax latency on this CPU box."""
-        if cls._is_done_signal(text):
-            return "done"
-        if last_rc not in (None, 0):       # last command failed, unacknowledged
+
+        Verify-then-repair gate: a completion CLAIM is NOT trusted on its face.
+        The weak CPU models' dominant failure is fabricated success — writing
+        'DONE:' right after a 126 exit, or narrating a finished task ("created and
+        ran greet.sh") without ever calling a tool. So the ground-truth checks run
+        FIRST and can veto a premature DONE: marker; the loop then spends a bounded
+        repair turn (capped by MAX_NUDGES) asking the model to fix/prove its work.
+        Only a claim backed by an action and no dangling failure is accepted. A
+        substantive non-DONE turn after real work with no error is still treated as
+        a finished task that just forgot the marker — nudging that would only tax
+        latency on this CPU box."""
+        if last_rc not in (None, 0):       # last command failed — veto any claim
             return "stalled"
         if not did_action:                 # all talk, no tool call yet
             return "stalled"
+        if cls._is_done_signal(text):      # claim is action-backed and clean → trust
+            return "done"
         if NUDGE_FILLER.search((text or "").strip()):
             return "stalled"
         return "done"
 
     @staticmethod
-    def _nudge_message(task: str, last_rc: int | None) -> str:
+    def _classify_failure(last_rc: int | None, output: str) -> tuple[str, str]:
+        """Map a failing tool result to a (category, fix-hint) pair so the repair
+        nudge can name the cause and the concrete next action instead of a generic
+        'it failed'. Clean-room: the idea is NightShift's `classify_failure`, but
+        these rules are our own — shell-first (language-agnostic), with a few Python
+        ones, most-specific first. Returns ('', '') when nothing matches.
+
+        Grounding the repair turn this way stops the weak model from retrying the
+        same broken command and burning a slow CPU turn."""
+        o = output or ""
+        if re.search(r"command not found|: not found", o, re.I):
+            return ("command-not-found",
+                    "that command/tool isn't installed or the name is wrong — use an "
+                    "existing command; do NOT retry the same name verbatim")
+        if last_rc == 126 or re.search(r"permission denied", o, re.I):
+            return ("permission-denied",
+                    "make it executable first (chmod +x ./file) or run it via "
+                    "'bash ./file' rather than executing the path directly")
+        if re.search(r"no such file or directory", o, re.I):
+            return ("missing-path",
+                    "the path does not exist — create the file/dir first, or correct "
+                    "the path to one that exists")
+        if re.search(r"ModuleNotFoundError|ImportError", o, re.I):
+            return ("missing-module",
+                    "a Python import is unavailable — do NOT retry until you create "
+                    "the module locally or switch to one that exists")
+        if re.search(r"IndentationError|TabError", o, re.I):
+            return ("indentation-error",
+                    "Python indentation is wrong — rewrite the file with correct "
+                    "spacing, then re-run")
+        if re.search(r"SyntaxError|syntax error", o, re.I):
+            return ("syntax-error",
+                    "there is a syntax error — read the file, fix the offending line, "
+                    "then re-run")
+        return ("", "")
+
+    @staticmethod
+    def _relevant_excerpt(text: str, cap: int = NATIVE_OUTPUT_CAP) -> str:
+        """Trim an over-long FAILING tool result down to the lines that explain the
+        failure before it's fed back. A blind head-cut at `cap` can drop the actual
+        error (usually at the TAIL), so keep the `exit=` line + error-relevant lines
+        (ERROR_LINE_RE), collapse blank runs, and fall back to a tail-cut if too
+        little survives. Short results pass through untouched. Clean-room analogue
+        of NightShift's `_failure_excerpt`; rules are our own.
+
+        Caller applies this ONLY to non-zero `run_shell` results — successful output
+        and file reads keep a plain cap so a legitimate answer is never shredded."""
+        text = text or ""
+        if len(text) <= cap:
+            return text
+        kept: list[str] = []
+        blank = False
+        found_error = False           # did any real diagnostic line match?
+        for ln in text.splitlines():
+            if ln.startswith("exit="):
+                kept.append(ln)
+                blank = False
+            elif ERROR_LINE_RE.search(ln):
+                kept.append(ln)
+                blank = False
+                found_error = True
+            elif not ln.strip():
+                if not blank:
+                    kept.append("")
+                    blank = True
+            # else: drop non-diagnostic chatter
+        excerpt = "\n".join(kept).strip()
+        if not found_error or not excerpt:   # filter found no diagnostic — keep the tail
+            return "…(truncated)\n" + text[-cap:]
+        return excerpt[:cap]
+
+    @classmethod
+    def _nudge_message(cls, task: str, last_rc: int | None, done_claimed: bool = False,
+                       last_output: str = "") -> str:
         """The continuation prompt for a stalled turn — carries the failing exit
-        code so the model fixes the cause instead of giving up, and offers the
-        clean `DONE:` exit if it actually is finished."""
+        code (and, when we can name it, the failure CATEGORY + a concrete fix) so the
+        model fixes the cause instead of retrying blindly or giving up, and offers
+        the clean `DONE:` exit if it actually is finished. When the model already
+        CLAIMED done but the loop has no proof (verify-then-repair veto), demand a
+        concrete verification command instead of taking the claim on trust."""
         head = ""
         if last_rc not in (None, 0):
-            head = (f"The last command exited {last_rc} (failure). Fix that cause "
-                    f"first — for a script, chmod +x before running it. ")
-        return (f"{head}You have not finished the task: {task}. If it IS fully done, "
-                f"reply with one line starting 'DONE:' and the result. Otherwise call "
-                f"the next tool now — act, do not describe.")
+            category, hint = cls._classify_failure(last_rc, last_output)
+            cause = f" Likely cause: {category} — {hint}." if category else ""
+            head = (f"The last command exited {last_rc} (failure).{cause} Fix that "
+                    f"cause first — for a script, chmod +x before running it. ")
+        elif done_claimed:
+            head = ("You said the task is done, but nothing was run to prove it. Run "
+                    "ONE command that verifies the result (e.g. cat the file, ls it, "
+                    "or execute it) and show the output before claiming done. ")
+        return (f"{head}You have not finished the task: {task}. If it IS fully done "
+                f"AND verified, reply with one line starting 'DONE:' and the result. "
+                f"Otherwise call the next tool now — act, do not describe.")
+
+    @classmethod
+    def _prune_native_messages(cls, messages: list[dict], budget: int,
+                               keep_recent: int = NATIVE_KEEP_RECENT
+                               ) -> tuple[list[dict], int]:
+        """Deterministically drop the OLDEST removable turn messages when the
+        native loop's running context exceeds `budget` (approx tokens). Pure
+        function — returns a (possibly new) list + the count dropped.
+
+        Clean-room counterpart to Exoshell's priority pruning. Never drops:
+        index 0 (the tiny seeded-context head), the pinned TASK message (its
+        content starts with TASK_MARKER), or the last `keep_recent` messages (so
+        the model still sees what just happened). Everything else is a candidate,
+        evicted oldest-first until the estimate fits — so the goal and the
+        freshest state always survive a long, chatty repair sequence. A no-op
+        (returns the same list, 0) whenever already under budget."""
+        est = lambda m: cls._est_tokens(str(m.get("content") or ""))  # noqa: E731
+        running = sum(est(m) for m in messages)
+        if running <= budget:
+            return messages, 0
+        n = len(messages)
+        keep = set(range(max(0, n - keep_recent), n)) | {0}
+        keep |= {i for i, m in enumerate(messages)
+                 if str(m.get("content") or "").startswith(TASK_MARKER)}
+        drop: set[int] = set()
+        for i in range(n):                      # oldest-first
+            if running <= budget:
+                break
+            if i in keep:
+                continue
+            drop.add(i)
+            running -= est(messages[i])
+        if not drop:
+            return messages, 0
+        return [m for i, m in enumerate(messages) if i not in drop], len(drop)
 
     async def _run_native(self, ws, task: str, asker: str) -> None:
         """Tier 1 (granted) bounded host-side tool-calling loop. The model runs on
@@ -809,7 +976,12 @@ class AgentBridge(Client):
             {"role": m.role if m.role in ("user", "assistant") else "user", "content": m.content}
             for m in self.transcript[-NATIVE_CONTEXT:]
         ]
-        messages.append({"role": "user", "content": f"{asker} wants this done in the sandbox: {task}"})
+        # The goal is a discrete, PINNED block (Exoshell's "never lose the goal"):
+        # the TASK_MARKER prefix lets `_prune_native_messages` preserve it by
+        # content no matter how the middle of the conversation grows, and anchors
+        # the weak model on what it is actually meant to accomplish.
+        messages.append({"role": "user",
+                         "content": f"{TASK_MARKER} {asker} wants this done in the sandbox: {task}"})
 
         # Chat gets ONE concise opener; the step-by-step play-by-play lives in the
         # shared sandbox terminal as an inert (commented) transcript everyone
@@ -822,6 +994,8 @@ class AgentBridge(Client):
         shell_calls = 0
         did_action = False          # any tool actually ran (verdict: pure talk = stall)
         last_rc: int | None = None  # exit of the most recent run_shell (give-up guard)
+        last_output = ""            # its result text (fed to the failure classifier)
+        reads_seen: set[str] = set()  # read_file paths already served (dedupe guard)
         nudges = 0                  # stall re-prompts spent (cap MAX_NUDGES)
         turns = 0
         hard_cap = self.max_turns + MAX_NUDGES   # absolute ceiling on model calls
@@ -829,9 +1003,23 @@ class AgentBridge(Client):
         hit_cap = True
         while turns < hard_cap:
             turns += 1
+            # Keep the running context under budget: drop the oldest middle turns
+            # (task + freshest turns pinned) so the goal never falls out of a weak
+            # model's effective window mid-task. Logged, never silent.
+            messages, pruned_n = self._prune_native_messages(messages, self.native_token_budget)
+            if pruned_n:
+                self.info(f"native ctx > ~{self.native_token_budget} tok — pruned "
+                          f"{pruned_n} old turn msg(s)")
+                await self._mirror_to_pty(ws, f"▸ (pruned {pruned_n} old turn msg(s) to fit context)")
+            # Recovery posture: once a command has failed (or we've started nudging),
+            # re-frame the whole turn in the SYSTEM prompt — a weak model weights
+            # that highest — to diagnose instead of flailing.
+            turn_system = system
+            if last_rc not in (None, 0) or nudges > 0:
+                turn_system = system + "\n\n" + REPAIR_STANCE
             await self._send_typing(ws, True)
             try:
-                text, calls = await asyncio.to_thread(cwt, system, messages, NATIVE_TOOLS)
+                text, calls = await asyncio.to_thread(cwt, turn_system, messages, NATIVE_TOOLS)
             except ToolsUnsupported:
                 await self._send_typing(ws, False)
                 await self._send_chat(ws, f"{asker}: (model has no tool support — using simple harness)")
@@ -886,7 +1074,10 @@ class AgentBridge(Client):
                     break
                 nudges += 1
                 messages.append({"role": "assistant", "content": text or ""})
-                messages.append({"role": "user", "content": self._nudge_message(task, last_rc)})
+                messages.append({"role": "user",
+                                 "content": self._nudge_message(task, last_rc,
+                                                                self._is_done_signal(text),
+                                                                last_output)})
                 await self._mirror_to_pty(ws, "▸ (nudge: finish the task or reply DONE:)")
                 continue
             # Echo the assistant's tool-call message, then run each call and append
@@ -899,7 +1090,22 @@ class AgentBridge(Client):
                 # mirrored here — it feeds the model loop and is reported via the
                 # final chat summary, keeping the terminal pane clean.
                 await self._mirror_to_pty(ws, f"▸ {self._describe_call(call)}")
-                if call.get("name") == "run_shell":
+                name = call.get("name")
+                # Dedupe idempotent reads only: a weak model sometimes loops re-
+                # reading the same file, burning a slow CPU turn. Short-circuit a
+                # repeat read with a nudge to act on what it has. run_shell is NEVER
+                # deduped — a re-run can be intentional (e.g. after a fix).
+                if name == "read_file":
+                    rpath = str((call.get("arguments") or {}).get("path", "")).strip()
+                    if rpath and rpath in reads_seen:
+                        messages.append({"role": "tool",
+                                         "content": (f"[already read {rpath} this task — "
+                                                     "re-reading wastes a turn; act on what "
+                                                     "you have or take the next action]")})
+                        continue
+                    if rpath:
+                        reads_seen.add(rpath)
+                if name == "run_shell":
                     shell_calls += 1
                     if shell_calls > MAX_COMMANDS:
                         result = "[blocked: command budget exhausted for this task]"
@@ -908,9 +1114,18 @@ class AgentBridge(Client):
                 else:
                     result = await self._exec_tool(ws, prefix, call)
                 did_action = True
-                if call.get("name") == "run_shell":
+                if name == "run_shell":
                     last_rc = self._parse_exit(result)
-                messages.append({"role": "tool", "content": result[:NATIVE_OUTPUT_CAP]})
+                    last_output = result
+                    # Failing output is excerpted to its error lines so the real
+                    # cause survives the byte cap (it's usually at the tail); clean
+                    # output and file reads keep a plain head-cap (never shred an
+                    # answer).
+                    fed = (self._relevant_excerpt(result) if last_rc not in (None, 0)
+                           else result[:NATIVE_OUTPUT_CAP])
+                else:
+                    fed = result[:NATIVE_OUTPUT_CAP]
+                messages.append({"role": "tool", "content": fed})
         if hit_cap:
             final = final or "[stopped at the turn cap — task may be incomplete]"
 
