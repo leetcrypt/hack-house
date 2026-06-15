@@ -31,8 +31,12 @@ err.log
 # Heavy / superseded demo-build kit (real demos live in video-toolkit)
 /docs/demo/
 
-# Benchmark runtime results (commit a curated baseline with `git add -f`)
-/bench/results/
+# Native-harness benchmark harness + results — dev-internal test tooling, kept
+# on disk but never pushed to origin (coupled to the local tmux+podman test rig)
+/bench/
+
+# Local-only planning/design docs (kept on disk, never pushed to origin)
+/docs/plans/
 
 # Project scratch
 /i-try/
