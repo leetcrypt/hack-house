@@ -74,8 +74,11 @@ def _apply_ollama_tuning(provider, args) -> None:
         provider.num_predict = args.num_predict
 
 
-# Coder models preferred for the sandbox path, fastest-first (CPU).
-_CODER_MODELS = ("qwen2.5-coder:1.5b", "qwen2.5-coder:3b", "qwen2.5-coder")
+# Coder models preferred for the sandbox `!task` path, accuracy-first. The 3b
+# build roughly doubles the ground-truth pass rate over 1.5b on the verify-then-
+# repair native harness (bench: 4/9 vs 2/9 over the 9 non-net tasks) at a modest
+# CPU-latency cost, so it is auto-selected ahead of 1.5b when present.
+_CODER_MODELS = ("qwen2.5-coder:3b", "qwen2.5-coder", "qwen2.5-coder:1.5b")
 
 
 def _build_code_provider(provider, args):
