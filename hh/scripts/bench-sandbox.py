@@ -97,6 +97,10 @@ class Owner(Client):
         await self._send(ws, json.dumps(
             {"_perm": "acl", "drivers": [agent], "sudoers": [agent] if sudo else []}))
 
+    async def revoke(self, ws) -> None:
+        await self._send(ws, json.dumps(
+            {"_perm": "acl", "drivers": [], "sudoers": []}))
+
     async def task(self, ws, agent: str, task: str) -> None:
         await self._send(ws, f"/ai {agent} !{task}")
 
@@ -334,9 +338,13 @@ async def run(args, agent_name: str) -> list[dict]:
                      "exec": "—", "note": "", "passes": f"0/{args.runs}", "avg_s": 0.0}
                     for lvl in LEVELS]
 
-        granted = False
         for r in range(args.runs):
             tag = f"[run {r + 1}/{args.runs}] " if args.runs > 1 else ""
+            # Each run must start ungranted so the L0-nogrant refusal test is
+            # valid every time — otherwise run 1's grant leaks into runs 2+.
+            await owner.revoke(ws)
+            await asyncio.sleep(0.6)
+            granted = False
             for lvl in LEVELS:
                 if lvl["phase"] == "granted" and not granted:
                     await owner.grant(ws, agent_name, sudo=args.sudo)
