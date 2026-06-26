@@ -37,6 +37,12 @@ def _add_conn_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--trigger", default=None,
                    help="extra phrase that marks a message 'addressed' to us "
                         "(the operator name / @name always count)")
+    p.add_argument("--depth", type=int, default=1,
+                   help="recursion depth budget (levels of nested operators)")
+    p.add_argument("--fanout", type=int, default=2,
+                   help="recursion fan-out budget (children per level)")
+    p.add_argument("--cost", type=float, default=5.0,
+                   help="soft cost ceiling (USD) carried to children")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -81,6 +87,24 @@ def _build_parser() -> argparse.ArgumentParser:
     gt.add_argument("--out", default=None, help="write to this local path (else stdout)")
     gt.add_argument("--session", default=None)
 
+    sp = sub.add_parser("spawn", help="spawn a nested Claude operator (budgeted)")
+    sp.add_argument("objective", help="what the nested operator should achieve")
+    sp.add_argument("--room-host", required=True)
+    sp.add_argument("--room-port", type=int, required=True)
+    sp.add_argument("--room-name", default="operator")
+    sp.add_argument("--stop", action="append", default=None,
+                    help="a stop condition (repeatable)")
+    sp.add_argument("--target", choices=["host"], default="host")
+    sp.add_argument("--config-dir", default=None,
+                    help="isolated CLAUDE_CONFIG_DIR for the child")
+    sp.add_argument("--allow-creds", action="store_true",
+                    help="carry our credentials to the child (default: off)")
+    sp.add_argument("--skip-permissions", action="store_true",
+                    help="run the child unattended (--dangerously-skip-permissions)")
+    sp.add_argument("--go", action="store_true",
+                    help="actually launch (default is a dry-run plan)")
+    sp.add_argument("--session", default=None)
+
     ky = sub.add_parser("keys", help="inject keystrokes into the room's shared PTY")
     ky.add_argument("keys", nargs="*",
                     help="tokens: literal text, named keys (enter, ctrl-c, esc, "
@@ -96,10 +120,12 @@ def _build_parser() -> argparse.ArgumentParser:
 # ── daemon ───────────────────────────────────────────────────────────────
 def _run_serve(args) -> int:
     from .bridge import OperatorBridge  # heavy imports only on the daemon path
+    from .bootstrap import Budget
+    budget = Budget(depth=args.depth, fanout=args.fanout, cost_usd=args.cost)
     bridge = OperatorBridge(
         args.host, args.port, name=args.user, password=args.password,
         insecure=args.insecure, no_tls=args.no_tls,
-        session=args.session, trigger=args.trigger)
+        session=args.session, trigger=args.trigger, budget=budget)
     try:
         bridge.run()
     except KeyboardInterrupt:
@@ -139,6 +165,8 @@ def _run_up(args) -> int:
         cmd += ["--session", args.session]
     if args.trigger:
         cmd += ["--trigger", args.trigger]
+    cmd += ["--depth", str(args.depth), "--fanout", str(args.fanout),
+            "--cost", str(args.cost)]
 
     log = open(sess.log_path, "a")  # noqa: SIM115 — handed to the child
     proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
@@ -267,6 +295,18 @@ def _run_get(args) -> int:
     return 0
 
 
+def _run_spawn(args) -> int:
+    resp = _client_request(args, {
+        "op": "spawn", "objective": args.objective,
+        "room": {"host": args.room_host, "port": args.room_port,
+                 "name": args.room_name},
+        "stop": args.stop, "target": args.target,
+        "config_dir": args.config_dir, "allow_creds": args.allow_creds,
+        "skip_permissions": args.skip_permissions, "dry_run": not args.go})
+    print(json.dumps(resp, indent=2))
+    return 0 if resp.get("ok") else 1
+
+
 def _run_keys(args) -> int:
     from . import sandbox as sbx
     if args.help_keys:
@@ -309,6 +349,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_get(args)
     if verb == "keys":
         return _run_keys(args)
+    if verb == "spawn":
+        return _run_spawn(args)
     if verb in ("roster", "status", "down"):
         return _run_simple(args, verb)
     return 2

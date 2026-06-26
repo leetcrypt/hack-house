@@ -25,6 +25,7 @@ import time
 import websockets
 
 from ..client.client import Client
+from . import bootstrap as boot
 from . import sandbox as sbx
 from .session import Session
 
@@ -39,12 +40,14 @@ class OperatorBridge(Client):
     def __init__(self, server: str, port: int, name: str,
                  password: str | None = None, insecure: bool = False,
                  no_tls: bool = False, session: str | None = None,
-                 trigger: str | None = None):
+                 trigger: str | None = None, budget: boot.Budget | None = None):
         super().__init__(server, port, username=name, password=password,
                          insecure=insecure, no_tls=no_tls)
         self.name = name
         self.trigger = (trigger or "").strip()
         self.session = Session(session or name)
+        # Recursion budget this operator may spend spawning nested operators.
+        self.budget = budget or boot.Budget()
 
         # Inbox: monotonically-seq'd events + an async condition to wake waiters.
         self.events: list[dict] = []
@@ -302,6 +305,8 @@ class OperatorBridge(Client):
             return await self._op_get(req)
         if op == "keys":
             return await self._op_keys(req)
+        if op == "spawn":
+            return await self._op_spawn(req)
         if op == "down":
             asyncio.get_running_loop().call_soon(self._begin_shutdown)
             return {"ok": True, "stopping": True}
@@ -468,6 +473,87 @@ class OperatorBridge(Client):
             return {"ok": False, "error": f"send failed: {type(e).__name__}: {e}"}
         await self._emit("keys", bytes=len(data))
         return {"ok": True, "bytes": len(data)}
+
+    # ── recursive spawn (Phase 5) ────────────────────────────────────────
+    async def _op_spawn(self, req: dict) -> dict:
+        """Stand up a nested Claude Code operator against another room.
+
+        Guardrails, in order:
+        - **budget** — refuse unless this node may still spawn (depth>0 &
+          fanout>0); the child inherits a decremented budget, we record one spent
+          slot. This is the hard stop against a runaway tree.
+        - **creds gating** — we carry our own credentials to the child *only* when
+          `allow_creds` is explicitly set; otherwise the child authenticates
+          itself. Never implicit, never to a system we don't own.
+        - **dry_run** — default returns the full plan (argv, budget, creds
+          decision) and launches nothing, so a tree can be inspected before it's
+          grown.
+
+        `target` is "host" (Popen detached here) — sandbox/VM placement is the
+        operator's to run via `exec` using the returned plan."""
+        objective = str(req.get("objective", "")).strip()
+        if not objective:
+            return {"ok": False, "error": "spawn needs an objective"}
+        room = req.get("room") or {}
+        if not room.get("host") or not room.get("port"):
+            return {"ok": False, "error": "spawn needs room {host, port, name}"}
+
+        if not self.budget.can_spawn():
+            return {"ok": False, "error": "recursion budget exhausted "
+                    f"(depth={self.budget.depth}, fanout={self.budget.fanout})"}
+        try:
+            child_budget = self.budget.descend()
+        except boot.BudgetExhausted as e:
+            return {"ok": False, "error": str(e)}
+
+        allow_creds = bool(req.get("allow_creds", False))
+        dry_run = bool(req.get("dry_run", True))
+        skip_perms = bool(req.get("skip_permissions", False))
+        config_dir = req.get("config_dir")
+
+        stop = req.get("stop") or None
+        directive = boot.compose_directive(objective, room, child_budget, stop=stop)
+        argv = boot.build_run_argv(directive, skip_permissions=skip_perms,
+                                   config_dir=config_dir)
+        creds = boot.plan_creds(config_dir or "~", allow=allow_creds)
+        plan = {"argv": argv, "budget": child_budget.as_dict(), "creds": creds,
+                "target": req.get("target", "host"),
+                "claude_present": boot.claude_present()}
+
+        if dry_run:
+            return {"ok": True, "dry_run": True, "plan": plan}
+
+        if not boot.claude_present():
+            return {"ok": False, "error": "claude CLI not installed",
+                    "install_plan": boot.install_plan(), "plan": plan}
+
+        # Carry creds only behind the explicit gate.
+        if creds.get("staged"):
+            try:
+                dest = boot.Path(creds["dest"])
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(boot.Path(creds["src"]).read_bytes())
+                dest.chmod(0o600)
+            except OSError as e:
+                return {"ok": False, "error": f"creds staging failed: {e}"}
+
+        # Launch detached so the child outlives this daemon; logs to the session.
+        import subprocess
+        try:
+            logf = open(self.session.dir / f"spawn-{self.seq + 1}.log", "a")  # noqa: SIM115
+            proc = subprocess.Popen(
+                argv, env=boot.child_env(config_dir),
+                stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True)
+        except OSError as e:
+            return {"ok": False, "error": f"spawn launch failed: {e}"}
+
+        self.budget = self.budget.spent()  # consume one child slot here
+        await self._emit("spawn", objective=objective, pid=proc.pid,
+                         budget=child_budget.as_dict(),
+                         creds_staged=creds.get("staged", False))
+        return {"ok": True, "pid": proc.pid, "plan": plan,
+                "remaining": self.budget.as_dict()}
 
     def _begin_shutdown(self) -> None:
         self._stop.set()

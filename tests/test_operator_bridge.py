@@ -15,6 +15,7 @@ from cryptography.fernet import Fernet
 
 from cmd_chat.operator.bridge import OperatorBridge
 from cmd_chat.operator import sandbox as sbx
+from cmd_chat.operator import bootstrap as boot
 
 
 def _bridge(name="oracle", trigger=None):
@@ -271,4 +272,94 @@ def test_exec_requires_target():
         assert r["ok"] is False and "no sandbox" in r["error"]
         r = await b._op_exec({"cmd": ""})
         assert r["ok"] is False and "empty" in r["error"]
+    asyncio.run(go())
+
+
+# ── Phase 5: recursion budget guardrails ──────────────────────────────────
+def test_budget_descend_and_exhaust():
+    b = boot.Budget(depth=2, fanout=2, cost_usd=5.0)
+    assert b.can_spawn()
+    child = b.descend()                       # one level down for the child
+    assert child.depth == 1 and child.fanout == 2
+    spent = b.spent()                         # this node used one child slot
+    assert spent.fanout == 1 and spent.depth == 2
+    # depth floor: a leaf cannot nest
+    leaf = boot.Budget(depth=0, fanout=2)
+    assert not leaf.can_spawn()
+    try:
+        leaf.descend()
+        assert False, "expected BudgetExhausted"
+    except boot.BudgetExhausted:
+        pass
+    # fan-out floor
+    spread = boot.Budget(depth=3, fanout=0)
+    assert not spread.can_spawn()
+
+
+def test_install_plan_prefers_npm_and_honors_override(monkeypatch=None):
+    plan = boot.install_plan({"has_npm": True, "pkg_manager": "apt-get"})
+    assert plan and plan[0] == ["npm", "install", "-g", boot.CLAUDE_NPM_PACKAGE]
+    # no npm → distro node install then npm global
+    plan = boot.install_plan({"has_npm": False, "pkg_manager": "apk"})
+    assert ["apk", "add", "nodejs", "npm"] in plan
+    # explicit override wins and is the only command
+    import os
+    os.environ["HH_CLAUDE_INSTALL"] = "echo custom-install"
+    try:
+        plan = boot.install_plan({"has_npm": True})
+        assert plan == [["sh", "-c", "echo custom-install"]]
+    finally:
+        del os.environ["HH_CLAUDE_INSTALL"]
+
+
+def test_compose_directive_carries_objective_stop_budget():
+    d = boot.compose_directive(
+        "map the room and report", {"host": "h", "port": 9, "name": "scout"},
+        boot.Budget(depth=1, fanout=2, cost_usd=3.0), stop=["task done"])
+    assert "hh-operator skill" in d
+    assert "map the room and report" in d
+    assert "task done" in d
+    assert "depth=1" in d and "fanout=2" in d
+
+
+def test_plan_creds_gated_off_by_default():
+    off = boot.plan_creds("/tmp/child", allow=False)
+    assert off["staged"] is False and "gating on" in off["reason"]
+
+
+def test_build_run_argv_flags():
+    argv = boot.build_run_argv("do x", skip_permissions=True)
+    assert argv[:3] == ["claude", "-p", "do x"]
+    assert "--dangerously-skip-permissions" in argv
+    argv = boot.build_run_argv("do x")
+    assert "--dangerously-skip-permissions" not in argv
+
+
+# ── spawn op: gating + dry-run ────────────────────────────────────────────
+def test_spawn_dry_run_returns_plan_without_launch():
+    async def go():
+        b = _bridge("oracle")
+        b.budget = boot.Budget(depth=1, fanout=1, cost_usd=2.0)
+        r = await b._op_spawn({"objective": "scout the room",
+                               "room": {"host": "h", "port": 7, "name": "kid"},
+                               "dry_run": True})
+        assert r["ok"] and r["dry_run"] is True
+        assert r["plan"]["budget"] == {"depth": 0, "fanout": 1, "cost_usd": 2.0}
+        assert r["plan"]["creds"]["staged"] is False     # gated off
+        # dry-run must not consume the budget
+        assert b.budget.fanout == 1
+        # no spawn event emitted on a dry run
+        assert [e for e in b.events if e["kind"] == "spawn"] == []
+    asyncio.run(go())
+
+
+def test_spawn_refuses_without_objective_or_room_or_budget():
+    async def go():
+        b = _bridge("oracle")
+        assert (await b._op_spawn({"objective": ""}))["ok"] is False
+        assert (await b._op_spawn({"objective": "x"}))["ok"] is False  # no room
+        b.budget = boot.Budget(depth=0, fanout=0)
+        r = await b._op_spawn({"objective": "x",
+                               "room": {"host": "h", "port": 7}})
+        assert r["ok"] is False and "budget exhausted" in r["error"]
     asyncio.run(go())
