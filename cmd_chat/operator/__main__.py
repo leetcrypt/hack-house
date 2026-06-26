@@ -1,0 +1,217 @@
+"""CLI for the operator bridge — `python -m cmd_chat.operator <verb>`.
+
+Verbs
+-----
+    serve  HOST PORT USER   run the daemon (normally spawned by `up`, not by hand)
+    up     HOST PORT USER   start the daemon detached and wait for it to connect
+    read   [--wait]         print new inbox events as JSONL (cursor-tracked)
+    say    TEXT…            send a chat line to the room
+    roster                  list who's in the room
+    status                  daemon + connection state
+    down                    stop the daemon, leave the room
+
+Phase 1: join + read + say. The reusable skill wrapper comes in a later phase;
+for now a Claude Code session can drive everything straight from Bash.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+from .cli_client import BridgeUnreachable, request
+from .session import Session, resolve
+
+
+def _add_conn_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("host")
+    p.add_argument("port", type=int)
+    p.add_argument("user", help="room display name to join as (also the session id)")
+    p.add_argument("--password", default=None)
+    p.add_argument("--no-tls", action="store_true", help="plain ws/http")
+    p.add_argument("--insecure", action="store_true", help="skip TLS verify")
+    p.add_argument("--session", default=None, help="session id (default: USER)")
+    p.add_argument("--trigger", default=None,
+                   help="extra phrase that marks a message 'addressed' to us "
+                        "(the operator name / @name always count)")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="cmd_chat.operator")
+    sub = ap.add_subparsers(dest="verb", required=True)
+
+    _add_conn_args(sub.add_parser("serve", help="run the daemon (foreground)"))
+    _add_conn_args(sub.add_parser("up", help="start the daemon detached"))
+
+    r = sub.add_parser("read", help="print new inbox events")
+    r.add_argument("--session", default=None)
+    r.add_argument("--since", type=int, default=None,
+                   help="seq to read after (default: saved cursor)")
+    r.add_argument("--wait", action="store_true", help="long-poll until an event arrives")
+    r.add_argument("--timeout", type=float, default=30.0)
+    r.add_argument("--all", action="store_true", help="ignore cursor, dump full ring")
+
+    s = sub.add_parser("say", help="send a chat line")
+    s.add_argument("text", nargs="+")
+    s.add_argument("--session", default=None)
+
+    for v in ("roster", "status", "down"):
+        sub.add_parser(v).add_argument("--session", default=None)
+    return ap
+
+
+# ── daemon ───────────────────────────────────────────────────────────────
+def _run_serve(args) -> int:
+    from .bridge import OperatorBridge  # heavy imports only on the daemon path
+    bridge = OperatorBridge(
+        args.host, args.port, name=args.user, password=args.password,
+        insecure=args.insecure, no_tls=args.no_tls,
+        session=args.session, trigger=args.trigger)
+    try:
+        bridge.run()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _run_up(args) -> int:
+    import subprocess
+
+    sess = Session(args.session or args.user)
+    sess.ensure_dir()
+
+    # Already alive?
+    if sess.sock_path.exists():
+        try:
+            st = request(sess.sock_path, {"op": "status"}, read_timeout=5)
+            if st.get("connected"):
+                print(f"session '{sess.name}' already up (connected)")
+                return 0
+        except BridgeUnreachable:
+            sess.cleanup()  # stale socket → fall through and respawn
+
+    sess.write_meta(host=args.host, port=args.port, user=args.user,
+                    trigger=args.trigger or "", no_tls=args.no_tls,
+                    started=time.time())
+
+    cmd = [sys.executable, "-m", "cmd_chat.operator", "serve",
+           args.host, str(args.port), args.user]
+    if args.password is not None:
+        cmd += ["--password", args.password]
+    if args.no_tls:
+        cmd.append("--no-tls")
+    if args.insecure:
+        cmd.append("--insecure")
+    if args.session:
+        cmd += ["--session", args.session]
+    if args.trigger:
+        cmd += ["--trigger", args.trigger]
+
+    log = open(sess.log_path, "a")  # noqa: SIM115 — handed to the child
+    proc = subprocess.Popen(cmd, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                            start_new_session=True, close_fds=True)
+
+    # Wait for the daemon to connect (or report a fatal-looking error).
+    deadline = time.time() + 15.0
+    last_err = None
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            print(f"daemon exited early (code {proc.returncode}); see {sess.log_path}",
+                  file=sys.stderr)
+            return 1
+        try:
+            st = request(sess.sock_path, {"op": "status"}, read_timeout=3)
+        except BridgeUnreachable:
+            time.sleep(0.3)
+            continue
+        if st.get("connected"):
+            print(f"session '{sess.name}' up — connected to {args.host}:{args.port} "
+                  f"as '{args.user}' (pid {proc.pid})")
+            return 0
+        # Connected socket but not in-room yet: peek for an error event.
+        try:
+            rd = request(sess.sock_path, {"op": "read", "since": 0}, read_timeout=3)
+            errs = [e for e in rd.get("events", []) if e.get("event") == "error"]
+            if errs:
+                last_err = errs[-1].get("reason")
+        except BridgeUnreachable:
+            pass
+        time.sleep(0.4)
+
+    msg = f"session '{sess.name}' started (pid {proc.pid}) but not connected yet"
+    if last_err:
+        msg += f" — last error: {last_err}"
+    print(msg + f"; tail {sess.log_path}", file=sys.stderr)
+    return 1
+
+
+# ── client verbs ─────────────────────────────────────────────────────────
+def _client_request(args, obj: dict, read_timeout: float = 35.0) -> dict:
+    sess = resolve(getattr(args, "session", None))
+    if not sess.sock_path.exists():
+        print(f"no live bridge for session '{sess.name}' "
+              f"(run `up` first)", file=sys.stderr)
+        sys.exit(2)
+    try:
+        return request(sess.sock_path, obj, read_timeout=read_timeout)
+    except BridgeUnreachable as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+
+def _run_read(args) -> int:
+    sess = resolve(getattr(args, "session", None))
+    if args.all:
+        since = 0
+    elif args.since is not None:
+        since = args.since
+    else:
+        since = sess.read_cursor()
+    timeout = args.timeout
+    resp = _client_request(args, {"op": "read", "since": since,
+                                  "wait": args.wait, "timeout": timeout},
+                           read_timeout=timeout + 5.0)
+    events = resp.get("events", [])
+    for ev in events:
+        print(json.dumps(ev))
+    if events and not args.all and args.since is None:
+        sess.write_cursor(events[-1]["seq"])
+    return 0
+
+
+def _run_say(args) -> int:
+    text = " ".join(args.text)
+    resp = _client_request(args, {"op": "say", "text": text})
+    if not resp.get("ok"):
+        print(resp.get("error", "say failed"), file=sys.stderr)
+        return 1
+    return 0
+
+
+def _run_simple(args, op: str) -> int:
+    resp = _client_request(args, {"op": op})
+    print(json.dumps(resp))
+    return 0 if resp.get("ok") else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    verb = args.verb
+    if verb == "serve":
+        return _run_serve(args)
+    if verb == "up":
+        return _run_up(args)
+    if verb == "read":
+        return _run_read(args)
+    if verb == "say":
+        return _run_say(args)
+    if verb in ("roster", "status", "down"):
+        return _run_simple(args, verb)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
