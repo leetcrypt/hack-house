@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import uuid
+from dataclasses import dataclass, field
 
 import websockets
 
@@ -239,6 +241,35 @@ REPAIR_STANCE = (
     "repeat a previous command unchanged."
 )
 
+# Stuck/loop detection thresholds (clean-room counterpart to OpenHands' stuck
+# detector, tuned tighter for a weak 3B that loops hard). A slow CPU turn is
+# expensive, so we break BEFORE the turn cap rather than burning the whole budget
+# re-running a known-dead action. All counting is per-task RAM (see _WorkSet.seen).
+STUCK_FAIL_REPEAT = 2   # same action signature observed failing this many times → abort
+STUCK_PAIR_REPEAT = 3   # same (signature, outcome) this many times → no-progress abort
+
+
+@dataclass
+class _WorkSet:
+    """Per-task in-RAM working memory for the native loop. Holds the few facts the
+    loop otherwise keeps re-deriving — sandbox cwd/shell, files touched, the failure
+    ledger, and the action-repeat counters that drive stuck detection — so they
+    survive context pruning WITHOUT touching disk. Rendered into the system prompt
+    on repair turns (where a weak model weights it highest). Lifecycle is identical
+    to the rolling transcript and MemoryIndex: process RAM only, dies with the task.
+
+    `failures` maps a failing command → (exit_code, category) from _classify_failure
+    so a repair nudge (and the rendered block) can name what already broke. `seen`
+    maps (action_signature, outcome) → count for loop detection — run_shell is NOT
+    deduped elsewhere, so this is the only guard against re-running a failing one."""
+    cwd: str = ""
+    shell: str = ""
+    files_written: set[str] = field(default_factory=set)
+    files_read: set[str] = field(default_factory=set)
+    failures: dict[str, tuple[int, str]] = field(default_factory=dict)
+    last_good: str = ""
+    seen: dict[tuple[str, str], int] = field(default_factory=dict)
+
 
 class AgentBridge(Client):
     def __init__(self, server: str, port: int, name: str, provider: Provider,
@@ -292,6 +323,11 @@ class AgentBridge(Client):
         self.sbx_engine: str | None = None   # docker|podman|multipass|local
         self.sbx_name: str = ""              # container/instance handle ("" for local)
         self.sbx_backend: str | None = None  # cosmetic label from the broker
+        # Cross-task (process-lifetime, RAM-only) carry of the sandbox's discovered
+        # cwd/shell so a second task in the same process skips the `_sandbox_facts`
+        # probe. (cwd, shell) once learned; None until the first native run. Dies
+        # with the agent — no disk, consistent with the rest of the agent's memory.
+        self._sbx_known: tuple[str, str] | None = None
 
     @staticmethod
     def _est_tokens(text: str) -> int:
@@ -762,6 +798,62 @@ class AgentBridge(Client):
         return int(m.group(1)) if m else None
 
     @staticmethod
+    def _action_signature(call: dict) -> str:
+        """Stable identity for an action, used by stuck detection to count repeats.
+        run_shell keys on the exact command; write_file on path + a content hash (so
+        re-writing the SAME bytes counts as a repeat but a real edit does not);
+        read_file on the path. Deterministic and cheap — pure string work, no I/O."""
+        name = call.get("name", "")
+        args = call.get("arguments") or {}
+        if name == "run_shell":
+            return "run_shell:" + str(args.get("command", "")).strip()
+        if name == "write_file":
+            body = str(args.get("content", ""))
+            digest = hashlib.sha1(body.encode("utf-8", "replace")).hexdigest()[:12]
+            return f"write_file:{str(args.get('path', '')).strip()}:{digest}"
+        if name == "read_file":
+            return "read_file:" + str(args.get("path", "")).strip()
+        return f"{name}:" + json.dumps(args, sort_keys=True)[:120]
+
+    @staticmethod
+    def _parse_sbx_facts(text: str) -> tuple[str, str]:
+        """Pull (cwd, shell) out of the `_sandbox_facts` probe output so they can be
+        held structurally in the WorkSet (and reused across tasks). Returns ('', '')
+        for anything it can't find — the raw text still rides the system prompt."""
+        cwd = shell = ""
+        m = re.search(r"(?m)^working_directory=(.*)$", text or "")
+        if m:
+            cwd = m.group(1).strip()
+        m = re.search(r"(?m)^bash=(.*)$", text or "")
+        if m:
+            val = m.group(1).strip()
+            shell = "" if val.startswith("(none") else val
+        return cwd, shell
+
+    @staticmethod
+    def _render_workset(ws: "_WorkSet") -> str:
+        """Render the per-task working set into a compact (≤5-line) block injected on
+        repair turns. This is the RAM-only scratchpad: it re-surfaces what the agent
+        already learned (where it is, what it wrote, what already failed and why) so
+        that knowledge survives context pruning without a NOTES.md on disk. Empty
+        string when there is nothing worth saying yet (keeps clean turns lean)."""
+        bits: list[str] = []
+        if ws.shell or ws.cwd:
+            bits.append(f"location: shell={ws.shell or '(sh)'} cwd={ws.cwd or '?'}")
+        if ws.files_written:
+            bits.append("files you wrote: " + ", ".join(sorted(ws.files_written)[:5]))
+        if ws.last_good:
+            bits.append(f"last command that worked: {ws.last_good[:80]}")
+        if ws.failures:
+            fb = "; ".join(f"`{c[:60]}` → exit {rc} ({cat or 'failed'})"
+                           for c, (rc, cat) in list(ws.failures.items())[:4])
+            bits.append("already failed — do NOT repeat verbatim: " + fb)
+        if not bits:
+            return ""
+        return ("WORKING SET (what you already know this task — trust it, don't "
+                "re-derive):\n" + "\n".join(f"- {b}" for b in bits))
+
+    @staticmethod
     def _is_done_signal(text: str) -> bool:
         return (text or "").lstrip().upper().startswith("DONE")
 
@@ -963,9 +1055,19 @@ class AgentBridge(Client):
         # files) so it stops inventing paths like /ai/bin/bash. Authoritative state
         # rides in the system prompt where a weak model weights it highest.
         system = NATIVE_SYSTEM.format(name=self.name)
+        # Per-task working set (RAM only, dies with the task). `wset` — NOT `ws`,
+        # which is the websocket throughout this method.
+        wset = _WorkSet()
         facts = await self._sandbox_facts(prefix)
         if facts:
             system += "\n\nLIVE SANDBOX STATE (authoritative — never contradict it):\n" + facts
+            wset.cwd, wset.shell = self._parse_sbx_facts(facts)
+            self._sbx_known = (wset.cwd, wset.shell)   # RAM carry for later tasks
+        elif self._sbx_known is not None:
+            # Probe failed this run, but we learned the sandbox's cwd/shell on an
+            # earlier task in this process — reuse it (RAM carry) so the model stays
+            # grounded instead of inventing paths.
+            wset.cwd, wset.shell = self._sbx_known
         # Action tasks get a TIGHT, RAG-free context. Unlike Q&A (`_model_messages`,
         # which adds the full window + semantic recall), an execution task wants the
         # instruction to dominate: a weak model fed prior chat chatter ("/grant"
@@ -995,7 +1097,6 @@ class AgentBridge(Client):
         did_action = False          # any tool actually ran (verdict: pure talk = stall)
         last_rc: int | None = None  # exit of the most recent run_shell (give-up guard)
         last_output = ""            # its result text (fed to the failure classifier)
-        reads_seen: set[str] = set()  # read_file paths already served (dedupe guard)
         nudges = 0                  # stall re-prompts spent (cap MAX_NUDGES)
         turns = 0
         hard_cap = self.max_turns + MAX_NUDGES   # absolute ceiling on model calls
@@ -1017,6 +1118,11 @@ class AgentBridge(Client):
             turn_system = system
             if last_rc not in (None, 0) or nudges > 0:
                 turn_system = system + "\n\n" + REPAIR_STANCE
+                # Re-surface the RAM working set (location, files written, what
+                # already failed) so it survives pruning without a NOTES.md on disk.
+                ws_block = self._render_workset(wset)
+                if ws_block:
+                    turn_system += "\n\n" + ws_block
             await self._send_typing(ws, True)
             try:
                 text, calls = await asyncio.to_thread(cwt, turn_system, messages, NATIVE_TOOLS)
@@ -1084,6 +1190,7 @@ class AgentBridge(Client):
             # its result as a `tool` message so the next turn sees the output.
             messages.append({"role": "assistant", "content": text or "",
                              "tool_calls": self._calls_to_wire(calls)})
+            stuck = ""   # set by the loop detector below → abort before the turn cap
             for call in calls:
                 # Mirror ONLY the action into the PTY (so the clergy sees what the
                 # agent is doing in the sandbox); the captured output/result is NOT
@@ -1097,14 +1204,14 @@ class AgentBridge(Client):
                 # deduped — a re-run can be intentional (e.g. after a fix).
                 if name == "read_file":
                     rpath = str((call.get("arguments") or {}).get("path", "")).strip()
-                    if rpath and rpath in reads_seen:
+                    if rpath and rpath in wset.files_read:
                         messages.append({"role": "tool",
                                          "content": (f"[already read {rpath} this task — "
                                                      "re-reading wastes a turn; act on what "
                                                      "you have or take the next action]")})
                         continue
                     if rpath:
-                        reads_seen.add(rpath)
+                        wset.files_read.add(rpath)
                 if name == "run_shell":
                     shell_calls += 1
                     if shell_calls > MAX_COMMANDS:
@@ -1126,6 +1233,53 @@ class AgentBridge(Client):
                 else:
                     fed = result[:NATIVE_OUTPUT_CAP]
                 messages.append({"role": "tool", "content": fed})
+
+                # ---- working set + stuck detection (per-task RAM, no disk) ----
+                # Record the outcome so the ledger can warn the model and the loop
+                # detector can break out of a dead repair cycle before the turn cap
+                # wastes more slow-CPU calls re-running a known-bad action.
+                sig = self._action_signature(call)
+                args = call.get("arguments") or {}
+                if name == "run_shell":
+                    cmd = str(args.get("command", "")).strip()
+                    failed = last_rc not in (None, 0)
+                    outcome = f"rc={last_rc}"
+                    if failed:
+                        cat, _ = self._classify_failure(last_rc, result)
+                        wset.failures[cmd] = (last_rc if last_rc is not None else -1, cat)
+                    elif cmd:
+                        wset.last_good = cmd
+                        wset.failures.pop(cmd, None)   # works now — drop stale failure
+                else:
+                    failed = result.lstrip().lower().startswith("[error")
+                    outcome = "err" if failed else "ok"
+                    if name == "write_file" and not failed:
+                        wpath = str(args.get("path", "")).strip()
+                        if wpath:
+                            wset.files_written.add(wpath)
+                key = (sig, outcome)
+                wset.seen[key] = wset.seen.get(key, 0) + 1
+                # Trip 1 — same action seen failing ≥ STUCK_FAIL_REPEAT times (across
+                # any failing outcome): the model is repeating a command verbatim
+                # despite REPAIR_STANCE telling it not to. Trip 2 — identical
+                # (action, outcome) ≥ STUCK_PAIR_REPEAT times: no forward progress.
+                fail_repeats = sum(c for (s, o), c in wset.seen.items()
+                                   if s == sig and o not in ("rc=0", "ok", "rc=None"))
+                if failed and fail_repeats >= STUCK_FAIL_REPEAT:
+                    stuck = f"repeating a failing action — {self._describe_call(call)}"
+                elif wset.seen[key] >= STUCK_PAIR_REPEAT:
+                    stuck = (f"no progress (same action+result ×{wset.seen[key]}) — "
+                             f"{self._describe_call(call)}")
+                if stuck:
+                    break
+            if stuck:
+                # Honest abort: surface the real reason to the PTY + chat instead of
+                # burning the rest of the turn budget on the same dead action.
+                await self._mirror_to_pty(ws, f"▸ (stuck: {stuck} — aborting)")
+                self.info(f"native loop aborted — {stuck}")
+                final = f"[stopped — {stuck}; task likely incomplete]"
+                hit_cap = False
+                break
         if hit_cap:
             final = final or "[stopped at the turn cap — task may be incomplete]"
 
