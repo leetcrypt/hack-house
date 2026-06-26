@@ -328,6 +328,12 @@ class AgentBridge(Client):
         # probe. (cwd, shell) once learned; None until the first native run. Dies
         # with the agent — no disk, consistent with the rest of the agent's memory.
         self._sbx_known: tuple[str, str] | None = None
+        # Calibration of the char-based token estimate against Ollama's REAL
+        # prompt_eval_count (Phase 4). real ≈ ratio × estimate; the native loop
+        # budgets pruning against `native_token_budget / ratio` so it tracks the
+        # true context window instead of the systematic bias of `len//4`. EMA-
+        # smoothed and clamped; 1.0 until the first turn yields a real count.
+        self._tok_ratio: float = 1.0
 
     @staticmethod
     def _est_tokens(text: str) -> int:
@@ -1153,8 +1159,11 @@ class AgentBridge(Client):
             # Keep the running context under budget: drop the oldest middle turns
             # (task + freshest turns pinned) so the goal never falls out of a weak
             # model's effective window mid-task. Logged, never silent.
-            messages, pruned_n, digested_n = self._prune_native_messages(
-                messages, self.native_token_budget)
+            # Budget against TRUE tokens (Phase 4): real ≈ ratio × estimate, so prune
+            # to keep the char-estimate under `budget / ratio`. Clamp the divisor so a
+            # noisy calibration sample can neither collapse nor balloon the window.
+            eff_budget = int(self.native_token_budget / min(max(self._tok_ratio, 0.5), 3.0))
+            messages, pruned_n, digested_n = self._prune_native_messages(messages, eff_budget)
             if pruned_n or digested_n:
                 detail = []
                 if digested_n:
@@ -1177,7 +1186,7 @@ class AgentBridge(Client):
                     turn_system += "\n\n" + ws_block
             await self._send_typing(ws, True)
             try:
-                text, calls = await asyncio.to_thread(cwt, turn_system, messages, NATIVE_TOOLS)
+                text, calls, usage = await asyncio.to_thread(cwt, turn_system, messages, NATIVE_TOOLS)
             except ToolsUnsupported:
                 await self._send_typing(ws, False)
                 await self._send_chat(ws, f"{asker}: (model has no tool support — using simple harness)")
@@ -1188,6 +1197,21 @@ class AgentBridge(Client):
                 await self._send_chat(ws, f"{asker}: [ai error: {e}]")
                 return
             await self._send_typing(ws, False)
+
+            # Calibrate the char estimator against Ollama's real prompt_eval_count
+            # (the prompt it just processed = system + tools + messages). EMA-smoothed
+            # and clamped so pruning tracks the true window without chasing jitter.
+            # Providers that omit counts leave the ratio — and thus behaviour —
+            # unchanged, so this is a free correctness win where available.
+            pt = usage.get("prompt_eval_count") if usage else None
+            if pt:
+                est_prompt = (self._est_tokens(turn_system)
+                              + self._est_tokens(json.dumps(NATIVE_TOOLS))
+                              + sum(self._est_tokens(str(m.get("content") or ""))
+                                    for m in messages))
+                if est_prompt > 0:
+                    sample = pt / est_prompt
+                    self._tok_ratio = min(max(0.7 * self._tok_ratio + 0.3 * sample, 0.5), 3.0)
 
             if not calls and not self._is_done_signal(text):
                 # The weak models' dominant failure is narrating the next command in a

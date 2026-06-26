@@ -128,13 +128,16 @@ class OllamaProvider:
 
     def complete_with_tools(
         self, system: str, messages: list[dict], tools: list[dict]
-    ) -> tuple[str, list[dict]]:
+    ) -> tuple[str, list[dict], dict]:
         """One non-streaming ``/api/chat`` turn carrying a ``tools`` schema. Used by
         the native harness loop. ``messages`` are raw Ollama wire dicts (so the
         caller can round-trip assistant ``tool_calls`` and ``tool`` results across
-        turns); ``system`` is prepended. Returns ``(text, tool_calls)`` where each
-        call is ``{"name": str, "arguments": dict}``. Raises ``ToolsUnsupported`` if
-        the model can't do function calling so the bridge can fall back to simple."""
+        turns); ``system`` is prepended. Returns ``(text, tool_calls, usage)`` where
+        each call is ``{"name": str, "arguments": dict}`` and ``usage`` carries
+        Ollama's real token counts (``prompt_eval_count`` / ``eval_count``) so the
+        caller can budget context against TRUE tokens instead of a char estimate
+        (``{}`` if the server omits them). Raises ``ToolsUnsupported`` if the model
+        can't do function calling so the bridge can fall back to simple."""
         # Greedy decode (temperature 0) for the tool loop: at Ollama's default 0.8 a
         # weak model "creatively" narrates the next step in prose or fabricates file
         # content instead of emitting a deterministic structured call. The nudge loop
@@ -161,7 +164,12 @@ class OllamaProvider:
                 raise ToolsUnsupported(detail or f"{self.model} does not support tools")
             self._raise_for_status(r)
         self._tools_ok = True
-        msg = r.json().get("message", {}) or {}
+        data = r.json()
+        msg = data.get("message", {}) or {}
+        # Real token counts straight from Ollama — exact, free (already in the
+        # response), and used to calibrate the native loop's char-based estimate.
+        usage = {k: data[k] for k in ("prompt_eval_count", "eval_count")
+                 if isinstance(data.get(k), int)}
         text = (msg.get("content") or "").strip()
         calls: list[dict] = []
         for tc in msg.get("tool_calls") or []:
@@ -188,7 +196,7 @@ class OllamaProvider:
             recovered_text, recovered = self._extract_text_tool_calls(text, valid)
             if recovered:
                 text, calls = recovered_text, recovered
-        return text, calls
+        return text, calls, usage
 
     # Wrapper tags a weak model wraps a leaked call (or its prose) in; stripped
     # from the chat-facing text once the JSON inside is recovered.
