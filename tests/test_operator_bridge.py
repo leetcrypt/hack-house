@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from cryptography.fernet import Fernet
 
 from cmd_chat.operator.bridge import OperatorBridge
+from cmd_chat.operator import sandbox as sbx
 
 
 def _bridge(name="oracle", trigger=None):
@@ -194,4 +195,80 @@ def test_dispatch_status_and_roster():
         assert ping["pong"] is True
         unknown = await b._dispatch({"op": "frobnicate"})
         assert unknown["ok"] is False
+    asyncio.run(go())
+
+
+# ── sandbox: keystroke encoding (the stop-vocabulary) ─────────────────────
+def test_encode_keys_named_and_literal():
+    assert sbx.encode_keys(["ls -la", "enter"]) == b"ls -la\r"
+    assert sbx.encode_keys("ctrl-c") == b"\x03"          # SIGINT
+    assert sbx.encode_keys("ctrl-d") == b"\x04"          # EOF
+    assert sbx.encode_keys(["CTRL-C"]) == b"\x03"        # case-insensitive
+    assert sbx.encode_keys("up") == b"\x1b[A"            # ANSI arrow
+    # 'text:' forces verbatim so a literal word like "enter" can be typed
+    assert sbx.encode_keys(["text:enter"]) == b"enter"
+    assert sbx.encode_keys("hex:1b5b41") == b"\x1b[A"
+    # a bare unknown string is typed as-is
+    assert sbx.encode_keys("q") == b"q"
+
+
+def test_exec_prefix_shapes():
+    assert sbx.exec_prefix("podman", "box") == ["podman", "exec", "-i", "box"]
+    assert sbx.exec_prefix("docker", "box") == ["docker", "exec", "-i", "box"]
+    assert sbx.exec_prefix("multipass", "vm") == ["multipass", "exec", "vm", "--"]
+    assert sbx.exec_prefix("local", "x") == []
+    assert sbx.exec_prefix("podman", "") is None        # unaddressable
+    assert sbx.exec_prefix("qemu", "x") is None
+
+
+# ── sandbox: target gating ────────────────────────────────────────────────
+def test_target_prefers_own_then_granted_room():
+    async def go():
+        b = _bridge("oracle")
+        # nothing yet → a clear error, no target
+        eng, name, err = b._target()
+        assert eng is None and err and "no sandbox" in err
+        # room has a sandbox but we're not granted → refused
+        b.sbx_engine, b.sbx_name = "podman", "hack-house"
+        eng, name, err = b._target()
+        assert eng is None and "granted" in err
+        # granted → drive the room's container directly (co-located exec)
+        b.granted = True
+        eng, name, err = b._target()
+        assert (eng, name, err) == ("podman", "hack-house", None)
+        # our own container always wins
+        b._own_engine, b._own_name = "podman", "hh-op-oracle"
+        eng, name, err = b._target()
+        assert (eng, name, err) == ("podman", "hh-op-oracle", None)
+    asyncio.run(go())
+
+
+def test_keys_requires_connection_and_grant():
+    async def go():
+        b = _bridge("oracle")
+        # not connected
+        r = await b._op_keys({"keys": ["enter"]})
+        assert r["ok"] is False and "not connected" in r["error"]
+        # connected but not granted → inert
+        b._ws = FakeWS()
+        r = await b._op_keys({"keys": ["enter"]})
+        assert r["ok"] is False and "granted" in r["error"]
+        # granted → injects an encrypted _sbx:input frame
+        b.granted = True
+        r = await b._op_keys({"keys": ["ls", "enter"]})
+        assert r["ok"] is True and r["bytes"] == 3
+        frame = json.loads(b.room_fernet.decrypt(b._ws.sent[0].encode()).decode())
+        assert frame["_sbx"] == "input"
+        import base64 as _b64
+        assert _b64.b64decode(frame["b64"]) == b"ls\r"
+    asyncio.run(go())
+
+
+def test_exec_requires_target():
+    async def go():
+        b = _bridge("oracle")
+        r = await b._op_exec({"cmd": "echo hi"})
+        assert r["ok"] is False and "no sandbox" in r["error"]
+        r = await b._op_exec({"cmd": ""})
+        assert r["ok"] is False and "empty" in r["error"]
     asyncio.run(go())

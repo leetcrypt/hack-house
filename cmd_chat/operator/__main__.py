@@ -58,6 +58,36 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("text", nargs="+")
     s.add_argument("--session", default=None)
 
+    # ── sandbox drive ───────────────────────────────────────────────────
+    sb = sub.add_parser("sbx", help="manage the operator's own container")
+    sb.add_argument("action", choices=["launch", "status", "down"], nargs="?",
+                    default="status")
+    sb.add_argument("--engine", default=None, help="podman|docker (default: auto)")
+    sb.add_argument("--image", default=None, help="container image (default per engine)")
+    sb.add_argument("--name", default=None, help="container name (default: hh-op-<user>)")
+    sb.add_argument("--session", default=None)
+
+    ex = sub.add_parser("exec", help="run a shell command in the sandbox")
+    ex.add_argument("cmd", nargs="+")
+    ex.add_argument("--session", default=None)
+
+    wr = sub.add_parser("write", help="write a file in the sandbox (content from stdin or --text)")
+    wr.add_argument("path")
+    wr.add_argument("--text", default=None, help="inline content (else read stdin)")
+    wr.add_argument("--session", default=None)
+
+    gt = sub.add_parser("get", help="read a file out of the sandbox")
+    gt.add_argument("path")
+    gt.add_argument("--out", default=None, help="write to this local path (else stdout)")
+    gt.add_argument("--session", default=None)
+
+    ky = sub.add_parser("keys", help="inject keystrokes into the room's shared PTY")
+    ky.add_argument("keys", nargs="*",
+                    help="tokens: literal text, named keys (enter, ctrl-c, esc, "
+                         "up…), text:<verbatim>, hex:<bytes>")
+    ky.add_argument("--help-keys", action="store_true", help="print the key vocabulary")
+    ky.add_argument("--session", default=None)
+
     for v in ("roster", "status", "down"):
         sub.add_parser(v).add_argument("--session", default=None)
     return ap
@@ -191,6 +221,67 @@ def _run_say(args) -> int:
     return 0
 
 
+def _run_sbx(args) -> int:
+    resp = _client_request(args, {"op": "sbx", "action": args.action,
+                                  "engine": args.engine, "image": args.image,
+                                  "name": args.name})
+    print(json.dumps(resp))
+    return 0 if resp.get("ok") else 1
+
+
+def _run_exec(args) -> int:
+    cmd = " ".join(args.cmd)
+    resp = _client_request(args, {"op": "exec", "cmd": cmd})
+    out = resp.get("output", "")
+    if out:
+        sys.stdout.write(out if out.endswith("\n") else out + "\n")
+    if not resp.get("ok"):
+        if "error" in resp:
+            print(resp["error"], file=sys.stderr)
+        return resp.get("rc", 1) or 1
+    return 0
+
+
+def _run_write(args) -> int:
+    text = args.text if args.text is not None else sys.stdin.read()
+    resp = _client_request(args, {"op": "write", "path": args.path, "content": text})
+    if not resp.get("ok"):
+        print(resp.get("error", "write failed"), file=sys.stderr)
+        return 1
+    print(f"wrote {resp.get('path')} ({resp.get('bytes')} bytes)", file=sys.stderr)
+    return 0
+
+
+def _run_get(args) -> int:
+    import base64
+    resp = _client_request(args, {"op": "get", "path": args.path})
+    if not resp.get("ok"):
+        print(resp.get("error", "get failed"), file=sys.stderr)
+        return 1
+    raw = base64.b64decode(resp.get("b64", ""))
+    if args.out:
+        Path(args.out).write_bytes(raw)
+        print(f"wrote {args.out} ({len(raw)} bytes)", file=sys.stderr)
+    else:
+        sys.stdout.buffer.write(raw)
+    return 0
+
+
+def _run_keys(args) -> int:
+    from . import sandbox as sbx
+    if args.help_keys:
+        print(sbx.KEYS_HELP)
+        return 0
+    if not args.keys:
+        print("no keys given (try --help-keys)", file=sys.stderr)
+        return 2
+    resp = _client_request(args, {"op": "keys", "keys": args.keys})
+    if not resp.get("ok"):
+        print(resp.get("error", "keys failed"), file=sys.stderr)
+        return 1
+    return 0
+
+
 def _run_simple(args, op: str) -> int:
     resp = _client_request(args, {"op": op})
     print(json.dumps(resp))
@@ -208,6 +299,16 @@ def main(argv: list[str] | None = None) -> int:
         return _run_read(args)
     if verb == "say":
         return _run_say(args)
+    if verb == "sbx":
+        return _run_sbx(args)
+    if verb == "exec":
+        return _run_exec(args)
+    if verb == "write":
+        return _run_write(args)
+    if verb == "get":
+        return _run_get(args)
+    if verb == "keys":
+        return _run_keys(args)
     if verb in ("roster", "status", "down"):
         return _run_simple(args, verb)
     return 2

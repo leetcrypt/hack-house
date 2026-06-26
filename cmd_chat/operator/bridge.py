@@ -25,6 +25,7 @@ import time
 import websockets
 
 from ..client.client import Client
+from . import sandbox as sbx
 from .session import Session
 
 
@@ -55,6 +56,12 @@ class OperatorBridge(Client):
         self.can_sudo = False
         self.sbx_engine: str | None = None
         self.sbx_name: str = ""
+
+        # Co-located sandbox the operator launched itself (Phase 2). When set we
+        # exec straight into it (out-of-band); independent of the room's broker
+        # sandbox, which we can also drive when co-located + granted.
+        self._own_engine: str | None = None
+        self._own_name: str = ""
 
         # Live websocket (None while reconnecting); set in _connect_and_serve.
         self._ws = None
@@ -285,6 +292,16 @@ class OperatorBridge(Client):
             return await self._op_read(req)
         if op == "say":
             return await self._op_say(req)
+        if op == "sbx":
+            return await self._op_sbx(req)
+        if op == "exec":
+            return await self._op_exec(req)
+        if op == "write":
+            return await self._op_write(req)
+        if op == "get":
+            return await self._op_get(req)
+        if op == "keys":
+            return await self._op_keys(req)
         if op == "down":
             asyncio.get_running_loop().call_soon(self._begin_shutdown)
             return {"ok": True, "stopping": True}
@@ -316,6 +333,141 @@ class OperatorBridge(Client):
             return {"ok": False, "error": f"send failed: {type(e).__name__}: {e}"}
         await self._emit("sent", **{"from": self.name}, text=text, addressed=False)
         return {"ok": True}
+
+    # ── sandbox drive (Phase 2) ──────────────────────────────────────────
+    def _target(self) -> tuple[str | None, str, str | None]:
+        """Pick the sandbox to exec into and report why.
+
+        Returns ``(engine, name, error)``. Prefer the operator's *own* container
+        (always ours to drive). Else, if the room granted us drive AND its broker
+        sandbox is a kind we can exec directly (we're co-located on this host),
+        target that. ``local`` is refused here — execing on the host is opt-in
+        only via our own `local` launch, never inherited from the room."""
+        if self._own_engine:
+            return self._own_engine, self._own_name, None
+        if self.granted and self.sbx_engine in ("docker", "podman", "multipass") \
+                and self.sbx_name:
+            return self.sbx_engine, self.sbx_name, None
+        if self.sbx_engine and not self.granted:
+            return None, "", "not a granted driver (owner must `/grant`)"
+        return None, "", "no sandbox — `sbx launch` one or join a room with one"
+
+    async def _op_sbx(self, req: dict) -> dict:
+        """Manage the operator's own co-located container: launch / status / down."""
+        action = req.get("action", "status")
+        if action == "launch":
+            engine = req.get("engine") or sbx.pick_engine()
+            if not engine:
+                return {"ok": False, "error": "no container engine (need podman or docker)"}
+            image = req.get("image") or sbx.default_image(engine)
+            name = req.get("name") or f"hh-op-{self.name}"
+            ok, msg = await sbx.launch_container(engine, name, image)
+            if ok:
+                self._own_engine, self._own_name = engine, name
+                await self._emit("sandbox", state="own-ready", engine=engine,
+                                 name=name, image=image)
+            return {"ok": ok, "engine": engine, "name": name, "image": image,
+                    "message": msg}
+        if action == "down":
+            if not self._own_engine:
+                return {"ok": False, "error": "no own sandbox to tear down"}
+            ok, msg = await sbx.teardown_container(self._own_engine, self._own_name)
+            if ok:
+                await self._emit("sandbox", state="own-down",
+                                 engine=self._own_engine, name=self._own_name)
+                self._own_engine, self._own_name = None, ""
+            return {"ok": ok, "message": msg}
+        # status
+        engine, name, err = self._target()
+        return {"ok": True, "target_engine": engine, "target_name": name,
+                "reason": err, "own_engine": self._own_engine,
+                "own_name": self._own_name, "room_engine": self.sbx_engine,
+                "room_name": self.sbx_name, "granted": self.granted}
+
+    async def _op_exec(self, req: dict) -> dict:
+        """Run a shell command in the target sandbox, capture combined output +
+        exit code. The command runs under `sh -c` (a real shell, intended) inside
+        the container — the container is the blast radius."""
+        cmd = str(req.get("cmd", ""))
+        if not cmd:
+            return {"ok": False, "error": "empty cmd"}
+        engine, name, err = self._target()
+        if err:
+            return {"ok": False, "error": err}
+        prefix = sbx.exec_prefix(engine, name)
+        if prefix is None:
+            return {"ok": False, "error": f"can't address {engine}/{name}"}
+        out, rc = await sbx.exec_capture(prefix + ["sh", "-c", cmd])
+        await self._emit("exec", engine=engine, name=name, cmd=cmd, rc=rc)
+        return {"ok": rc == 0, "rc": rc, "output": out, "engine": engine, "name": name}
+
+    async def _op_write(self, req: dict) -> dict:
+        """Write a file in the target sandbox. Content arrives on stdin (never
+        shell-parsed); the path is a positional arg. `mkdir -p` the parent first
+        so an absolute path into a new dir works. Mirrors the native harness."""
+        path = str(req.get("path", "")).strip()
+        if not path:
+            return {"ok": False, "error": "missing path"}
+        content = req.get("content", "")
+        data = content.encode() if isinstance(content, str) else bytes(content)
+        engine, name, err = self._target()
+        if err:
+            return {"ok": False, "error": err}
+        prefix = sbx.exec_prefix(engine, name)
+        if prefix is None:
+            return {"ok": False, "error": f"can't address {engine}/{name}"}
+        out, rc = await sbx.exec_capture(
+            prefix + ["sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"',
+                      "hh-write", path],
+            stdin=data)
+        await self._emit("write", engine=engine, name=name, path=path, rc=rc)
+        return {"ok": rc == 0, "rc": rc, "path": path, "bytes": len(data),
+                "output": out if (out or "").strip() else ""}
+
+    async def _op_get(self, req: dict) -> dict:
+        """Read a file out of the target sandbox. Returns base64 (binary-safe);
+        the content is plumbing, so it's uncapped (unlike exec output)."""
+        path = str(req.get("path", "")).strip()
+        if not path:
+            return {"ok": False, "error": "missing path"}
+        engine, name, err = self._target()
+        if err:
+            return {"ok": False, "error": err}
+        prefix = sbx.exec_prefix(engine, name)
+        if prefix is None:
+            return {"ok": False, "error": f"can't address {engine}/{name}"}
+        raw, rc = await sbx.exec_capture(prefix + ["cat", "--", path], text=False)
+        if rc != 0:
+            return {"ok": False, "rc": rc,
+                    "error": f"read failed (exit={rc}): {raw.decode(errors='replace')[:200]}"}
+        return {"ok": True, "rc": 0, "path": path,
+                "b64": base64.b64encode(raw).decode(), "bytes": len(raw)}
+
+    async def _op_keys(self, req: dict) -> dict:
+        """Relay raw keystrokes into the room's *shared* PTY — the same
+        `_sbx:input` frame a human driver's terminal emits. The broker writes our
+        bytes to the shared shell iff we're a granted driver, so this is how the
+        operator drives a broker-owned sandbox (and tests interactive programs:
+        ctrl-c to stop, q to quit a pager, esc to leave vim). See
+        `sandbox.KEYS_HELP` for the byte vocabulary."""
+        if self._ws is None:
+            return {"ok": False, "error": "not connected to room"}
+        if not self.granted:
+            return {"ok": False, "error": "not a granted driver — keystrokes inert until `/grant`"}
+        spec = req.get("keys")
+        if spec in (None, "", []):
+            return {"ok": False, "error": "no keys", "help": sbx.KEYS_HELP}
+        try:
+            data = sbx.encode_keys(spec)
+        except ValueError as e:
+            return {"ok": False, "error": f"bad key spec: {e}"}
+        frame = json.dumps({"_sbx": "input", "b64": base64.b64encode(data).decode()})
+        try:
+            await self._ws.send(self.room_fernet.encrypt(frame.encode()).decode())
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"send failed: {type(e).__name__}: {e}"}
+        await self._emit("keys", bytes=len(data))
+        return {"ok": True, "bytes": len(data)}
 
     def _begin_shutdown(self) -> None:
         self._stop.set()
