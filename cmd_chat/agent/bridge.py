@@ -1000,40 +1000,86 @@ class AgentBridge(Client):
                 f"AND verified, reply with one line starting 'DONE:' and the result. "
                 f"Otherwise call the next tool now — act, do not describe.")
 
+    @staticmethod
+    def _digest_tool_output(text: str) -> str:
+        """Compress a tool result to ONE line for context budgeting: the exit marker
+        (if present) plus the most salient line — the first error line when the
+        command failed, else the first non-empty line. This preserves the
+        action→result causal trace at a fraction of the tokens so that evicting a
+        whole turn (which severs that chain) becomes a last resort. Returns the
+        original text unchanged when it is already short enough to not be worth it."""
+        t = (text or "").strip()
+        if len(t) <= 80:
+            return text
+        lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+        if not lines:
+            return text
+        exit_part, body = "", lines
+        m = re.match(r"exit=(-?\d+)", lines[0])
+        if m:
+            exit_part, body = f"exit={m.group(1)} · ", lines[1:]
+        salient = next((ln for ln in body if ERROR_LINE_RE.search(ln)),
+                       body[0] if body else "")
+        digest = (exit_part + salient).strip() or t[:80]
+        return "[digest] " + digest[:160]
+
     @classmethod
     def _prune_native_messages(cls, messages: list[dict], budget: int,
                                keep_recent: int = NATIVE_KEEP_RECENT
-                               ) -> tuple[list[dict], int]:
-        """Deterministically drop the OLDEST removable turn messages when the
-        native loop's running context exceeds `budget` (approx tokens). Pure
-        function — returns a (possibly new) list + the count dropped.
+                               ) -> tuple[list[dict], int, int]:
+        """Two-stage, deterministic context budgeting for the native loop's growing
+        message list. Pure function — returns (possibly new list, dropped, digested).
 
-        Clean-room counterpart to Exoshell's priority pruning. Never drops:
-        index 0 (the tiny seeded-context head), the pinned TASK message (its
-        content starts with TASK_MARKER), or the last `keep_recent` messages (so
-        the model still sees what just happened). Everything else is a candidate,
-        evicted oldest-first until the estimate fits — so the goal and the
-        freshest state always survive a long, chatty repair sequence. A no-op
-        (returns the same list, 0) whenever already under budget."""
+        Never touches: index 0 (the tiny seeded-context head), the pinned TASK
+        message (content starts with TASK_MARKER), or the last `keep_recent` messages
+        (so the freshest state — including the most recent tool output, verbatim —
+        always survives a long, chatty repair sequence).
+
+        Stage 1 (digest): compress OLD `tool`-role outputs to a one-line summary.
+        Tool outputs are the biggest context hog, and digesting keeps the
+        action→result chain intact, so this runs before any eviction. Stage 2
+        (evict): if still over budget, drop the oldest removable messages — the
+        original behaviour, now a fallback. A no-op (same list, 0, 0) when already
+        under budget. Clean-room counterpart to Goose's tool-output condensation
+        track + Exoshell's priority pruning."""
         est = lambda m: cls._est_tokens(str(m.get("content") or ""))  # noqa: E731
         running = sum(est(m) for m in messages)
         if running <= budget:
-            return messages, 0
+            return messages, 0, 0
         n = len(messages)
         keep = set(range(max(0, n - keep_recent), n)) | {0}
         keep |= {i for i, m in enumerate(messages)
                  if str(m.get("content") or "").startswith(TASK_MARKER)}
+
+        # Stage 1 — digest old tool outputs (oldest-first) until we fit.
+        out = list(messages)
+        digested = 0
+        for i in range(n):
+            if running <= budget:
+                break
+            if i in keep or out[i].get("role") != "tool":
+                continue
+            full = str(out[i].get("content") or "")
+            short = cls._digest_tool_output(full)
+            if len(short) < len(full):
+                out[i] = {**out[i], "content": short}
+                running -= (cls._est_tokens(full) - cls._est_tokens(short))
+                digested += 1
+
+        # Stage 2 — still over budget: evict oldest removable messages (fallback).
         drop: set[int] = set()
-        for i in range(n):                      # oldest-first
+        for i in range(n):
             if running <= budget:
                 break
             if i in keep:
                 continue
             drop.add(i)
-            running -= est(messages[i])
-        if not drop:
-            return messages, 0
-        return [m for i, m in enumerate(messages) if i not in drop], len(drop)
+            running -= est(out[i])
+        if drop:
+            out = [m for i, m in enumerate(out) if i not in drop]
+        if not drop and not digested:
+            return messages, 0, 0
+        return out, len(drop), digested
 
     async def _run_native(self, ws, task: str, asker: str) -> None:
         """Tier 1 (granted) bounded host-side tool-calling loop. The model runs on
@@ -1107,11 +1153,17 @@ class AgentBridge(Client):
             # Keep the running context under budget: drop the oldest middle turns
             # (task + freshest turns pinned) so the goal never falls out of a weak
             # model's effective window mid-task. Logged, never silent.
-            messages, pruned_n = self._prune_native_messages(messages, self.native_token_budget)
-            if pruned_n:
-                self.info(f"native ctx > ~{self.native_token_budget} tok — pruned "
-                          f"{pruned_n} old turn msg(s)")
-                await self._mirror_to_pty(ws, f"▸ (pruned {pruned_n} old turn msg(s) to fit context)")
+            messages, pruned_n, digested_n = self._prune_native_messages(
+                messages, self.native_token_budget)
+            if pruned_n or digested_n:
+                detail = []
+                if digested_n:
+                    detail.append(f"digested {digested_n} old tool output(s)")
+                if pruned_n:
+                    detail.append(f"pruned {pruned_n} old turn msg(s)")
+                what = " + ".join(detail)
+                self.info(f"native ctx > ~{self.native_token_budget} tok — {what}")
+                await self._mirror_to_pty(ws, f"▸ ({what} to fit context)")
             # Recovery posture: once a command has failed (or we've started nudging),
             # re-frame the whole turn in the SYSTEM prompt — a weak model weights
             # that highest — to diagnose instead of flailing.
