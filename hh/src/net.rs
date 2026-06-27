@@ -1,7 +1,7 @@
 //! SRP authentication (blocking, one-shot) + async websocket transport and the
 //! reader task that decrypts/parses server frames into `Net` events.
 
-use crate::app::{ChatLine, Net, User};
+use crate::app::{CatalogItem, ChatLine, Net, User};
 use crate::crypto;
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -238,7 +238,42 @@ fn parse_sbx(text: &str, sender: &str) -> Option<Net> {
             by: sender.to_string(),
             vm: v["vm"].as_str().unwrap_or("a VM").to_string(),
         }),
+        // VM-trading (Phase B). `by` is the server-authenticated sender; `to`
+        // names the intended recipient (the handler acts only if it's itself).
+        "catreq" => Some(Net::SbxCatReq {
+            by: sender.to_string(),
+            to: v["to"].as_str().unwrap_or("").to_string(),
+        }),
+        "catalog" => Some(Net::SbxCatalog {
+            by: sender.to_string(),
+            to: v["to"].as_str().unwrap_or("").to_string(),
+            items: v["items"]
+                .as_array()
+                .map(|a| a.iter().map(parse_catalog_item).collect())
+                .unwrap_or_default(),
+        }),
+        "pullreq" => Some(Net::SbxPullReq {
+            by: sender.to_string(),
+            to: v["to"].as_str().unwrap_or("").to_string(),
+            label: v["label"].as_str()?.to_string(),
+        }),
         _ => None,
+    }
+}
+
+/// Parse one `_sbx:catalog` item object into a `CatalogItem`. Tolerant: missing
+/// fields default to empty so a malformed row degrades rather than dropping the
+/// whole catalog.
+fn parse_catalog_item(v: &Value) -> CatalogItem {
+    CatalogItem {
+        label: v["label"].as_str().unwrap_or("").to_string(),
+        purpose: v["purpose"].as_str().unwrap_or("").to_string(),
+        status: v["status"].as_str().unwrap_or("").to_string(),
+        tags: v["tags"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        size_bytes: v["size"].as_u64(),
     }
 }
 
@@ -407,5 +442,50 @@ mod tests {
             let v = json!([{ "user_id": id, "username": name }, "garbage", 42, null]);
             let _ = parse_users(&v);
         }
+    }
+
+    // ── Phase B VM-trading frames ──────────────────────────────────────────
+    #[test]
+    fn parse_sbx_catreq_uses_authenticated_sender() {
+        // The frame can claim any `to`, but `by` is the server-stamped sender.
+        let frame = json!({"_sbx":"catreq","to":"bob"}).to_string();
+        let Some(Net::SbxCatReq { by, to }) = parse_sbx(&frame, "alice") else {
+            panic!("expected SbxCatReq");
+        };
+        assert_eq!(by, "alice");
+        assert_eq!(to, "bob");
+    }
+
+    #[test]
+    fn parse_sbx_catalog_parses_items() {
+        let frame = json!({
+            "_sbx":"catalog","to":"alice",
+            "items":[
+                {"label":"kali-recon","purpose":"recon box","status":"in_progress",
+                 "tags":["recon","kali"],"size": 1024},
+                {"label":"bare"} // missing fields must default, not drop the row
+            ]
+        }).to_string();
+        let Some(Net::SbxCatalog { by, to, items }) = parse_sbx(&frame, "bob") else {
+            panic!("expected SbxCatalog");
+        };
+        assert_eq!(by, "bob");
+        assert_eq!(to, "alice");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "kali-recon");
+        assert_eq!(items[0].tags, vec!["recon".to_string(), "kali".to_string()]);
+        assert_eq!(items[0].size_bytes, Some(1024));
+        assert_eq!(items[1].label, "bare");
+        assert!(items[1].purpose.is_empty());
+        assert_eq!(items[1].size_bytes, None);
+    }
+
+    #[test]
+    fn parse_sbx_pullreq_requires_label() {
+        let ok = json!({"_sbx":"pullreq","to":"bob","label":"kali-recon"}).to_string();
+        assert!(matches!(parse_sbx(&ok, "alice"), Some(Net::SbxPullReq { .. })));
+        // No label → reject the frame rather than pull a nameless VM.
+        let bad = json!({"_sbx":"pullreq","to":"bob"}).to_string();
+        assert!(parse_sbx(&bad, "alice").is_none());
     }
 }

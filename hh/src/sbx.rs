@@ -934,6 +934,99 @@ pub fn save_state(backend: Backend, name: &str, label: &str, local: bool) -> Res
     }
 }
 
+/// Export an already-committed `hh-snap:<label>` image to a portable `.tar` under
+/// `hh-snapshots/` — the standalone file a peer can receive over `/send`. This is
+/// the `--local` half of `save_state` made reusable for `/sbx publish`, so an
+/// image saved *without* `--local` can still be made tradeable later. Idempotent:
+/// returns the existing file if it's already there. Blocking.
+pub fn export_image(backend: Backend, label: &str) -> Result<std::path::PathBuf> {
+    let engine = match backend {
+        Backend::Docker | Backend::Podman => engine_bin(backend),
+        _ => anyhow::bail!("only docker/podman snapshots export to a portable .tar"),
+    };
+    let path = snap_dir()?.join(format!("hh-snap-{label}.tar"));
+    if path.exists() {
+        return Ok(path);
+    }
+    let tag = format!("{SNAP_REPO}:{label}");
+    let out = Command::new(engine)
+        .args(["save", &tag, "-o"])
+        .arg(&path)
+        .output()
+        .with_context(|| format!("{engine} save"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "exporting {tag} failed: {}",
+            err.lines().last().unwrap_or("").trim()
+        );
+    }
+    Ok(path)
+}
+
+/// Pull the `(tag, label)` of a loaded snapshot out of `<engine> load` stdout.
+/// docker prints `Loaded image: hh-snap:<label>`; podman prints
+/// `Loaded image: localhost/hh-snap:<label>` (registry-qualified). We locate the
+/// `hh-snap:` marker anywhere in a line and normalise to the bare `hh-snap:<label>`
+/// tag — podman resolves the unqualified form back to `localhost/…` on use, and
+/// docker stores it bare, so the bare tag is the portable handle. Pure (no engine
+/// call) so the dual-engine output shapes stay under test.
+fn parse_loaded_tag(stdout: &str) -> Option<(String, String)> {
+    let marker = format!("{SNAP_REPO}:");
+    let tag = stdout
+        .lines()
+        .find_map(|l| l.find(&marker).map(|i| l[i..].trim().to_string()))?;
+    let label = tag.split_once(':').map(|(_, l)| l.to_string()).unwrap_or_default();
+    Some((tag, label))
+}
+
+/// Load a received `hh-snap-<label>.tar` image archive into the local engine —
+/// the receive-side inverse of `export_image`. Tries docker first, then podman
+/// (a docker `save` archive loads into either). Returns `(engine, image_tag,
+/// label)` parsed from the engine's `Loaded image:` line. Blocking.
+pub fn import_image_archive(path: &std::path::Path) -> Result<(String, String, String)> {
+    let mut last_err = String::new();
+    for engine in ["docker", "podman"] {
+        let out = match Command::new(engine).args(["load", "-i"]).arg(path).output() {
+            Ok(o) => o,
+            Err(_) => continue, // engine not installed — try the next
+        };
+        if !out.status.success() {
+            last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (tag, label) = parse_loaded_tag(&stdout)
+            .with_context(|| format!("{engine} load: no {SNAP_REPO}:… tag in output"))?;
+        return Ok((engine.to_string(), tag, label));
+    }
+    anyhow::bail!(
+        "couldn't load image archive (no docker/podman, or load failed: {})",
+        if last_err.is_empty() { "engine missing" } else { &last_err }
+    )
+}
+
+/// Run a throwaway container from `image` to read its `.hh-agent` manifest, so a
+/// just-imported snapshot can be registered with its purpose/status/todo without
+/// booting it into the room. `<engine> run --rm <image> cat …`; None if the image
+/// carries no manifest. Blocking.
+pub fn read_image_manifest(engine: &str, image: &str) -> Option<String> {
+    let out = Command::new(engine)
+        .args(["run", "--rm", image, "cat", "/root/.hh-agent/manifest.yaml"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// Restore a Multipass instance to a saved snapshot — the load-side inverse of
 /// the multipass branch of `save_state`. `multipass restore <name>.<label>`
 /// requires the instance to exist and be **stopped**, which is exactly the
@@ -1504,6 +1597,22 @@ impl Sandbox {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn parse_loaded_tag_handles_docker_and_podman() {
+        // docker: bare tag.
+        assert_eq!(
+            parse_loaded_tag("Loaded image: hh-snap:kali-recon\n"),
+            Some(("hh-snap:kali-recon".to_string(), "kali-recon".to_string()))
+        );
+        // podman: registry-qualified — must strip `localhost/` to the bare tag.
+        assert_eq!(
+            parse_loaded_tag("Loaded image: localhost/hh-snap:kali-recon\n"),
+            Some(("hh-snap:kali-recon".to_string(), "kali-recon".to_string()))
+        );
+        // no snapshot tag in the output → None (caller surfaces a clear error).
+        assert_eq!(parse_loaded_tag("Loaded image: alpine:latest\n"), None);
+    }
 
     /// Proves the PTY pipeline: spawn a real shell, send a command, read its
     /// output back off the channel. (Local backend — no container needed.)

@@ -9,6 +9,7 @@ mod crypto;
 mod ft;
 mod layout;
 mod net;
+mod registry;
 mod sbx;
 mod theme;
 mod ui;

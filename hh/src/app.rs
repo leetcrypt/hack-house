@@ -3,6 +3,7 @@
 use crate::ft;
 use crate::layout::{Dir, Layout, Resize};
 use crate::net::{self, Session};
+use crate::registry;
 use crate::sbx;
 use crate::theme::Theme;
 use crate::ui;
@@ -144,7 +145,39 @@ pub enum Net {
         by: String,
         vm: String,
     },
+    /// A peer asked for our shareable-VM catalog (`/sbx catalog @me`). `by` is the
+    /// server-authenticated requester; `to` is whom the request named (we act only
+    /// if it's us). We reply with a `_sbx:catalog` frame of our published VMs.
+    SbxCatReq {
+        by: String,
+        to: String,
+    },
+    /// A peer answered our `/sbx catalog @them` with their published-VM slice.
+    SbxCatalog {
+        by: String,
+        to: String,
+        items: Vec<CatalogItem>,
+    },
+    /// A peer asked us to hand over a published VM (`/sbx pull @me <label>`). If we
+    /// published `label`, we `/send` them its portable artifact.
+    SbxPullReq {
+        by: String,
+        to: String,
+        label: String,
+    },
     Closed,
+}
+
+/// One row of a peer's shareable-VM catalog, as it rides the `_sbx:catalog` frame.
+/// A trimmed view of `registry::Entry` — enough for the requester to decide what
+/// to `/sbx pull`, without leaking host-local paths.
+#[derive(Clone, Debug, Default)]
+pub struct CatalogItem {
+    pub label: String,
+    pub purpose: String,
+    pub status: String,
+    pub tags: Vec<String>,
+    pub size_bytes: Option<u64>,
 }
 
 pub struct SbxView {
@@ -565,6 +598,34 @@ impl App {
                     self.sys(format!(
                         "† {by} opened ‘{vm}’ locally — `/sbx gui {vm}` to open your own copy"
                     ));
+                }
+            }
+            // catreq/pullreq need to send frames + read disk → handled in the run
+            // loop; they never reach here. Arms kept for match exhaustiveness.
+            Net::SbxCatReq { .. } | Net::SbxPullReq { .. } => {}
+            Net::SbxCatalog { by, to, items } => {
+                // Only render a catalog that was sent to us (everyone sees the
+                // broadcast, but it's a private reply to one requester).
+                if to != self.me {
+                    return;
+                }
+                if items.is_empty() {
+                    self.sys(format!("† {by} has no shareable VMs"));
+                } else {
+                    self.sys(format!("† {by}'s shareable VMs ({}):", items.len()));
+                    for it in items {
+                        let purpose = if it.purpose.is_empty() { "—" } else { it.purpose.as_str() };
+                        let status = if it.status.is_empty() { "?" } else { it.status.as_str() };
+                        let mut line = format!("  • {} · [{}] · {}", it.label, status, purpose);
+                        if !it.tags.is_empty() {
+                            line.push_str(&format!(" · {{{}}}", it.tags.join(", ")));
+                        }
+                        if let Some(sz) = it.size_bytes {
+                            line.push_str(&format!(" · {}", crate::ft::human(sz as usize)));
+                        }
+                        self.sys(line);
+                        self.sys(format!("      pull with `/sbx pull @{by} {}`", it.label));
+                    }
                 }
             }
             Net::Closed => {
@@ -1513,8 +1574,38 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                         };
                                     });
                                 }
+                                // A pulled OCI snapshot (`hh-snap-<label>.tar`) loads
+                                // into the local engine and self-registers — the
+                                // manifest rides inside the image, so the receiver's
+                                // `/sbx browse`/`load` light up without a human briefing.
+                                let is_snap_tar = ext.as_deref() == Some("tar")
+                                    && path
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .is_some_and(|n| n.starts_with("hh-snap-"));
+                                if is_snap_tar {
+                                    let tx = app_tx.clone();
+                                    let tar = path.clone();
+                                    tokio::spawn(async move {
+                                        let res = tokio::task::spawn_blocking(move || {
+                                            register_received_snapshot(&tar)
+                                        })
+                                        .await;
+                                        let _ = match res {
+                                            Ok(Ok(msg)) => tx.send(Net::Sys(msg)),
+                                            Ok(Err(e)) => tx.send(Net::Sys(format!(
+                                                "(received snapshot not imported: {e:#})"
+                                            ))),
+                                            Err(e) => tx.send(Net::Err(format!("import task: {e}"))),
+                                        };
+                                    });
+                                }
+                                // Bridge any *other* received file into a hosted
+                                // sandbox so the room can use it from the shared
+                                // shell. Snapshot archives are skipped — they're
+                                // loaded as images above, not dropped into a shell.
                                 if let Some((be, name)) = &broker_meta {
-                                    if !matches!(be, sbx::Backend::Local) {
+                                    if !is_snap_tar && !matches!(be, sbx::Backend::Local) {
                                         let (be, name) = (*be, name.clone());
                                         let run_user = sbx::run_user_for(
                                             be,
@@ -1591,6 +1682,51 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     name,
                                     ft::human(size as usize)
                                 )),
+                            }
+                        }
+                        // A peer asked for our shareable-VM catalog — reply (only
+                        // if the request named us) with our published slice.
+                        Net::SbxCatReq { by, to } => {
+                            if to == app.me {
+                                let items: Vec<serde_json::Value> = registry::list_shareable()
+                                    .into_iter()
+                                    .map(|e| json!({
+                                        "label": e.label, "purpose": e.purpose,
+                                        "status": e.status, "tags": e.tags, "size": e.size_bytes,
+                                    }))
+                                    .collect();
+                                send_frame(&out_tx, &session.room, json!({
+                                    "_sbx":"catalog","to": by,"items": items
+                                }));
+                            }
+                        }
+                        // A peer asked us to hand over a published VM — if we
+                        // actually published it (and the artifact's still on disk),
+                        // `/send` it to them; their ft path auto-imports + registers.
+                        Net::SbxPullReq { by, to, label } => {
+                            if to == app.me {
+                                match registry::get(&label) {
+                                    Some(e)
+                                        if e.shareable
+                                            && !e.share_path.is_empty()
+                                            && std::path::Path::new(&e.share_path).exists() =>
+                                    {
+                                        app.sys(format!(
+                                            "† {by} is pulling ‘{label}’ — sending it over…"
+                                        ));
+                                        let path = e.share_path.clone();
+                                        offer_payload(
+                                            &mut app, &mut send_seq, &out_tx, &session.room,
+                                            &app_tx, &path, Some(&by),
+                                        );
+                                    }
+                                    Some(_) => app.sys(format!(
+                                        "† {by} asked for ‘{label}’ but it isn't published — `/sbx publish {label}` first"
+                                    )),
+                                    None => app.sys(format!(
+                                        "† {by} asked for ‘{label}’ but no such saved VM exists here"
+                                    )),
+                                }
                             }
                         }
                         other => app.apply(other),
@@ -2178,11 +2314,20 @@ fn handle_command(
                         app.sys("multipass must power off to snapshot — stopping the shared shell, then saving (reload it with `/sbx load`)");
                     }
                     let (tx, lbl) = (app_tx.clone(), label.clone());
+                    let created_by = app.me.clone();
                     tokio::spawn(async move {
-                        let res = tokio::task::spawn_blocking(move || sbx::save_state(be, &name, &label, local)).await;
+                        let res = tokio::task::spawn_blocking(move || {
+                            let desc = sbx::save_state(be, &name, &label, local)?;
+                            // Index the snapshot in the host-global registry, caching
+                            // its .hh-agent manifest summary. Best-effort: an index
+                            // hiccup must never fail the save the user just asked for.
+                            register_saved_snapshot(be, &name, &label, &created_by);
+                            Ok::<String, anyhow::Error>(desc)
+                        })
+                        .await;
                         let _ = match res {
                             Ok(Ok(desc)) => tx.send(Net::Sys(format!(
-                                "† saved sandbox → {desc} · reload with `/sbx load {lbl}`"))),
+                                "† saved sandbox → {desc} · reload with `/sbx load {lbl}` · `/sbx browse`"))),
                             Ok(Err(e)) => tx.send(Net::Err(format!("save failed: {e}"))),
                             Err(e) => tx.send(Net::Err(format!("save task: {e}"))),
                         };
@@ -2297,6 +2442,97 @@ fn handle_command(
                         Err(e) => tx.send(Net::Err(format!("snaps task: {e}"))),
                     };
                 });
+            }
+            Some("browse") | Some("registry") => {
+                // The discovery layer: every saved VM with WHAT it's for + where the
+                // work stands, read from the host-global registry. Reconciled against
+                // the engine so pruned snapshots drop out (no passive accumulation).
+                let tx = app_tx.clone();
+                tokio::spawn(async move {
+                    let res = tokio::task::spawn_blocking(|| {
+                        registry::list_reconciled(oci_image_exists)
+                    })
+                    .await;
+                    match res {
+                        Ok(entries) if !entries.is_empty() => {
+                            let _ = tx.send(Net::Sys(format!("saved VMs ({}):", entries.len())));
+                            for e in entries {
+                                let purpose = if e.purpose.is_empty() { "—" } else { e.purpose.as_str() };
+                                let status = if e.status.is_empty() { "?" } else { e.status.as_str() };
+                                let mut line = format!("  • {} · [{}] · {}", e.label, status, purpose);
+                                let nt = e.next_todo();
+                                if !nt.is_empty() {
+                                    line.push_str(&format!(" · next: {nt}"));
+                                }
+                                let _ = tx.send(Net::Sys(line));
+                                let _ = tx.send(Net::Sys(format!(
+                                    "      load with `/sbx load {}`", e.label)));
+                            }
+                        }
+                        Ok(_) => {
+                            let _ = tx.send(Net::Sys(
+                                "no saved VMs yet — `/sbx save [label]` records one with its manifest".into()));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Net::Err(format!("browse task: {e}")));
+                        }
+                    }
+                });
+            }
+            Some("publish") => {
+                // Mark a saved VM shareable so peers can pull it. Ensures a
+                // portable artifact exists (exports an image-backed snap to a
+                // `.tar`), then flips the registry entry's `shareable` flag.
+                let args: Vec<String> = p.map(str::to_string).collect();
+                let mut pos = args.iter().filter(|a| !a.starts_with('-'));
+                match pos.next() {
+                    None => app.sys(
+                        "usage: /sbx publish <label> [tag…]  (mark a saved VM shareable so peers can /sbx pull it)",
+                    ),
+                    Some(label) => {
+                        let label = label.clone();
+                        let tags: Vec<String> = pos.cloned().collect();
+                        app.sys(format!("publishing '{label}'…"));
+                        let tx = app_tx.clone();
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(move || {
+                                publish_snapshot(&label, &tags)
+                            })
+                            .await;
+                            let _ = match res {
+                                Ok(Ok(msg)) => tx.send(Net::Sys(msg)),
+                                Ok(Err(e)) => tx.send(Net::Err(format!("publish failed: {e:#}"))),
+                                Err(e) => tx.send(Net::Err(format!("publish task: {e}"))),
+                            };
+                        });
+                    }
+                }
+            }
+            Some("catalog") => {
+                // Ask a peer what VMs they offer. They reply with a `_sbx:catalog`
+                // frame (handled in apply → printed). Leading '@' optional.
+                match p.next().map(|s| s.trim_start_matches('@')) {
+                    Some(u) if !u.is_empty() => {
+                        send_frame(out_tx, room, json!({"_sbx":"catreq","to": u}));
+                        app.sys(format!("requested {u}'s shareable VMs…"));
+                    }
+                    _ => app.sys("usage: /sbx catalog @<user>  (ask a peer which VMs they offer)"),
+                }
+            }
+            Some("pull") => {
+                // Pull a published VM from a peer: send a pullreq; they `/send` the
+                // artifact and our ft path auto-imports + registers it on /accept.
+                let who = p.next().map(|s| s.trim_start_matches('@').to_string());
+                let label = p.next().map(str::to_string);
+                match (who, label) {
+                    (Some(u), Some(l)) if !u.is_empty() && !l.is_empty() => {
+                        send_frame(out_tx, room, json!({"_sbx":"pullreq","to": u,"label": l}));
+                        app.sys(format!(
+                            "asked {u} for ‘{l}’ — when it offers, `/accept` to receive + import it"
+                        ));
+                    }
+                    _ => app.sys("usage: /sbx pull @<user> <label>  (pull a published VM from a peer)"),
+                }
             }
             Some("vms") => {
                 let tx = app_tx.clone();
@@ -2535,7 +2771,7 @@ fn handle_command(
                 }
             }
             other => {
-                let usage = "usage: /sbx <type> <option> — /sbx docker|podman|multipass|local [image] · /sbx vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx vbox new [name] (fresh VM) · vmlib [<id> [install [--iso path]]] (VM library — build locally) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>";
+                let usage = "usage: /sbx <type> <option> — /sbx docker|podman|multipass|local [image] · /sbx vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx vbox new [name] (fresh VM) · vmlib [<id> [install [--iso path]]] (VM library — build locally) · vms · stop · save [label] [--local] · load <label> · snaps · browse (saved VMs + what each is for) · publish <label> [tag…] (mark shareable) · catalog @user (peer's VMs) · pull @user <label> (fetch a peer's VM) · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>";
                 // Bare `/sbx` → usage. An unrecognised subcommand → suggest the
                 // closest documented one before the usage line.
                 match other.and_then(|bad| closest(bad, SBX_SUBCOMMANDS).map(|s| (bad, s))) {
@@ -2830,8 +3066,8 @@ const KNOWN_COMMANDS: &[&str] = &[
 /// "did you mean". Aliases (`launch`, `virtualbox`, `snapshots`, `gui`) are
 /// omitted so suggestions point at the documented form.
 const SBX_SUBCOMMANDS: &[&str] = &[
-    "docker", "podman", "multipass", "local", "vbox", "stop", "save", "load", "snaps", "vms",
-    "vmsave", "vmload", "vmsnaps", "vmlib",
+    "docker", "podman", "multipass", "local", "vbox", "stop", "save", "load", "snaps", "browse",
+    "publish", "catalog", "pull", "vms", "vmsave", "vmload", "vmsnaps", "vmlib",
 ];
 
 /// Classic Levenshtein edit distance (insert/delete/substitute, each cost 1).
@@ -2864,6 +3100,144 @@ fn closest<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
         .filter(|(d, _)| *d <= 3 && *d < len)
         .min_by_key(|(d, _)| *d)
         .map(|(_, c)| c)
+}
+
+/// Record a freshly-saved snapshot in the host-global VM registry, caching the
+/// `.hh-agent` manifest summary read out of the (still-running, for OCI backends)
+/// container. Best-effort — never panics, never fails the save. Blocking; call
+/// from inside `spawn_blocking`.
+fn register_saved_snapshot(be: sbx::Backend, name: &str, label: &str, created_by: &str) {
+    let (artifact_kind, artifact_ref, size_bytes, manifest) = match be {
+        sbx::Backend::Docker | sbx::Backend::Podman => {
+            let engine = be.engine();
+            let image = format!("{}:{}", sbx::SNAP_REPO, label);
+            let size = oci_image_size(engine, &image);
+            let manifest = registry::read_container_manifest(engine, name, "/root");
+            ("image".to_string(), image, size, manifest)
+        }
+        // Multipass snapshots live in multipass's own store; the instance is
+        // powered off by save time, so there's no container to read a manifest
+        // from. Record the pointer; reconcile leaves it (no image to probe).
+        sbx::Backend::Multipass => ("snapshot".to_string(), label.to_string(), None, None),
+        sbx::Backend::Local => return, // nothing persistent to index
+    };
+    let (purpose, status, todo) = manifest
+        .as_deref()
+        .map(registry::scan_manifest)
+        .unwrap_or_default();
+    let entry = registry::Entry {
+        label: label.to_string(),
+        backend: be.engine().to_string(),
+        artifact_kind,
+        artifact_ref,
+        size_bytes,
+        created_unix: registry::now_unix(),
+        created_by: created_by.to_string(),
+        repo: registry::cwd_repo(),
+        purpose,
+        status,
+        todo,
+        ..Default::default()
+    };
+    if let Err(e) = registry::upsert(entry) {
+        eprintln!("registry upsert failed for '{label}': {e}");
+    }
+}
+
+/// Load a pulled `hh-snap-<label>.tar` into the local engine and record it in the
+/// host registry, scraping the `.hh-agent` manifest that rides inside the image so
+/// the receiver's `/sbx browse`/`load` know what the VM is for. Blocking — runs
+/// off the UI thread. Returns a status line for the room. The kept `.tar` doubles
+/// as this host's portable artifact, so a pulled VM is immediately re-shareable.
+fn register_received_snapshot(tar: &std::path::Path) -> anyhow::Result<String> {
+    let (engine, image, label) = sbx::import_image_archive(tar)?;
+    let (purpose, status, todo) = sbx::read_image_manifest(&engine, &image)
+        .as_deref()
+        .map(registry::scan_manifest)
+        .unwrap_or_default();
+    let entry = registry::Entry {
+        label: label.clone(),
+        backend: engine.clone(),
+        artifact_kind: "image".to_string(),
+        artifact_ref: image.clone(),
+        size_bytes: oci_image_size(&engine, &image),
+        created_unix: registry::now_unix(),
+        created_by: "pulled".to_string(),
+        repo: registry::cwd_repo(),
+        purpose,
+        status,
+        // The received file is already a portable artifact — keep it shareable so
+        // a pulled skill VM can be re-traded onward without re-exporting.
+        share_path: tar.to_string_lossy().into_owned(),
+        shareable: true,
+        todo,
+        ..Default::default()
+    };
+    registry::upsert(entry)?;
+    Ok(format!(
+        "† imported snapshot ‘{label}’ — `/sbx load {label}` to boot it · `/sbx browse` for details"
+    ))
+}
+
+/// Mark a saved snapshot shareable and ensure it has a portable, sendable file.
+/// File-backed snaps (`.tar`/`.ova`) are already tradeable; image-backed snaps
+/// are exported to `hh-snapshots/hh-snap-<label>.tar` first so a peer can receive
+/// them over `/send`. Blocking — run off the UI thread. Returns a status line.
+fn publish_snapshot(label: &str, tags: &[String]) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let entry = registry::get(label)
+        .with_context(|| format!("no saved VM labelled '{label}' — `/sbx browse` to list"))?;
+    let share_path = match entry.artifact_kind.as_str() {
+        // Already a standalone file the owner controls — send it as-is.
+        "file" => entry.artifact_ref.clone(),
+        // Lives only in the engine image store — export a portable copy.
+        "image" => {
+            let backend = sbx::Backend::parse(&entry.backend)
+                .with_context(|| format!("unknown backend '{}' for '{label}'", entry.backend))?;
+            sbx::export_image(backend, label)?
+                .to_string_lossy()
+                .into_owned()
+        }
+        other => anyhow::bail!(
+            "'{label}' is a {other} snapshot — only file/image snapshots are tradeable"
+        ),
+    };
+    let published = registry::publish(label, &share_path, tags)?;
+    let tagnote = if published.tags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", published.tags.join(", "))
+    };
+    Ok(format!(
+        "✓ published '{label}'{tagnote} — shareable artifact at {share_path}; peers can `/sbx pull @<you> {label}`"
+    ))
+}
+
+/// Size in bytes of an OCI image (`<engine> image inspect … --format {{.Size}}`),
+/// or None if the engine/image isn't available. Blocking.
+fn oci_image_size(engine: &str, image: &str) -> Option<u64> {
+    let out = std::process::Command::new(engine)
+        .args(["image", "inspect", image, "--format", "{{.Size}}"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+}
+
+/// Does an OCI image still exist? Used to reconcile the registry so entries whose
+/// snapshot was pruned drop out of `/sbx browse`. Blocking.
+fn oci_image_exists(backend: &str, image: &str) -> bool {
+    let engine = if backend == "podman" { "podman" } else { "docker" };
+    std::process::Command::new(engine)
+        .args(["image", "inspect", image])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// A safe snapshot label — compatible with both a Docker image tag and a

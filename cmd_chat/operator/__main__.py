@@ -151,6 +151,14 @@ def _build_parser() -> argparse.ArgumentParser:
     mf.add_argument("--replace", action="store_true", help="replace state lists instead of appending")
     mf.add_argument("--session", default=None)
 
+    # ── VM registry (discovery: what saved VMs exist + what each is for) ──
+    rg = sub.add_parser("registry",
+                        help="browse the host-global saved-VM registry (~/.hh/registry.json)")
+    rg.add_argument("action", choices=["list", "show"], nargs="?", default="list")
+    rg.add_argument("--label", default=None, help="for show: which VM")
+    rg.add_argument("--repo", default=None, help="for list: filter to this origin repo")
+    rg.add_argument("--json", action="store_true", help="machine-readable output")
+
     for v in ("roster", "status", "down"):
         sub.add_parser(v).add_argument("--session", default=None)
     return ap
@@ -396,6 +404,57 @@ def _run_manifest(args) -> int:
     return 0 if resp.get("ok") else 1
 
 
+def _run_registry(args) -> int:
+    """Read the host-global VM registry written by the TUI's `/sbx save`. Standalone
+    (no daemon/room needed) so an agent can survey available work before joining."""
+    path = Path.home() / ".hh" / "registry.json"
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        print("no VM registry yet (~/.hh/registry.json) — save a VM with `/sbx save`",
+              file=sys.stderr)
+        return 0 if args.action == "list" else 1
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"registry unreadable: {e}", file=sys.stderr)
+        return 1
+
+    entries = list((data.get("entries") or {}).values())
+    entries.sort(key=lambda e: e.get("created_unix", 0), reverse=True)
+
+    if args.action == "show":
+        if not args.label:
+            print("usage: registry show --label <name>", file=sys.stderr)
+            return 2
+        match = next((e for e in entries if e.get("label") == args.label), None)
+        if not match:
+            print(f"no saved VM '{args.label}'", file=sys.stderr)
+            return 1
+        print(json.dumps(match, indent=2))
+        return 0
+
+    if args.repo:
+        entries = [e for e in entries if e.get("repo") == args.repo]
+    if args.json:
+        print(json.dumps(entries, indent=2))
+        return 0
+    if not entries:
+        print("no saved VMs yet")
+        return 0
+    for e in entries:
+        todo = e.get("todo") or []
+        nxt = f" · next: {todo[0]}" if todo else ""
+        # Phase B: flag tradeable VMs so an agent knows what it can `/sbx pull`.
+        share = ""
+        if e.get("shareable"):
+            tags = e.get("tags") or []
+            share = " · shareable" + (f" {{{', '.join(tags)}}}" if tags else "")
+        print(f"• {e.get('label')} · [{e.get('status') or '?'}] · "
+              f"{e.get('purpose') or '—'}{nxt}{share}")
+        print(f"    backend={e.get('backend')} artifact={e.get('artifact_ref')} "
+              f"by={e.get('created_by')}")
+    return 0
+
+
 def _run_simple(args, op: str) -> int:
     resp = _client_request(args, {"op": op})
     print(json.dumps(resp))
@@ -427,6 +486,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_spawn(args)
     if verb == "manifest":
         return _run_manifest(args)
+    if verb == "registry":
+        return _run_registry(args)
     if verb == "screen":
         return _run_screen(args)
     if verb == "watch":
