@@ -427,3 +427,99 @@ def test_watch_matches_event_and_idle_and_timeout():
         res = await b._op_watch({"for": "never-ever", "timeout": 0.3})
         assert res["reason"] == "timeout" and res["matched"] is False
     asyncio.run(go())
+
+
+# ── agent-manifest (the unit of work-transmission) ──────────────────────────
+from cmd_chat.operator import manifest as mfst  # noqa: E402
+
+
+def test_manifest_roundtrip_dict():
+    m = mfst.Manifest(name="box", purpose="p",
+                      goals={"objective": "o", "user_intent": "u",
+                             "stop_conditions": ["done"]})
+    d = m.to_dict()
+    # canonical key order keeps schema/id/name scannable at the top
+    assert list(d)[:3] == ["schema", "id", "name"]
+    m2 = mfst.Manifest.from_dict(d)
+    assert m2.name == "box" and m2.goals["objective"] == "o"
+    # unknown keys from a newer writer are ignored, not fatal
+    m3 = mfst.Manifest.from_dict({**d, "future_field": 123})
+    assert m3.name == "box"
+
+
+def test_manifest_update_appends_and_replaces():
+    m = mfst.Manifest(name="box")
+    first = m.updated_at
+    m.update_state(done="wrote tooling", todo=["wire verb", "test"], status="in_progress")
+    assert m.state["done"] == ["wrote tooling"]
+    assert m.state["todo"] == ["wire verb", "test"]
+    m.update_state(done=["more"], append=True)
+    assert m.state["done"] == ["wrote tooling", "more"]
+    m.update_state(todo=["only"], append=False)  # replace
+    assert m.state["todo"] == ["only"]
+    assert m.updated_at >= first
+
+
+def test_manifest_provenance_and_render():
+    m = mfst.Manifest(name="recon", purpose="kali box")
+    m.add_provenance(by="op-a", action="init", note="created")
+    m.add_provenance(by="op-b", note="handed off")
+    agent = mfst.render_agent_md(m)
+    assert "AGENT.md — recon" in agent and "kali box" in agent
+    last = mfst.render_last_state_md(m)
+    assert "op-a" in last and "op-b" in last and "handed off" in last
+    files = mfst.bundle_files(m)
+    assert set(files) == {"manifest.yaml", "AGENT.md", "last-state.md",
+                          "summary.md", "goals.yaml"}
+
+
+def test_manifest_write_read_bundle(tmp_path):
+    m = mfst.Manifest(name="box", purpose="p",
+                      goals={"objective": "ship", "user_intent": "i",
+                             "stop_conditions": ["x"]})
+    bdir = mfst.write_bundle(m, str(tmp_path))
+    assert Path(bdir).name == mfst.MANIFEST_DIR
+    loaded = mfst.read_bundle(str(tmp_path))
+    assert loaded.id == m.id and loaded.goals["objective"] == "ship"
+
+
+def test_op_manifest_push_pull_update_via_local(tmp_path):
+    async def go():
+        b = _bridge("oracle")
+        b._own_engine, b._own_name = "local", ""  # exec on host into tmp_path
+        root = str(tmp_path)
+        r = await b._op_manifest({
+            "action": "push", "root": root, "name": "demo-box",
+            "purpose": "build manifest tooling live", "objective": "hand it off",
+            "stop": ["round-trips"]})
+        assert r["ok"] and r["id"].startswith("hh-")
+        # the VM now carries its own bundle on disk
+        assert (tmp_path / ".hh-agent" / "manifest.yaml").is_file()
+        assert (tmp_path / ".hh-agent" / "AGENT.md").is_file()
+        # pull it back parsed — what a spawn/handoff reads to resume
+        r = await b._op_manifest({"action": "pull", "root": root})
+        assert r["ok"] and r["manifest"]["name"] == "demo-box"
+        assert r["manifest"]["created_by"] == "oracle"
+        # update state + provenance, re-rendered into the bundle
+        r = await b._op_manifest({
+            "action": "update", "root": root, "status": "done",
+            "progress": "tooling shipped", "done": ["wrote it"],
+            "note": "operator handing to child"})
+        assert r["ok"] and r["status"] == "done"
+        r = await b._op_manifest({"action": "pull", "root": root})
+        st = r["manifest"]["state"]
+        assert st["status"] == "done" and "wrote it" in st["done"]
+        prov = r["manifest"]["provenance"]
+        assert any(p["action"] == "update" for p in prov)
+    asyncio.run(go())
+
+
+def test_op_manifest_pull_missing_is_clean_error():
+    async def go():
+        b = _bridge("oracle")
+        b._own_engine, b._own_name = "local", ""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            r = await b._op_manifest({"action": "pull", "root": d})
+            assert r["ok"] is False and "no manifest" in r["error"]
+    asyncio.run(go())

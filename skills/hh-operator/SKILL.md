@@ -103,6 +103,31 @@ Tokens combine: literal text types verbatim; named keys send control bytes;
 **Rule:** end a stuck command with `ctrl-c`; if ignored, `ctrl-\` then `ctrl-c`
 again. Always know how to exit an interactive program *before* you start it.
 
+## 3b. Agent manifest — make a VM carry its own handoff record
+
+A sandbox becomes **shareable/tradeable** when it documents itself. `manifest`
+writes an ICM-style `.hh-agent/` bundle *inside* the target sandbox so the next
+agent (human or a spawned Claude) can resume without a briefing:
+
+```bash
+# stamp a fresh VM with purpose, goal, user intent, stop conditions
+$HH manifest push --root /root --name kali-recon-vm \
+  --purpose "Kali recon sandbox" \
+  --objective "map the target and hand off" \
+  --intent "tradeable VM state across handoffs" --stop "scan complete"
+# as work progresses, record state + a provenance line
+$HH manifest update --root /root --status done --progress "scan done" \
+  --done "ran nmap" --todo "exploit phase" --note "oracle → child handoff"
+# what a spawn/handoff reads first to resume exactly where you left off
+$HH manifest pull --root /root      # → parsed manifest.yaml
+```
+
+Bundle written under `<root>/.hh-agent/`: `manifest.yaml` (canonical machine
+record), `AGENT.md` (read this first), `last-state.md`, `summary.md`,
+`goals.yaml`. The yaml is the source of truth; the rest are rendered from it.
+Pair with `spawn`: stamp → push → spawn a child whose objective is "load the
+`.hh-agent` manifest and continue."
+
 ## 4. Delegate to a local model (optional)
 
 A room often has an `/ai <name>` Ollama agent. To offload a task, just `say`

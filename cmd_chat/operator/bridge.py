@@ -338,6 +338,8 @@ class OperatorBridge(Client):
             return await self._op_keys(req)
         if op == "spawn":
             return await self._op_spawn(req)
+        if op == "manifest":
+            return await self._op_manifest(req)
         if op == "screen":
             return await self._op_screen(req)
         if op == "watch":
@@ -648,6 +650,104 @@ class OperatorBridge(Client):
                          creds_staged=creds.get("staged", False))
         return {"ok": True, "pid": proc.pid, "plan": plan,
                 "remaining": self.budget.as_dict()}
+
+    # ── agent-manifest: make a sandbox carry its own handoff record ──────────
+    async def _op_manifest(self, req: dict) -> dict:
+        """Read/write the `.hh-agent/` manifest bundle *inside* the target
+        sandbox, so a VM travels with a self-describing handoff record.
+
+        Actions:
+        - ``push`` — build a bundle from the given fields and write all five
+          files under ``<root>/.hh-agent`` in the sandbox. This is what makes a
+          VM tradeable: the next agent reads AGENT.md and knows the purpose.
+        - ``pull`` — cat the canonical ``manifest.yaml`` back out, parsed, so a
+          handoff/spawn can resume exactly where the last one left off.
+        - ``update`` — pull, apply a state change (status/progress/done/todo/
+          blockers + a provenance entry), and re-push the rendered bundle.
+
+        All manifest logic lives in ``manifest.py``; the bridge only moves bytes
+        in and out of the sandbox via the same exec path as `write`/`get`."""
+        from . import manifest as mf
+
+        action = req.get("action", "push")
+        root = str(req.get("root", "/root")).rstrip("/") or "/"
+        bdir = f"{root}/{mf.MANIFEST_DIR}"
+        engine, name, err = self._target()
+        if err:
+            return {"ok": False, "error": err}
+        prefix = sbx.exec_prefix(engine, name)
+        if prefix is None:
+            return {"ok": False, "error": f"can't address {engine}/{name}"}
+
+        async def _put(path: str, data: bytes):
+            return await sbx.exec_capture(
+                prefix + ["sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"',
+                          "hh-manifest", path], stdin=data)
+
+        async def _read_manifest() -> mf.Manifest | None:
+            raw, rc = await sbx.exec_capture(
+                prefix + ["cat", "--", f"{bdir}/{mf.MANIFEST_FILE}"], text=False)
+            if rc != 0:
+                return None
+            return mf.Manifest.from_dict(mf._load(raw.decode(errors="replace")))
+
+        async def _write_bundle(m: mf.Manifest):
+            for fname, text in mf.bundle_files(m).items():
+                _, rc = await _put(f"{bdir}/{fname}", text.encode())
+                if rc != 0:
+                    return False, fname
+            return True, ""
+
+        if action == "pull":
+            m = await _read_manifest()
+            if m is None:
+                return {"ok": False, "error": f"no manifest at {bdir}"}
+            return {"ok": True, "dir": bdir, "manifest": m.to_dict()}
+
+        if action == "push":
+            name_ = str(req.get("name") or "").strip()
+            if not name_:
+                return {"ok": False, "error": "manifest push needs a name"}
+            m = mf.Manifest(
+                name=name_, purpose=str(req.get("purpose", "")),
+                created_by=self.name,
+                vm={"engine": req.get("engine") or engine,
+                    "image": req.get("image", ""),
+                    "state_ref": req.get("state_ref", ""),
+                    "entrypoint": req.get("entrypoint", "")},
+                setup=list(req.get("setup") or []),
+                usage=list(req.get("usage") or []),
+                goals={"objective": req.get("objective", ""),
+                       "user_intent": req.get("user_intent", ""),
+                       "stop_conditions": list(req.get("stop") or [])})
+            m.add_provenance(by=self.name, action="init", note=f"created {m.name}")
+            ok, bad = await _write_bundle(m)
+            if not ok:
+                return {"ok": False, "error": f"failed writing {bad} into sandbox"}
+            await self._emit("manifest", action="push", id=m.id, dir=bdir)
+            return {"ok": True, "id": m.id, "dir": bdir,
+                    "files": list(mf.bundle_files(m))}
+
+        if action == "update":
+            m = await _read_manifest()
+            if m is None:
+                return {"ok": False, "error": f"no manifest at {bdir} (push first)"}
+            m.update_state(
+                status=req.get("status"), progress=req.get("progress"),
+                done=req.get("done") or None, todo=req.get("todo") or None,
+                blockers=req.get("blockers") or None,
+                append=not bool(req.get("replace", False)))
+            note = req.get("note")
+            if note:
+                m.add_provenance(by=self.name, action="update", note=str(note))
+            ok, bad = await _write_bundle(m)
+            if not ok:
+                return {"ok": False, "error": f"failed writing {bad} into sandbox"}
+            await self._emit("manifest", action="update", id=m.id, dir=bdir)
+            return {"ok": True, "id": m.id, "dir": bdir,
+                    "status": m.state.get("status")}
+
+        return {"ok": False, "error": f"unknown manifest action {action!r}"}
 
     def _begin_shutdown(self) -> None:
         self._stop.set()

@@ -127,6 +127,30 @@ def _build_parser() -> argparse.ArgumentParser:
     ky.add_argument("--help-keys", action="store_true", help="print the key vocabulary")
     ky.add_argument("--session", default=None)
 
+    # ── agent-manifest (make a sandbox carry its own handoff record) ─────
+    mf = sub.add_parser("manifest", help="push/pull/update the sandbox's .hh-agent bundle")
+    mf.add_argument("action", choices=["push", "pull", "update"])
+    mf.add_argument("--root", default="/root", help="dir the .hh-agent/ lives under in the sandbox")
+    mf.add_argument("--name", default=None)
+    mf.add_argument("--purpose", default=None)
+    mf.add_argument("--objective", default=None)
+    mf.add_argument("--intent", dest="user_intent", default=None)
+    mf.add_argument("--stop", action="append", default=None, help="stop condition (repeatable)")
+    mf.add_argument("--engine", default=None)
+    mf.add_argument("--image", default=None)
+    mf.add_argument("--state-ref", dest="state_ref", default=None)
+    mf.add_argument("--entrypoint", default=None)
+    mf.add_argument("--setup", action="append", default=None)
+    mf.add_argument("--usage", action="append", default=None)
+    mf.add_argument("--status", default=None)
+    mf.add_argument("--progress", default=None)
+    mf.add_argument("--done", action="append", default=None)
+    mf.add_argument("--todo", action="append", default=None)
+    mf.add_argument("--blocker", dest="blockers", action="append", default=None)
+    mf.add_argument("--note", default=None, help="provenance note for update")
+    mf.add_argument("--replace", action="store_true", help="replace state lists instead of appending")
+    mf.add_argument("--session", default=None)
+
     for v in ("roster", "status", "down"):
         sub.add_parser(v).add_argument("--session", default=None)
     return ap
@@ -356,6 +380,22 @@ def _run_keys(args) -> int:
     return 0
 
 
+def _run_manifest(args) -> int:
+    req = {"op": "manifest", "action": args.action, "root": args.root}
+    # forward only the fields the user actually set, so the daemon's defaults hold
+    for k in ("name", "purpose", "objective", "user_intent", "stop", "engine",
+              "image", "state_ref", "entrypoint", "setup", "usage", "status",
+              "progress", "done", "todo", "blockers", "note"):
+        v = getattr(args, k, None)
+        if v is not None:
+            req[k] = v
+    if args.replace:
+        req["replace"] = True
+    resp = _client_request(args, req)
+    print(json.dumps(resp, indent=2))
+    return 0 if resp.get("ok") else 1
+
+
 def _run_simple(args, op: str) -> int:
     resp = _client_request(args, {"op": op})
     print(json.dumps(resp))
@@ -385,6 +425,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_keys(args)
     if verb == "spawn":
         return _run_spawn(args)
+    if verb == "manifest":
+        return _run_manifest(args)
     if verb == "screen":
         return _run_screen(args)
     if verb == "watch":
