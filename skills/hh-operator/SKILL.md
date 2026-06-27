@@ -72,12 +72,18 @@ $HH sbx down                                            # tear your container do
 When the **room** has a sandbox and you're granted, `exec`/`write`/`get` target
 it directly (you're co-located on the host) — no launch needed.
 
-**Keystroke relay** — drive the room's *shared* terminal live, like a human:
+**Keystroke relay** — drive the room's *shared* terminal live, like a human.
+The relay loop is **type → wait → read**:
 ```bash
-$HH keys "ls -la" enter          # type + run
-$HH keys ctrl-c                  # interrupt the running program
-$HH keys --help-keys             # print the full vocabulary
+$HH keys "make build" enter             # type + run
+$HH watch --for "BUILD (SUCCESS|FAIL)" --in screen --timeout 120   # wait
+$HH screen                               # read the relayed terminal (ansi-stripped)
+$HH keys ctrl-c                          # interrupt the running program
+$HH keys --help-keys                     # print the full vocabulary
 ```
+`watch` is the stop-condition engine — it blocks until a regex matches (in
+`screen` output or chat `events`), or `--idle N` quiet, or `--timeout` — then
+reports which fired. This is how you stay autonomous without busy-polling.
 
 ### Keystroke cheat-sheet (how to *stop* things matters most)
 

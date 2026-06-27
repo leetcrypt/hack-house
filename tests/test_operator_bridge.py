@@ -363,3 +363,67 @@ def test_spawn_refuses_without_objective_or_room_or_budget():
                                "room": {"host": "h", "port": 7}})
         assert r["ok"] is False and "budget exhausted" in r["error"]
     asyncio.run(go())
+
+
+# ── Phase 6: relay read (screen) + stop-condition engine (watch) ──────────
+def test_strip_ansi():
+    assert sbx.strip_ansi("\x1b[31mred\x1b[0m text") == "red text"
+    assert sbx.strip_ansi("a\rb") == "a\nb"            # bare CR → newline
+    assert sbx.strip_ansi("\x1b]0;title\x07ok") == "ok"  # OSC title strip
+
+
+def _sbx_data(b, raw: bytes):
+    """A broker PTY-relay frame carrying raw terminal bytes."""
+    import base64 as _b64
+    payload = json.dumps({"_sbx": "data", "b64": _b64.b64encode(raw).decode()})
+    return _msg_frame(b, "broker", payload)
+
+
+def test_sbx_data_absorbed_into_screen():
+    async def go():
+        b = _bridge("oracle")
+        await b._handle_frame(None, _sbx_data(b, b"\x1b[32mroot@box\x1b[0m:~# ls\r\n"))
+        # PTY relay must NOT surface as a chat message
+        assert [e for e in b.events if e["kind"] == "message"] == []
+        r = await b._op_screen({})
+        assert "root@box:~# ls" in r["text"]            # ansi-stripped
+        raw = await b._op_screen({"ansi": True})
+        assert "\x1b[32m" in raw["text"]                 # raw keeps codes
+    asyncio.run(go())
+
+
+def test_watch_matches_screen():
+    async def go():
+        b = _bridge("oracle")
+
+        async def driver():
+            await asyncio.sleep(0.05)
+            await b._handle_frame(None, _sbx_data(b, b"...building...\n"))
+            await asyncio.sleep(0.05)
+            await b._handle_frame(None, _sbx_data(b, b"BUILD SUCCESS\n"))
+
+        watcher = b._op_watch({"for": "BUILD (SUCCESS|FAIL)", "in": "screen",
+                               "timeout": 5})
+        res, _ = await asyncio.gather(watcher, driver())
+        assert res["reason"] == "match" and res["match"] == "BUILD SUCCESS"
+    asyncio.run(go())
+
+
+def test_watch_matches_event_and_idle_and_timeout():
+    async def go():
+        b = _bridge("oracle")
+
+        async def speak():
+            await asyncio.sleep(0.05)
+            await b._emit("message", **{"from": "alice"}, text="please stop now",
+                          addressed=True)
+        res, _ = await asyncio.gather(
+            b._op_watch({"for": r"\bstop\b", "in": "events", "timeout": 5}), speak())
+        assert res["reason"] == "match" and res["event"]["from"] == "alice"
+        # idle: nothing happens → quiescence fires fast
+        res = await b._op_watch({"idle": 0.2, "timeout": 5})
+        assert res["reason"] == "idle"
+        # timeout: a pattern that never appears
+        res = await b._op_watch({"for": "never-ever", "timeout": 0.3})
+        assert res["reason"] == "timeout" and res["matched"] is False
+    asyncio.run(go())

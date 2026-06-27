@@ -36,6 +36,7 @@ class OperatorBridge(Client):
     _RECONNECT_MAX_BACKOFF = 30.0
     _RECONNECT_STABLE_SECS = 30.0
     MAX_EVENTS = 2000  # in-RAM inbox ring; full history lives in inbox.jsonl
+    TERM_CAP = 65536   # rolling relayed-PTY buffer (bytes) kept for `screen`
 
     def __init__(self, server: str, port: int, name: str,
                  password: str | None = None, insecure: bool = False,
@@ -65,6 +66,12 @@ class OperatorBridge(Client):
         # sandbox, which we can also drive when co-located + granted.
         self._own_engine: str | None = None
         self._own_name: str = ""
+
+        # Relay terminal buffer (Phase 6): rolling raw PTY bytes the broker
+        # relays as `_sbx:data`. Lets the operator *read* a remote/broker-owned
+        # sandbox it drives via `keys` — the output half of relay mode.
+        self._term = bytearray()
+        self._term_seq = 0  # bumps on each chunk so `watch` can poll for growth
 
         # Live websocket (None while reconnecting); set in _connect_and_serve.
         self._ws = None
@@ -143,12 +150,36 @@ class OperatorBridge(Client):
         await self._emit("message", **{"from": sender}, text=text,
                          addressed=self._is_addressed(text))
 
+    def _absorb_term(self, b64: str) -> None:
+        """Append a relayed PTY chunk to the rolling terminal buffer (capped).
+        High-volume, so we don't emit an inbox event per chunk — `watch`/`screen`
+        poll `_term_seq` instead."""
+        if not b64:
+            return
+        try:
+            chunk = base64.b64decode(b64)
+        except (ValueError, TypeError):
+            return
+        self._term += chunk
+        if len(self._term) > self.TERM_CAP:
+            del self._term[:-self.TERM_CAP]
+        self._term_seq += 1
+
+    def _screen_text(self, tail: int | None, ansi: bool) -> str:
+        raw = bytes(self._term[-tail:] if tail else self._term)
+        s = raw.decode(errors="replace")
+        return s if ansi else sbx.strip_ansi(s)
+
     async def _record_control(self, text: str) -> None:
-        """Surface ACL + sandbox-status changes into the inbox (awareness only).
-        Ignore high-volume / irrelevant control frames (_sbx:data, _ai, _ft)."""
+        """Surface ACL + sandbox-status changes into the inbox (awareness only)
+        and absorb relayed PTY output (`_sbx:data`) into the terminal buffer.
+        Ignore other high-volume control frames (_ai, _ft)."""
         try:
             frame = json.loads(text)
         except json.JSONDecodeError:
+            return
+        if frame.get("_sbx") == "data":
+            self._absorb_term(frame.get("b64", ""))
             return
         if frame.get("_sbx") == "status":
             ready = frame.get("state") == "ready"
@@ -307,6 +338,10 @@ class OperatorBridge(Client):
             return await self._op_keys(req)
         if op == "spawn":
             return await self._op_spawn(req)
+        if op == "screen":
+            return await self._op_screen(req)
+        if op == "watch":
+            return await self._op_watch(req)
         if op == "down":
             asyncio.get_running_loop().call_soon(self._begin_shutdown)
             return {"ok": True, "stopping": True}
@@ -473,6 +508,65 @@ class OperatorBridge(Client):
             return {"ok": False, "error": f"send failed: {type(e).__name__}: {e}"}
         await self._emit("keys", bytes=len(data))
         return {"ok": True, "bytes": len(data)}
+
+    # ── relay read + stop-condition engine (Phase 6) ─────────────────────
+    async def _op_screen(self, req: dict) -> dict:
+        """Return the current relayed terminal buffer — the output half of relay
+        mode (drive with `keys`, read with `screen`). ANSI-stripped by default;
+        `tail` bounds the bytes returned."""
+        tail = req.get("tail")
+        tail = int(tail) if tail else None
+        ansi = bool(req.get("ansi", False))
+        return {"ok": True, "text": self._screen_text(tail, ansi),
+                "bytes": len(self._term), "seq": self._term_seq}
+
+    async def _op_watch(self, req: dict) -> dict:
+        """Block until a stop condition fires, then report which one. Formalizes
+        the `/loop` autonomy stops so a driver can `keys` then wait for a result.
+
+        Conditions (first to fire wins):
+        - ``for`` regex matched in the chosen source ``in`` = "events" (default,
+          matches event text) or "screen" (matches relayed terminal output);
+        - ``idle`` seconds with no new event/output (quiescence);
+        - ``timeout`` seconds elapsed (the hard ceiling).
+        """
+        pattern = req.get("for")
+        source = req.get("in", "events")
+        timeout = float(req.get("timeout", 30.0))
+        idle = req.get("idle")
+        idle = float(idle) if idle is not None else None
+        match_since = int(req.get("since", self.seq))  # fixed scan cursor
+        try:
+            rx = re.compile(pattern) if pattern else None
+        except re.error as e:
+            return {"ok": False, "error": f"bad regex: {e}"}
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        last_change = loop.time()
+        prev_seq, prev_term = self.seq, self._term_seq
+        while True:
+            if rx and source == "screen":
+                m = rx.search(self._screen_text(None, False))
+                if m:
+                    return {"ok": True, "reason": "match", "where": "screen",
+                            "match": m.group(0), "seq": self.seq}
+            if rx and source == "events":
+                for e in self.events:
+                    if e["seq"] <= match_since:
+                        continue
+                    if rx.search(str(e.get("text", "")) or json.dumps(e)):
+                        return {"ok": True, "reason": "match", "where": "events",
+                                "event": e, "seq": self.seq}
+            now = loop.time()
+            if self.seq != prev_seq or self._term_seq != prev_term:
+                last_change, prev_seq, prev_term = now, self.seq, self._term_seq
+            if idle is not None and now - last_change >= idle:
+                return {"ok": True, "reason": "idle", "idle": idle, "seq": self.seq}
+            if now >= deadline:
+                return {"ok": True, "reason": "timeout", "matched": False,
+                        "seq": self.seq}
+            await asyncio.sleep(min(0.3, max(0.0, deadline - now)))
 
     # ── recursive spawn (Phase 5) ────────────────────────────────────────
     async def _op_spawn(self, req: dict) -> dict:

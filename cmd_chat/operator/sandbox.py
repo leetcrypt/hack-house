@@ -22,6 +22,24 @@ Nothing here opens a websocket or holds state; the bridge wires these in.
 from __future__ import annotations
 
 import asyncio
+import re
+
+# CSI / OSC / single-char escape sequences + carriage returns, so relayed PTY
+# bytes read as plain text. We strip rather than interpret: the operator wants
+# to grep the output, not render a faithful screen.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"   # CSI  …  (colours, cursor moves)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC  …  (title sets) BEL/ST-terminated
+    r"|\x1b[@-Z\\-_]"              # two-char escapes
+)
+
+
+def strip_ansi(text: str) -> str:
+    """Drop ANSI/control noise from relayed terminal output. Collapses bare
+    carriage returns (so progress redraws don't stack) but keeps newlines."""
+    clean = _ANSI_RE.sub("", text)
+    clean = clean.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(c for c in clean if c == "\n" or c == "\t" or c >= " ")
 
 # Match the native harness so behaviour is identical across both drivers.
 EXEC_TIMEOUT = 60.0      # NATIVE_TOOL_TIMEOUT

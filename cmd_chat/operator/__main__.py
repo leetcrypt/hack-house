@@ -105,6 +105,21 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="actually launch (default is a dry-run plan)")
     sp.add_argument("--session", default=None)
 
+    sc = sub.add_parser("screen", help="print the relayed sandbox terminal buffer")
+    sc.add_argument("--tail", type=int, default=None, help="last N bytes only")
+    sc.add_argument("--ansi", action="store_true", help="keep ANSI codes (raw)")
+    sc.add_argument("--session", default=None)
+
+    wt = sub.add_parser("watch", help="block until a stop condition fires")
+    wt.add_argument("--for", dest="pattern", default=None,
+                    help="regex to match (stops on first hit)")
+    wt.add_argument("--in", dest="source", choices=["events", "screen"],
+                    default="events", help="where to match (default: events)")
+    wt.add_argument("--idle", type=float, default=None,
+                    help="stop after this many seconds of quiet")
+    wt.add_argument("--timeout", type=float, default=30.0)
+    wt.add_argument("--session", default=None)
+
     ky = sub.add_parser("keys", help="inject keystrokes into the room's shared PTY")
     ky.add_argument("keys", nargs="*",
                     help="tokens: literal text, named keys (enter, ctrl-c, esc, "
@@ -295,6 +310,25 @@ def _run_get(args) -> int:
     return 0
 
 
+def _run_screen(args) -> int:
+    resp = _client_request(args, {"op": "screen", "tail": args.tail,
+                                  "ansi": args.ansi})
+    if not resp.get("ok"):
+        print(resp.get("error", "screen failed"), file=sys.stderr)
+        return 1
+    sys.stdout.write(resp.get("text", ""))
+    return 0
+
+
+def _run_watch(args) -> int:
+    resp = _client_request(args, {"op": "watch", "for": args.pattern,
+                                  "in": args.source, "idle": args.idle,
+                                  "timeout": args.timeout},
+                           read_timeout=args.timeout + 5.0)
+    print(json.dumps(resp))
+    return 0 if resp.get("ok") else 1
+
+
 def _run_spawn(args) -> int:
     resp = _client_request(args, {
         "op": "spawn", "objective": args.objective,
@@ -351,6 +385,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_keys(args)
     if verb == "spawn":
         return _run_spawn(args)
+    if verb == "screen":
+        return _run_screen(args)
+    if verb == "watch":
+        return _run_watch(args)
     if verb in ("roster", "status", "down"):
         return _run_simple(args, verb)
     return 2
