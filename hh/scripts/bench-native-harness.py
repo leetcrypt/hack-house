@@ -98,8 +98,16 @@ def make_bridge(provider, workdir: str):
 
     b._inject = cap_inject
 
-    async def cap_sbx_input(ws, data):  # PTY-mirror frames — broker-only in prod
-        b._chat.append("[pty] " + data.decode(errors="replace").rstrip("\n"))
+    async def cap_sbx_input(ws, data):  # stand in for the shared PTY
+        # In prod the broker writes these keystrokes to the room's PTY shell; here
+        # there's no PTY, so run them in the bench process (CWD == workdir) to
+        # exercise run_shell end-to-end. Mirror lines are `# `-prefixed comments,
+        # so the shell no-ops them; the only real command is the staged wrapper.
+        line = data.decode(errors="replace")
+        b._chat.append("[pty] " + line.rstrip("\n"))
+        proc = await asyncio.create_subprocess_shell(
+            line, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await proc.wait()
 
     b._send_sbx_input = cap_sbx_input
     return b
