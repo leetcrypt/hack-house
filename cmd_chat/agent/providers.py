@@ -180,7 +180,7 @@ class OllamaProvider:
                     args = json.loads(args)
                 except ValueError:
                     args = {}
-            calls.append({"name": fn.get("name", ""), "arguments": args or {}})
+            calls.append({"name": fn.get("name", ""), "arguments": self._clean_args(args or {})})
         # Small/quantized models (notably qwen2.5 on CPU) intermittently emit a valid
         # tool call as literal text in `content` instead of the structured `tool_calls`
         # field — qwen's `<tool_call>{…}</tool_call>`, but also bare/fenced JSON and
@@ -215,6 +215,37 @@ class OllamaProvider:
         re.I,
     )
 
+    # Per-argument schema-echo leak: a weak model sometimes emits a parameter's
+    # JSON *schema* fragment as its *value*, e.g.
+    #   run_shell(command={'type': 'string', 'description': 'bash ./add.py'})
+    # Every native tool arg is a plain string, so a dict-valued arg is always this
+    # leak — recover the intended string (the model stows it in a value-ish key, or
+    # in `description`), else drop to "" so the tool reports a clean error instead
+    # of running the stringified dict.
+    _LEAK_VALUE_KEYS = ("value", "default", "command", "content", "path",
+                        "text", "input", "arg", "description")
+    # JSON-schema scaffolding keys — never a recovered value (e.g. `type: string`
+    # must not be mistaken for the single string value of a bare `{'type':'string'}`).
+    _SCHEMA_META = frozenset({"type", "format", "enum", "items", "properties",
+                              "required", "title", "additionalproperties"})
+
+    @classmethod
+    def _unleak_str(cls, v):
+        if not isinstance(v, dict):
+            return v
+        for k in cls._LEAK_VALUE_KEYS:
+            if isinstance(v.get(k), str) and v[k].strip():
+                return v[k]
+        strs = [x for k, x in v.items()
+                if k not in cls._SCHEMA_META and isinstance(x, str) and x.strip()]
+        return strs[0] if len(strs) == 1 else ""
+
+    @classmethod
+    def _clean_args(cls, args):
+        if not isinstance(args, dict):
+            return args
+        return {k: cls._unleak_str(v) for k, v in args.items()}
+
     @classmethod
     def _coerce_call(cls, obj, valid_names) -> dict | None:
         """Turn a decoded JSON object into a `{"name","arguments"}` call IF it
@@ -243,7 +274,7 @@ class OllamaProvider:
                 args = {}
         if not isinstance(args, dict):
             args = {}
-        return {"name": name, "arguments": args}
+        return {"name": name, "arguments": cls._clean_args(args)}
 
     @classmethod
     def _extract_text_tool_calls(
