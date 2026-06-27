@@ -97,6 +97,11 @@ def make_bridge(provider, workdir: str):
         b._chat.append("[inject] " + " ; ".join(cmds))
 
     b._inject = cap_inject
+
+    async def cap_sbx_input(ws, data):  # PTY-mirror frames — broker-only in prod
+        b._chat.append("[pty] " + data.decode(errors="replace").rstrip("\n"))
+
+    b._send_sbx_input = cap_sbx_input
     return b
 
 
@@ -157,7 +162,7 @@ async def main() -> int:
     print("[preflight] probing tool support…", flush=True)
     t0 = time.monotonic()
     try:
-        text, calls = await asyncio.to_thread(
+        text, calls, _usage = await asyncio.to_thread(
             provider.complete_with_tools,
             "You are a test.",
             [{"role": "user", "content": "Call run_shell to echo hi."}],
