@@ -606,22 +606,27 @@ class OperatorBridge(Client):
         dry_run = bool(req.get("dry_run", True))
         skip_perms = bool(req.get("skip_permissions", False))
         config_dir = req.get("config_dir")
+        try:
+            runner = boot.get_runner(req.get("runner"))
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
 
         stop = req.get("stop") or None
         directive = boot.compose_directive(objective, room, child_budget, stop=stop)
         argv = boot.build_run_argv(directive, skip_permissions=skip_perms,
-                                   config_dir=config_dir)
-        creds = boot.plan_creds(config_dir or "~", allow=allow_creds)
+                                   config_dir=config_dir, runner=runner)
+        creds = boot.plan_creds(config_dir or "~", allow=allow_creds, runner=runner)
+        present = boot.runner_present(runner)
         plan = {"argv": argv, "budget": child_budget.as_dict(), "creds": creds,
                 "target": req.get("target", "host"),
-                "claude_present": boot.claude_present()}
+                "runner": runner.name, "runner_present": present}
 
         if dry_run:
             return {"ok": True, "dry_run": True, "plan": plan}
 
-        if not boot.claude_present():
-            return {"ok": False, "error": "claude CLI not installed",
-                    "install_plan": boot.install_plan(), "plan": plan}
+        if not present:
+            return {"ok": False, "error": f"{runner.name} CLI not installed",
+                    "install_plan": boot.install_plan(runner=runner), "plan": plan}
 
         # Carry creds only behind the explicit gate.
         if creds.get("staged"):
@@ -638,7 +643,7 @@ class OperatorBridge(Client):
         try:
             logf = open(self.session.dir / f"spawn-{self.seq + 1}.log", "a")  # noqa: SIM115
             proc = subprocess.Popen(
-                argv, env=boot.child_env(config_dir),
+                argv, env=boot.child_env(config_dir, runner=runner),
                 stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
                 start_new_session=True, close_fds=True)
         except OSError as e:

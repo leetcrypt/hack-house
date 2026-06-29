@@ -87,11 +87,15 @@ def _build_parser() -> argparse.ArgumentParser:
     gt.add_argument("--out", default=None, help="write to this local path (else stdout)")
     gt.add_argument("--session", default=None)
 
-    sp = sub.add_parser("spawn", help="spawn a nested Claude operator (budgeted)")
+    sp = sub.add_parser("spawn", help="spawn a nested operator (budgeted)")
     sp.add_argument("objective", help="what the nested operator should achieve")
     sp.add_argument("--room-host", required=True)
     sp.add_argument("--room-port", type=int, required=True)
     sp.add_argument("--room-name", default="operator")
+    sp.add_argument("--runner", default="claude",
+                    choices=["claude", "codex", "gemini", "cmd"],
+                    help="which agent CLI to spawn as the child operator "
+                         "(default: claude; 'cmd' reads $HH_OPERATOR_CMD)")
     sp.add_argument("--stop", action="append", default=None,
                     help="a stop condition (repeatable)")
     sp.add_argument("--target", choices=["host"], default="host")
@@ -366,6 +370,7 @@ def _run_spawn(args) -> int:
         "op": "spawn", "objective": args.objective,
         "room": {"host": args.room_host, "port": args.room_port,
                  "name": args.room_name},
+        "runner": args.runner,
         "stop": args.stop, "target": args.target,
         "config_dir": args.config_dir, "allow_creds": args.allow_creds,
         "skip_permissions": args.skip_permissions, "dry_run": not args.go})

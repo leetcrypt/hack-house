@@ -7,6 +7,7 @@ Each test builds the bridge *inside* its own ``asyncio.run`` so the bridge's
 import sys
 import asyncio
 import json
+import os
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -333,6 +334,95 @@ def test_build_run_argv_flags():
     assert "--dangerously-skip-permissions" in argv
     argv = boot.build_run_argv("do x")
     assert "--dangerously-skip-permissions" not in argv
+
+
+# ── runner registry (P3): model-agnostic spawn ───────────────────────────────
+def test_get_runner_default_and_unknown():
+    assert boot.get_runner().name == "claude"
+    assert boot.get_runner("codex").name == "codex"
+    import pytest
+    with pytest.raises(ValueError):
+        boot.get_runner("bogus")
+
+
+def test_build_run_argv_per_runner():
+    # claude default unchanged
+    assert boot.build_run_argv("do x")[:3] == ["claude", "-p", "do x"]
+    # codex: own subcommand + unattended flag
+    argv = boot.build_run_argv("do x", skip_permissions=True, runner="codex")
+    assert argv[:3] == ["codex", "exec", "do x"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    # gemini
+    assert boot.build_run_argv("do x", runner="gemini")[:3] == ["gemini", "-p", "do x"]
+    # back-compat: claude_bin override still honoured for the default runner
+    assert boot.build_run_argv("do x", claude_bin="/opt/claude")[0] == "/opt/claude"
+
+
+def test_cmd_runner_template():
+    import os
+    os.environ["HH_OPERATOR_CMD"] = "mycli --go {directive}"
+    try:
+        assert boot.build_run_argv("do x", runner="cmd") == ["mycli", "--go", "do x"]
+    finally:
+        del os.environ["HH_OPERATOR_CMD"]
+    # no {directive} placeholder → directive appended
+    os.environ["HH_OPERATOR_CMD"] = "mycli run"
+    try:
+        assert boot.build_run_argv("do x", runner="cmd") == ["mycli", "run", "do x"]
+    finally:
+        del os.environ["HH_OPERATOR_CMD"]
+    # missing template env → clear error
+    import pytest
+    with pytest.raises(ValueError):
+        boot.build_run_argv("do x", runner="cmd")
+
+
+def test_install_plan_per_runner():
+    assert boot.install_plan({"has_npm": True}, runner="codex")[0] == \
+        ["npm", "install", "-g", "@openai/codex"]
+    assert boot.install_plan({"has_npm": True}, runner="gemini")[0] == \
+        ["npm", "install", "-g", "@google/gemini-cli"]
+    # generic cmd runner has no npm package → manual install
+    assert boot.install_plan({"has_npm": True}, runner="cmd") == []
+    # per-runner override env wins
+    import os
+    os.environ["HH_CODEX_INSTALL"] = "echo codex-install"
+    try:
+        assert boot.install_plan({"has_npm": True}, runner="codex") == \
+            [["sh", "-c", "echo codex-install"]]
+    finally:
+        del os.environ["HH_CODEX_INSTALL"]
+
+
+def test_child_env_uses_runner_config_var():
+    assert boot.child_env("/tmp/cd")["CLAUDE_CONFIG_DIR"] == "/tmp/cd"
+    assert boot.child_env("/tmp/cd", runner="codex")["CODEX_HOME"] == "/tmp/cd"
+    # claude's config var is not set under a different runner
+    assert boot.child_env("/tmp/cd", runner="codex").get("CLAUDE_CONFIG_DIR") == \
+        os.environ.get("CLAUDE_CONFIG_DIR")
+
+
+def test_spawn_dry_run_honours_runner():
+    async def go():
+        b = _bridge("oracle")
+        b.budget = boot.Budget(depth=1, fanout=1, cost_usd=2.0)
+        r = await b._op_spawn({"objective": "scout", "runner": "codex",
+                               "room": {"host": "h", "port": 7, "name": "kid"},
+                               "dry_run": True})
+        assert r["ok"] and r["plan"]["runner"] == "codex"
+        assert r["plan"]["argv"][0] == "codex"
+        assert "runner_present" in r["plan"]
+    asyncio.run(go())
+
+
+def test_spawn_rejects_unknown_runner():
+    async def go():
+        b = _bridge("oracle")
+        b.budget = boot.Budget(depth=1, fanout=1, cost_usd=2.0)
+        r = await b._op_spawn({"objective": "x", "runner": "bogus",
+                               "room": {"host": "h", "port": 7}})
+        assert r["ok"] is False and "unknown runner" in r["error"]
+    asyncio.run(go())
 
 
 # ── spawn op: gating + dry-run ────────────────────────────────────────────

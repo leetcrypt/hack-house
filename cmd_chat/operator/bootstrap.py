@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -112,20 +113,110 @@ def claude_present() -> bool:
     return shutil.which("claude") is not None
 
 
-def install_plan(sysinfo: dict | None = None) -> list[list[str]]:
-    """Ordered candidate commands to get the `claude` CLI onto the system.
+# ── runner registry ──────────────────────────────────────────────────────────
+# A *runner* captures everything that varies by which agent CLI we spawn as the
+# nested operator. The Claude path stays the default and byte-identical; other
+# CLIs are first-class but **best-effort** — their exact flags/creds paths are
+# meant to be pinned per-site via the override env vars (or routed through the
+# generic ``cmd`` runner). Only ``claude`` is validated end-to-end today.
+@dataclass(frozen=True)
+class Runner:
+    name: str
+    bin: str                                    # executable to locate / invoke
+    prompt_flags: tuple[str, ...] = ("-p",)     # flag(s) that precede the directive
+    unattended_flags: tuple[str, ...] = ()      # appended when skip_permissions
+    npm_package: str | None = None              # for npm-installable CLIs
+    install_env: str | None = None              # env var holding a full install cmd
+    cmd_env: str | None = None                  # generic template env var (the 'cmd' runner)
+    creds_path: str | None = None               # ~-relative source credential file
+    config_env: str | None = None               # env var for an isolated config dir
 
-    Honours $HH_CLAUDE_INSTALL (a full shell command) first so a site can pin
-    its own channel. Otherwise prefers the documented npm package; if npm is
-    missing, prefix the distro's node install. We never fabricate a download
-    URL — if none of these apply the caller surfaces "install claude manually"."""
-    override = os.environ.get("HH_CLAUDE_INSTALL")
+    def present(self) -> bool:
+        return bool(self.bin) and shutil.which(self.bin) is not None
+
+    def argv(self, directive: str, *, skip_permissions: bool = False) -> list[str]:
+        """Launch argv for this runner. The generic ``cmd`` runner reads a full
+        command template from ``$cmd_env`` and substitutes ``{directive}``;
+        everything else is ``[bin, *prompt_flags, directive] (+ unattended)``."""
+        if self.cmd_env:
+            tmpl = os.environ.get(self.cmd_env)
+            if not tmpl:
+                raise ValueError(
+                    f"runner '{self.name}' needs ${self.cmd_env} set to a command "
+                    "template (use {directive} as the placeholder)"
+                )
+            if "{directive}" in tmpl:
+                return [p.replace("{directive}", directive) for p in shlex.split(tmpl)]
+            return [*shlex.split(tmpl), directive]
+        a = [self.bin, *self.prompt_flags, directive]
+        if skip_permissions:
+            a += list(self.unattended_flags)
+        return a
+
+    def creds_source(self) -> Path | None:
+        if not self.creds_path:
+            return None
+        p = Path(self.creds_path).expanduser()
+        return p if p.exists() else None
+
+
+RUNNERS: dict[str, Runner] = {
+    "claude": Runner(
+        "claude", "claude", ("-p",), ("--dangerously-skip-permissions",),
+        npm_package=CLAUDE_NPM_PACKAGE, install_env="HH_CLAUDE_INSTALL",
+        creds_path="~/.claude/.credentials.json", config_env="CLAUDE_CONFIG_DIR"),
+    # Best-effort defaults — override flags/install/creds via the env vars below
+    # or use the generic `cmd` runner if a CLI's interface differs.
+    "codex": Runner(
+        "codex", "codex", ("exec",), ("--dangerously-bypass-approvals-and-sandbox",),
+        npm_package="@openai/codex", install_env="HH_CODEX_INSTALL",
+        creds_path="~/.codex/auth.json", config_env="CODEX_HOME"),
+    "gemini": Runner(
+        "gemini", "gemini", ("-p",), ("--yolo",),
+        npm_package="@google/gemini-cli", install_env="HH_GEMINI_INSTALL",
+        creds_path="~/.gemini/oauth_creds.json", config_env="GEMINI_SYSTEM_MD"),
+    # Fully user-controlled escape hatch: $HH_OPERATOR_CMD is the launch template.
+    "cmd": Runner("cmd", "", cmd_env="HH_OPERATOR_CMD", install_env="HH_OPERATOR_INSTALL"),
+}
+
+
+def get_runner(runner: "Runner | str | None" = None) -> Runner:
+    """Resolve a runner by name (default ``claude``). Pass-through if already a
+    :class:`Runner`. Raises ``ValueError`` on an unknown name."""
+    if isinstance(runner, Runner):
+        return runner
+    r = RUNNERS.get(runner or "claude")
+    if r is None:
+        raise ValueError(
+            f"unknown runner '{runner}' (known: {', '.join(RUNNERS)})"
+        )
+    return r
+
+
+def runner_present(runner: "Runner | str | None" = None) -> bool:
+    return get_runner(runner).present()
+
+
+def install_plan(sysinfo: dict | None = None, *,
+                 runner: "Runner | str | None" = None) -> list[list[str]]:
+    """Ordered candidate commands to get the runner's CLI onto the system.
+
+    Honours the runner's install-override env (``$HH_CLAUDE_INSTALL`` for claude)
+    first so a site can pin its own channel. Otherwise prefers the runner's
+    documented npm package; if npm is missing, prefix the distro's node install.
+    We never fabricate a download URL — a runner with no npm package (e.g. the
+    generic ``cmd`` runner) returns ``[]`` and the caller surfaces "install
+    manually"."""
+    r = get_runner(runner)
+    override = os.environ.get(r.install_env) if r.install_env else None
     if override:
         return [["sh", "-c", override]]
+    if not r.npm_package:
+        return []
     info = sysinfo or detect_system()
     plans: list[list[str]] = []
     if info.get("has_npm"):
-        plans.append(["npm", "install", "-g", CLAUDE_NPM_PACKAGE])
+        plans.append(["npm", "install", "-g", r.npm_package])
     else:
         mgr = info.get("pkg_manager")
         node_install = {
@@ -138,31 +229,38 @@ def install_plan(sysinfo: dict | None = None) -> list[list[str]]:
         }.get(mgr)
         if node_install:
             plans.append(node_install)
-            plans.append(["npm", "install", "-g", CLAUDE_NPM_PACKAGE])
+            plans.append(["npm", "install", "-g", r.npm_package])
     return plans
 
 
 # ── credentials (gated) ─────────────────────────────────────────────────────
-def creds_source() -> Path | None:
-    """The parent session's own OAuth/API credentials file, if present."""
-    p = Path.home() / ".claude" / ".credentials.json"
-    return p if p.exists() else None
+def creds_source(runner: "Runner | str | None" = None) -> Path | None:
+    """The parent session's own credentials file for the runner, if present
+    (defaults to Claude's ``~/.claude/.credentials.json``)."""
+    return get_runner(runner).creds_source()
 
 
-def plan_creds(dest_home: str | os.PathLike, *, allow: bool) -> dict:
+def plan_creds(dest_home: str | os.PathLike, *, allow: bool,
+               runner: "Runner | str | None" = None) -> dict:
     """Decide whether to carry credentials into a child's config dir.
 
     Default (``allow=False``) → carry nothing; the child must authenticate
-    itself (`claude` interactive login or its own $ANTHROPIC_API_KEY). Only when
-    the operator *explicitly* opts in do we stage a copy of our own creds — and
-    only into a path we were handed. This function plans; the bridge performs the
-    copy so the side effect stays behind one audited flag."""
+    itself (its own interactive login or API key). Only when the operator
+    *explicitly* opts in do we stage a copy of our own creds — and only into a
+    path we were handed. The destination mirrors the runner's own creds layout
+    under ``dest_home``. This function plans; the bridge performs the copy so the
+    side effect stays behind one audited flag."""
     if not allow:
         return {"staged": False, "reason": "creds gating on — child authenticates itself"}
-    src = creds_source()
+    r = get_runner(runner)
+    src = r.creds_source()
     if src is None:
         return {"staged": False, "reason": "no parent credentials to carry"}
-    dest = Path(dest_home) / ".claude" / ".credentials.json"
+    try:
+        rel = Path(r.creds_path).expanduser().relative_to(Path.home())
+    except ValueError:
+        rel = Path(Path(r.creds_path).name)
+    dest = Path(dest_home) / rel
     return {"staged": True, "src": str(src), "dest": str(dest)}
 
 
@@ -195,21 +293,29 @@ def compose_directive(objective: str, room: dict, budget: Budget,
 
 def build_run_argv(directive: str, *, skip_permissions: bool = False,
                    config_dir: str | None = None,
+                   runner: "Runner | str | None" = None,
                    claude_bin: str = "claude") -> list[str]:
-    """argv to launch a headless nested Claude session. `skip_permissions` maps
-    to Claude Code's unattended flag (only for trusted, sandboxed autonomy);
-    `config_dir` points the child at an isolated $CLAUDE_CONFIG_DIR so its creds
-    and state don't collide with the parent."""
-    argv = [claude_bin, "-p", directive]
-    if skip_permissions:
-        argv.append("--dangerously-skip-permissions")
-    return argv
+    """argv to launch a headless nested operator session for the chosen runner
+    (default ``claude``). `skip_permissions` maps to the runner's unattended flag
+    (only for trusted, sandboxed autonomy); `config_dir` is applied via
+    :func:`child_env`, not the argv. `claude_bin` overrides the executable for the
+    default claude runner (back-compat)."""
+    r = get_runner(runner)
+    if r.name == "claude" and claude_bin != "claude":
+        argv = [claude_bin, *r.prompt_flags, directive]
+        if skip_permissions:
+            argv += list(r.unattended_flags)
+        return argv
+    return r.argv(directive, skip_permissions=skip_permissions)
 
 
-def child_env(config_dir: str | None = None) -> dict:
-    """Environment for the child process. Isolates its config dir when given so
-    a nested session's auth/state is its own."""
+def child_env(config_dir: str | None = None, *,
+              runner: "Runner | str | None" = None) -> dict:
+    """Environment for the child process. Isolates its config dir when given (via
+    the runner's config-dir env var, e.g. $CLAUDE_CONFIG_DIR) so a nested
+    session's auth/state is its own."""
     env = dict(os.environ)
-    if config_dir:
-        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    r = get_runner(runner)
+    if config_dir and r.config_env:
+        env[r.config_env] = str(config_dir)
     return env
