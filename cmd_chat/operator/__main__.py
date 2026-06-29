@@ -109,6 +109,33 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="actually launch (default is a dry-run plan)")
     sp.add_argument("--session", default=None)
 
+    # ── harness-mode operator (drive the room with any function-calling model) ──
+    op = sub.add_parser("operate",
+                        help="run a function-calling model as the operator brain "
+                             "(native loop over the bridge verbs)")
+    op.add_argument("--objective", required=True,
+                    help="what this operator should achieve in the room")
+    op.add_argument("--profile", default=None,
+                    help="named models.toml profile (e.g. local, groq-llama)")
+    op.add_argument("--provider", default=None,
+                    help="provider spec when not using --profile "
+                         "(ollama|anthropic|openai|module:Class)")
+    op.add_argument("--model", default=None, help="model name/id")
+    op.add_argument("--base-url", default=None, help="OpenAI-compatible base URL")
+    op.add_argument("--host", default=None, help="Ollama host URL")
+    op.add_argument("--stop", action="append", default=None,
+                    help="a stop condition (repeatable)")
+    op.add_argument("--max-turns", type=int, default=None,
+                    help="ceiling on model turns (default 12)")
+    op.add_argument("--token-ceiling", type=int, default=None,
+                    help="cumulative prompt+completion token hard stop (default 20000)")
+    op.add_argument("--leave-on-done", action="store_true",
+                    help="`down` the daemon when the objective is met")
+    op.add_argument("--depth", type=int, default=1)
+    op.add_argument("--fanout", type=int, default=2)
+    op.add_argument("--cost", type=float, default=5.0)
+    op.add_argument("--session", default=None)
+
     sc = sub.add_parser("screen", help="print the relayed sandbox terminal buffer")
     sc.add_argument("--tail", type=int, default=None, help="last N bytes only")
     sc.add_argument("--ansi", action="store_true", help="keep ANSI codes (raw)")
@@ -378,6 +405,79 @@ def _run_spawn(args) -> int:
     return 0 if resp.get("ok") else 1
 
 
+def _build_operate_provider(args):
+    """Resolve a Provider from --profile OR --provider/--model (+ endpoint flags).
+    Returns the provider or exits with a clear message."""
+    from cmd_chat.ai import load_profiles, make_provider, provider_from_profile, preflight
+    if args.profile:
+        profs = load_profiles()
+        prof = profs.get(args.profile)
+        if prof is None:
+            avail = ", ".join(sorted(profs)) or "(none found)"
+            print(f"no profile '{args.profile}' — available: {avail}", file=sys.stderr)
+            sys.exit(2)
+        provider = provider_from_profile(prof, name=args.profile, model=args.model,
+                                         base_url=args.base_url)
+    elif args.provider:
+        opts = {}
+        if args.base_url:
+            opts["base_url"] = args.base_url
+        if args.host:
+            opts["host"] = args.host
+        provider = make_provider(args.provider, model=args.model, **opts)
+    else:
+        print("operate needs --profile NAME or --provider SPEC --model M",
+              file=sys.stderr)
+        sys.exit(2)
+    ok, msg = preflight(provider)
+    if not ok:
+        print(f"preflight failed: {msg}", file=sys.stderr)
+        sys.exit(2)
+    return provider
+
+
+def _run_operate(args) -> int:
+    from .bootstrap import Budget
+    from .harness import OperatorHarness
+
+    sess = resolve(getattr(args, "session", None))
+    if not sess.sock_path.exists():
+        print(f"no live bridge for session '{sess.name}' (run `up` first)",
+              file=sys.stderr)
+        return 2
+    # Confirm we're connected and learn our own room name (used to filter echoes).
+    try:
+        st = request(sess.sock_path, {"op": "status"}, read_timeout=5)
+    except BridgeUnreachable as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    if not st.get("connected"):
+        print("bridge is up but not connected to the room yet", file=sys.stderr)
+        return 2
+
+    provider = _build_operate_provider(args)
+    budget = Budget(depth=args.depth, fanout=args.fanout, cost_usd=args.cost)
+    kw = {}
+    if args.max_turns is not None:
+        kw["max_turns"] = args.max_turns
+    if args.token_ceiling is not None:
+        kw["token_ceiling"] = args.token_ceiling
+    harness = OperatorHarness(
+        provider=provider, sock_path=str(sess.sock_path),
+        objective=args.objective, stop=args.stop, budget=budget,
+        me=st.get("name", "operator"), **kw)
+    result = harness.run()
+    print(json.dumps({"final": result.final, "reason": result.reason,
+                      "turns": result.turns, "tokens": result.tokens,
+                      "tool_calls": result.tool_calls}, indent=2))
+    if args.leave_on_done and result.reason == "done":
+        try:
+            request(sess.sock_path, {"op": "down"}, read_timeout=5)
+        except BridgeUnreachable:
+            pass
+    return 0 if result.reason in ("done", "token-ceiling", "turn-cap") else 1
+
+
 def _run_keys(args) -> int:
     from . import sandbox as sbx
     if args.help_keys:
@@ -489,6 +589,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_keys(args)
     if verb == "spawn":
         return _run_spawn(args)
+    if verb == "operate":
+        return _run_operate(args)
     if verb == "manifest":
         return _run_manifest(args)
     if verb == "registry":
