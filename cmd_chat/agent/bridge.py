@@ -22,7 +22,7 @@ import websockets
 
 from ..client.client import Client
 from .memory import MemoryIndex
-from .providers import Msg, Provider, ToolsUnsupported
+from cmd_chat.ai.providers import Msg, Provider, ToolsUnsupported
 
 DEFAULT_SYSTEM = (
     "You are {name}, a helpful AI participant in an encrypted terminal chat "
