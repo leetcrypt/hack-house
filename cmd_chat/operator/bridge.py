@@ -612,7 +612,8 @@ class OperatorBridge(Client):
             return {"ok": False, "error": str(e)}
 
         stop = req.get("stop") or None
-        directive = boot.compose_directive(objective, room, child_budget, stop=stop)
+        directive = boot.compose_directive(objective, room, child_budget,
+                                            stop=stop, runner=runner)
         argv = boot.build_run_argv(directive, skip_permissions=skip_perms,
                                    config_dir=config_dir, runner=runner)
         creds = boot.plan_creds(config_dir or "~", allow=allow_creds, runner=runner)

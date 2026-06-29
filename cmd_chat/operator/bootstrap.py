@@ -265,17 +265,37 @@ def plan_creds(dest_home: str | os.PathLike, *, allow: bool,
 
 
 # ── directive + run argv ────────────────────────────────────────────────────
+def load_capabilities() -> str:
+    """The portable Layer-1 capabilities prompt (`CAPABILITIES.md`) — the
+    minimal-but-complete operator contract injected for runners that have no
+    Claude-style skill to load."""
+    return Path(__file__).with_name("CAPABILITIES.md").read_text()
+
+
 def compose_directive(objective: str, room: dict, budget: Budget,
-                      stop: list[str] | None = None) -> str:
-    """The prompt the nested Claude runs under `claude -p`. Tells it to use the
-    hh-operator skill, where to join, what to achieve, when to stop, and the
-    recursion budget it inherits (so it self-limits its own spawns)."""
+                      stop: list[str] | None = None,
+                      runner: "Runner | str | None" = None) -> str:
+    """The prompt the nested operator runs headlessly. Tells it where to join,
+    what to achieve, when to stop, and the recursion budget it inherits (so it
+    self-limits its own spawns).
+
+    Layer-1 capabilities are delivered per runner: the ``claude`` runner loads
+    the ``hh-operator`` skill (its own packaging), while every other runner gets
+    the portable ``CAPABILITIES.md`` prepended inline — same contract, no skill
+    machinery required."""
+    r = get_runner(runner)
     host, port = room.get("host", "?"), room.get("port", "?")
     name = room.get("name", "operator")
     stop = stop or ["objective met", "owner says stop/leave", "idle past remit"]
+    if r.name == "claude":
+        preamble = ("Use the hh-operator skill. You are an autonomous operator "
+                    "joining a hack-house room.")
+    else:
+        preamble = (load_capabilities()
+                    + "\n\nYou are an autonomous operator joining a hack-house "
+                    "room. Operate per the capabilities above.")
     lines = [
-        "Use the hh-operator skill. You are an autonomous operator joining a "
-        "hack-house room.",
+        preamble,
         f"Join: `hh-bridge up {host} {port} {name}` "
         f"(password via room config; add --no-tls for plain ws).",
         f"Objective: {objective}",

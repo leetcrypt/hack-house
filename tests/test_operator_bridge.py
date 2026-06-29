@@ -323,6 +323,19 @@ def test_compose_directive_carries_objective_stop_budget():
     assert "depth=1" in d and "fanout=2" in d
 
 
+def test_compose_directive_injects_capabilities_for_non_claude():
+    d = boot.compose_directive(
+        "map the room and report", {"host": "h", "port": 9, "name": "scout"},
+        boot.Budget(depth=1, fanout=2, cost_usd=3.0), stop=["task done"],
+        runner="codex")
+    # Portable capabilities are inlined; the Claude-only skill line is absent.
+    assert "hh-operator skill" not in d
+    assert boot.load_capabilities().split("\n", 1)[0] in d
+    assert "read" in d and "think" in d and "act" in d
+    assert "map the room and report" in d
+    assert "depth=1" in d and "fanout=2" in d
+
+
 def test_plan_creds_gated_off_by_default():
     off = boot.plan_creds("/tmp/child", allow=False)
     assert off["staged"] is False and "gating on" in off["reason"]
