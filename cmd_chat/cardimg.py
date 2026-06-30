@@ -281,6 +281,10 @@ def render_card_svg(card: Card, art_data_uri: str | None = None) -> str:
              f'No.{card.dex:03d} · {_esc(card.label)}{holo}</text>')
     p.append(f'<text x="{W-PAD-6}" y="40" text-anchor="end" font-size="15" '
              f'fill="#f4f6f8" font-weight="bold">PWR {card.power}</text>')
+    # status pill on the rarity ribbon's left (done = green check, else amber)
+    st_done = card.status in ("done", "complete", "completed")
+    st_col, st_txt = (("#3fae5a", f"✓ {card.status}") if st_done
+                      else ("#d8a23a", f"● {card.status or 'unknown'}"))
     # type badges (top-right under PWR)
     bx = W - PAD - 6
     for ty in reversed(card.types):
@@ -307,6 +311,12 @@ def render_card_svg(card: Card, art_data_uri: str | None = None) -> str:
     p.append(f'<text x="{W/2}" y="{ART_Y+ART_H-8}" text-anchor="middle" font-size="14" '
              f'fill="#0c0f14" font-weight="bold" letter-spacing="2">'
              f'{card.rarity.upper()}</text>')
+    # status pill (top-left corner of the art window)
+    sw = 22 + len(st_txt) * 7
+    p.append(f'<rect x="{ART_X+8}" y="{ART_Y+8}" width="{sw}" height="20" rx="10" '
+             f'fill="{st_col}" opacity="0.92"/>')
+    p.append(f'<text x="{ART_X+8+sw/2}" y="{ART_Y+22}" text-anchor="middle" '
+             f'font-size="11" fill="#0c0f14" font-weight="bold">{_esc(st_txt)}</text>')
     # stat bars
     y0 = ART_Y + ART_H + 26
     bw = W - 2 * (PAD + 8)
@@ -368,6 +378,51 @@ def render_card(card: Card, out_dir: Path, backend: str, fmt: str) -> Path:
     return svg_path
 
 
+# ── browser gallery ───────────────────────────────────────────────────────────
+RARITY_ORDER = {"Legendary": 0, "Epic": 1, "Rare": 2, "Uncommon": 3, "Common": 4}
+
+
+def build_gallery(cards: list[Card], out_dir: Path, backend: str) -> Path:
+    """Render every card as an inline SVG and lay them out in one index.html."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cards = sorted(cards, key=lambda c: (RARITY_ORDER.get(c.rarity, 9), -c.power))
+    tally: dict[str, int] = {}
+    cells = []
+    for c in cards:
+        art_uri = None
+        if backend != "sigil":
+            try:
+                art_uri = fetch_art_data_uri(c, backend)
+            except Exception as e:
+                print(f"  ! {c.label}: {backend} art failed ({e}); sigil", file=sys.stderr)
+        tally[c.rarity] = tally.get(c.rarity, 0) + 1
+        cells.append(f'<div class="card">{render_card_svg(c, art_uri)}</div>')
+        print(f"  rendered {c.rarity:<10} {c.label}")
+    spread = " · ".join(f"{n}× {r}" for r, n in
+                        sorted(tally.items(), key=lambda kv: RARITY_ORDER.get(kv[0], 9)))
+    html = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<style>'
+        'body{margin:0;background:#0a0c10;color:#e8eaed;'
+        'font-family:DejaVu Sans,Arial,sans-serif}'
+        '.hd{padding:28px 36px 8px}'
+        '.hd h1{margin:0;font-size:30px}'
+        '.hd p{margin:6px 0 0;color:#9aa0a8;font-size:15px}'
+        '.grid{display:grid;grid-template-columns:repeat(4,500px);gap:26px;'
+        'padding:24px 36px 40px;justify-content:center}'
+        '.card svg{width:500px;height:700px;display:block;'
+        'border-radius:22px;box-shadow:0 8px 30px rgba(0,0,0,.6)}'
+        '@media(max-width:2100px){.grid{grid-template-columns:repeat(3,500px)}}'
+        '</style></head><body>'
+        f'<div class="hd"><h1>hack-house VM Cardex</h1>'
+        f'<p>{len(cards)} saved VMs · {spread}</p></div>'
+        f'<div class="grid">{"".join(cells)}</div>'
+        '</body></html>')
+    idx = out_dir / "index.html"
+    idx.write_text(html)
+    return idx
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="hh-cardimg",
@@ -381,6 +436,8 @@ def main(argv=None) -> int:
     p.add_argument("--out", default="cards", help="output directory")
     p.add_argument("--prompt", action="store_true",
                    help="just print the AI-art prompt(s) and exit")
+    p.add_argument("--gallery", action="store_true",
+                   help="emit a single browser index.html grid of all cards")
     args = p.parse_args(argv)
 
     entries = load_entries(Path(args.registry))
@@ -400,6 +457,10 @@ def main(argv=None) -> int:
         return 0
 
     out = Path(args.out)
+    if args.gallery:
+        idx = build_gallery(cards, out, args.art)
+        print(f"gallery → {idx}")
+        return 0
     for c in cards:
         path = render_card(c, out, args.art, args.format)
         print(f"{c.rarity:<10} {c.label:<22} → {path}")

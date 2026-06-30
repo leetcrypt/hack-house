@@ -221,6 +221,7 @@ class Card:
     stats: dict = field(default_factory=dict)   # HP/Attack/Defense/SpAtk/Speed/SpDef
     subscores: dict = field(default_factory=dict)
     shiny: bool = False             # deterministic "holo pull"
+    status: str = ""                # VM build status (done / in_progress / …)
     flavor: str = ""
 
     def to_dict(self) -> dict:
@@ -280,8 +281,10 @@ def card_from_entry(entry: dict, manifest: dict | None = None) -> Card:
     flavor = (f"A {rarity.lower()} {ty}-type born from {purpose.rstrip('.')}. "
               f"Base stat total {sum(stats.values())}.")
 
+    status = (entry.get("status") or "unknown").strip().lower()
     return Card(label=label, name=name, dex=_dex(label), rarity=rarity, power=power,
-                types=types, stats=stats, subscores=subs, shiny=shiny, flavor=flavor)
+                types=types, stats=stats, subscores=subs, shiny=shiny,
+                status=status, flavor=flavor)
 
 
 # ── registry I/O + CLI ────────────────────────────────────────────────────────
