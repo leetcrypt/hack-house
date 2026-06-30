@@ -5,6 +5,7 @@ use crate::layout::{Dir, Layout, Resize};
 use crate::net::{self, Session};
 use crate::registry;
 use crate::sbx;
+use crate::snapshot;
 use crate::theme::Theme;
 use crate::ui;
 use anyhow::Result;
@@ -2321,7 +2322,7 @@ fn handle_command(
                             // Index the snapshot in the host-global registry, caching
                             // its .hh-agent manifest summary. Best-effort: an index
                             // hiccup must never fail the save the user just asked for.
-                            register_saved_snapshot(be, &name, &label, &created_by);
+                            snapshot::register_saved_snapshot(be, &name, &label, &created_by);
                             Ok::<String, anyhow::Error>(desc)
                         })
                         .await;
@@ -2496,7 +2497,7 @@ fn handle_command(
                         let tx = app_tx.clone();
                         tokio::spawn(async move {
                             let res = tokio::task::spawn_blocking(move || {
-                                publish_snapshot(&label, &tags)
+                                snapshot::publish_snapshot(&label, &tags)
                             })
                             .await;
                             let _ = match res {
@@ -3102,48 +3103,6 @@ fn closest<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
         .map(|(_, c)| c)
 }
 
-/// Record a freshly-saved snapshot in the host-global VM registry, caching the
-/// `.hh-agent` manifest summary read out of the (still-running, for OCI backends)
-/// container. Best-effort — never panics, never fails the save. Blocking; call
-/// from inside `spawn_blocking`.
-fn register_saved_snapshot(be: sbx::Backend, name: &str, label: &str, created_by: &str) {
-    let (artifact_kind, artifact_ref, size_bytes, manifest) = match be {
-        sbx::Backend::Docker | sbx::Backend::Podman => {
-            let engine = be.engine();
-            let image = format!("{}:{}", sbx::SNAP_REPO, label);
-            let size = oci_image_size(engine, &image);
-            let manifest = registry::read_container_manifest(engine, name, "/root");
-            ("image".to_string(), image, size, manifest)
-        }
-        // Multipass snapshots live in multipass's own store; the instance is
-        // powered off by save time, so there's no container to read a manifest
-        // from. Record the pointer; reconcile leaves it (no image to probe).
-        sbx::Backend::Multipass => ("snapshot".to_string(), label.to_string(), None, None),
-        sbx::Backend::Local => return, // nothing persistent to index
-    };
-    let (purpose, status, todo) = manifest
-        .as_deref()
-        .map(registry::scan_manifest)
-        .unwrap_or_default();
-    let entry = registry::Entry {
-        label: label.to_string(),
-        backend: be.engine().to_string(),
-        artifact_kind,
-        artifact_ref,
-        size_bytes,
-        created_unix: registry::now_unix(),
-        created_by: created_by.to_string(),
-        repo: registry::cwd_repo(),
-        purpose,
-        status,
-        todo,
-        ..Default::default()
-    };
-    if let Err(e) = registry::upsert(entry) {
-        eprintln!("registry upsert failed for '{label}': {e}");
-    }
-}
-
 /// Load a pulled `hh-snap-<label>.tar` into the local engine and record it in the
 /// host registry, scraping the `.hh-agent` manifest that rides inside the image so
 /// the receiver's `/sbx browse`/`load` know what the VM is for. Blocking — runs
@@ -3160,7 +3119,7 @@ fn register_received_snapshot(tar: &std::path::Path) -> anyhow::Result<String> {
         backend: engine.clone(),
         artifact_kind: "image".to_string(),
         artifact_ref: image.clone(),
-        size_bytes: oci_image_size(&engine, &image),
+        size_bytes: snapshot::oci_image_size(&engine, &image),
         created_unix: registry::now_unix(),
         created_by: "pulled".to_string(),
         repo: registry::cwd_repo(),
@@ -3177,54 +3136,6 @@ fn register_received_snapshot(tar: &std::path::Path) -> anyhow::Result<String> {
     Ok(format!(
         "† imported snapshot ‘{label}’ — `/sbx load {label}` to boot it · `/sbx browse` for details"
     ))
-}
-
-/// Mark a saved snapshot shareable and ensure it has a portable, sendable file.
-/// File-backed snaps (`.tar`/`.ova`) are already tradeable; image-backed snaps
-/// are exported to `hh-snapshots/hh-snap-<label>.tar` first so a peer can receive
-/// them over `/send`. Blocking — run off the UI thread. Returns a status line.
-fn publish_snapshot(label: &str, tags: &[String]) -> anyhow::Result<String> {
-    use anyhow::Context;
-    let entry = registry::get(label)
-        .with_context(|| format!("no saved VM labelled '{label}' — `/sbx browse` to list"))?;
-    let share_path = match entry.artifact_kind.as_str() {
-        // Already a standalone file the owner controls — send it as-is.
-        "file" => entry.artifact_ref.clone(),
-        // Lives only in the engine image store — export a portable copy.
-        "image" => {
-            let backend = sbx::Backend::parse(&entry.backend)
-                .with_context(|| format!("unknown backend '{}' for '{label}'", entry.backend))?;
-            sbx::export_image(backend, label)?
-                .to_string_lossy()
-                .into_owned()
-        }
-        other => anyhow::bail!(
-            "'{label}' is a {other} snapshot — only file/image snapshots are tradeable"
-        ),
-    };
-    let published = registry::publish(label, &share_path, tags)?;
-    let tagnote = if published.tags.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", published.tags.join(", "))
-    };
-    Ok(format!(
-        "✓ published '{label}'{tagnote} — shareable artifact at {share_path}; peers can `/sbx pull @<you> {label}`"
-    ))
-}
-
-/// Size in bytes of an OCI image (`<engine> image inspect … --format {{.Size}}`),
-/// or None if the engine/image isn't available. Blocking.
-fn oci_image_size(engine: &str, image: &str) -> Option<u64> {
-    let out = std::process::Command::new(engine)
-        .args(["image", "inspect", image, "--format", "{{.Size}}"])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
 }
 
 /// Does an OCI image still exist? Used to reconcile the registry so entries whose

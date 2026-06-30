@@ -105,12 +105,76 @@ fn store(reg: &Registry) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let text = serde_json::to_string_pretty(reg).context("serializing registry")?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    // Write to a per-process temp then atomically rename into place, so a reader
+    // (or a concurrent wave member taking the lock next) never observes a
+    // half-written file even if this process is killed mid-write.
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("committing {}", path.display()))?;
     Ok(())
+}
+
+/// How long a lockfile may sit before it's presumed stale (its holder died) and
+/// forcibly reclaimed. Generous enough for a slow `export_image` of a fat VM.
+const LOCK_STALE_SECS: u64 = 120;
+
+/// An advisory cross-process lock on the registry, held for the duration of one
+/// read-modify-write. Dropping it releases the lock (removes the lockfile).
+struct RegistryLock {
+    path: PathBuf,
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn lock_path() -> PathBuf {
+    registry_path().with_extension("lock")
+}
+
+/// Take the registry lock, spinning until it's free or presumed-stale. The lock
+/// is a `create_new` (O_EXCL) sentinel file — atomic across processes on a local
+/// filesystem — which lets concurrent `/loop` wave members serialize their
+/// registry writes instead of clobbering each other through last-writer-wins.
+fn acquire_lock() -> Result<RegistryLock> {
+    let path = lock_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(LOCK_STALE_SECS + 5);
+    loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", std::process::id());
+                return Ok(RegistryLock { path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Reclaim a lock whose holder appears to have died.
+                if let Ok(age) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                    if age.elapsed().map(|d| d.as_secs() > LOCK_STALE_SECS).unwrap_or(false) {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                }
+                if std::time::Instant::now() > deadline {
+                    anyhow::bail!(
+                        "registry locked (held >{LOCK_STALE_SECS}s) — another save/publish in progress?"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        }
+    }
 }
 
 /// Insert or replace the entry for `entry.label`.
 pub fn upsert(entry: Entry) -> Result<()> {
+    let _lock = acquire_lock()?;
     let mut reg = load();
     reg.entries.insert(entry.label.clone(), entry);
     store(&reg)
@@ -126,6 +190,7 @@ pub fn get(label: &str) -> Option<Entry> {
 /// `share_path` a peer can receive, merges in any `tags`, and flips `shareable`.
 /// Errors if the label isn't in the registry. Idempotent.
 pub fn publish(label: &str, share_path: &str, tags: &[String]) -> Result<Entry> {
+    let _lock = acquire_lock()?;
     let mut reg = load();
     let entry = reg
         .entries
@@ -173,6 +238,9 @@ pub fn list_shareable() -> Vec<Entry> {
 /// `image_exists` is injected so the engine probe stays out of this module's deps;
 /// it is asked only about `artifact_kind == "image"` entries.
 pub fn list_reconciled(image_exists: impl Fn(&str, &str) -> bool) -> Vec<Entry> {
+    // Best-effort lock: this prunes-and-stores, so serialize it against writers
+    // when we can, but never block a read-only listing if the lock is contended.
+    let _lock = acquire_lock().ok();
     let mut reg = load();
     let before = reg.entries.len();
     reg.entries.retain(|_, e| match e.artifact_kind.as_str() {
