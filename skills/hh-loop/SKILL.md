@@ -21,21 +21,29 @@ HH=".venv/bin/python -m cmd_chat.operator"        # the hh-bridge CLI
 HHBIN="hh/target/debug/hack-house"                # the Rust client + sbx CLI
 ```
 
-## What "high value" means — the brief framework
+## What "high value" means — the measurable rubric
 
-Every run is guided by the **same value rubric** so output is consistently
-useful, not busywork. A VM library contribution is high-value when it is:
+Value is **scored**, not vibes. `cmd_chat/cardex.py` mints every saved VM into a
+collectible card with a **PowerScore (0–1000)** = the sum of five sub-scores. The
+loop's job is to genuinely **maximize that score**, which it does by building
+deeper, more complete, better-described VMs — the rubric rewards real substance,
+so optimizing it *is* optimizing value. Target **Epic (≥650) / Legendary (≥825)**,
+not Rare. Score any candidate with `.venv/bin/python -m cmd_chat.cardex --label <l>`.
 
-1. **Reusable** — a ready-to-run capability, not a one-off script. Another
-   agent/human pulls it and it *just works*.
-2. **Self-describing** — carries a complete `.hh-agent` manifest: `purpose`,
-   `objective`, `usage[]` (how to run it), `setup[]`, and `status: done`.
-3. **Verified** — the capability is demonstrated working (tests / PoC green)
-   *before* save. Unverified work is not published.
-4. **Distinct** — fills a real gap. **Always `registry list` first**; never
-   duplicate an existing label/capability.
-5. **Bounded** — prefer what's in the base image (`localhost/hh-dev:slim`,
-   Kali/Parrot) so it builds fast and the artifact stays portable.
+| Axis | Cap | What earns it | How to max it **genuinely** |
+|---|---|---|---|
+| **completeness** | 25 | `status: done`, no open `todo`, no blockers | Finish the work. Leave `todo` **empty** at save (a dangling todo costs ~3 each). |
+| **reusability** | 20 | `shareable:true` + a real exported artifact | `sbx publish` so a portable **`.tar`** (`artifact_kind=file`, +6) exists, not just an image. |
+| **richness** | 20 | `purpose`+`objective` set, `usage[]`/`setup[]`, ≥3 tags | Write a real `purpose` **and** `objective`, stamp `usage[]`+`setup[]`, give **3 meaningful tags**. |
+| **pedigree** | 15 | provenance trail + a real `created_by` | Stamp **≥4 `--note` provenance entries** (each +3, cap 12) recording how it was built. |
+| **heft** | 20 | payload size over the ~128 MB base image | **Install genuinely useful real tooling + bake substantial curated datasets.** Heft is log-scaled: ~+70 MB of real payload ≈ Epic, +130 MB ≈ maxed. This is the #1 differentiator — pure-stdlib featherweight VMs cap out Rare. |
+
+So a high-value VM is also, by construction: **reusable** (ready-to-run, published
+`.tar`), **self-describing** (complete manifest), **verified** (PoC green *before*
+save — unverified work is never published), **distinct** (**always `registry list`
+first**; never duplicate a label/capability), and **substantial** (real software +
+real data, not a featherweight script). Stay **bounded** to the base image where
+practical so it still builds fast and stays portable.
 
 A **brief** is the per-run spec the operators receive:
 
@@ -83,11 +91,15 @@ $HH up 127.0.0.1 $PORT planner --password "$PW" --no-tls --session "$RUN"
 $HH sbx launch --image localhost/hh-dev:slim --engine podman
 # (in a real room the owner /grants; for a self-owned loop room you already drive it)
 
-# 2. stamp the VM's manifest up front (canonical metadata travels with the work)
+# 2. stamp the VM's manifest up front (canonical metadata travels with the work).
+#    Populate the RICHNESS + provenance axes here, not just purpose/objective.
 $HH manifest push --root /root --name "$LABEL" \
   --purpose "Recon kit — one-command host+service map" \
   --objective "build recon.sh that maps a target to report.md, verified" \
-  --intent "reusable recon VM for the library" --stop "verify criterion green"
+  --intent "reusable recon VM for the library" --stop "verify criterion green" \
+  --setup "apt/pip deps baked; wordlists + fingerprint DB under /root" \
+  --usage "./recon.sh <target>  →  writes report.md (open-port + service section)" \
+  --entrypoint "/root/recon.sh"
 
 # 3. spawn the team per topology (objective = brief + value rubric + save contract)
 $HH spawn "Join 127.0.0.1 $PORT as builder (--password $PW --no-tls). Use the \
@@ -96,10 +108,16 @@ Load /root/.hh-agent first. When built, say 'BUILD READY'." \
   --room-host 127.0.0.1 --room-port $PORT --room-name builder --go --skip-permissions
 # (3-operator briefs also spawn a tester that must emit PASS against `verify`)
 
-# 4. planner drives the review loop, then records done-state
+# 4. planner drives the review loop, then records done-state. Stamp a real
+#    provenance trail (≥4 --note, each +pedigree) and leave NO todo (completeness).
 $HH watch --for "PASS|verify (ok|green)" --in events --timeout 1800
 $HH manifest update --root /root --status done --progress "built + verified" \
-  --done "recon.sh works" --note "ready to publish"
+  --done "recon.sh works" --done "verify criterion green" \
+  --note "provisioned deps + datasets in localhost/hh-dev:slim" \
+  --note "implemented recon.sh + report generator" \
+  --note "ran in-sandbox VERIFY; open-port section present" \
+  --note "published shareable .tar to the registry"
+# (do NOT pass --todo at done; a dangling todo costs completeness points)
 ```
 
 ### Save + publish — canonical, headless, lock-safe
@@ -121,7 +139,14 @@ ls -la hh/hh-snapshots/hh-snap-"$LABEL".tar
 ```
 
 A run is **done** only when: `verify` is green, `manifest status: done`, the
-registry entry is `shareable: true`, and the `.tar` exists.
+registry entry is `shareable: true`, the `.tar` exists, **and the card scores at
+least Rare — aim Epic (≥650)**:
+
+```bash
+.venv/bin/python -m cmd_chat.cardex --label "$LABEL"   # check rarity/power
+# Rare-or-below on a finished VM usually means: thin payload (heft) or a
+# half-filled manifest (richness/pedigree). Add real tooling/data + provenance.
+```
 
 ## Recording a run (`--record`)
 
