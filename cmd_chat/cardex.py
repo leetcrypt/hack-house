@@ -32,12 +32,41 @@ BASE_MB = 128.0          # ~size of the empty hh-dev base image; payload = size 
 SUBSCORE_MAX = 100       # completeness+reusability+richness+pedigree+heft caps sum
 POWER_MAX = 1000         # PowerScore = subscore_sum * 10
 
+# Sub-score caps (sum == SUBSCORE_MAX). completeness/reusability are near-binary
+# "is it a real, shipped VM?" gates, so they're kept small; the discriminating
+# signal lives in richness (how self-describing + how rare its capabilities),
+# heft (installed payload), and pedigree — those carry most of the spread.
+COMP_MAX = 20.0
+REUSE_MAX = 15.0
+RICH_MAX = 30.0
+PED_MAX = 10.0
+HEFT_MAX = 25.0
+
+# Per-tag capability weight — rare/high-skill security capabilities are worth
+# more than generic ones, so a VM's "type rarity" pushes its richness (and thus
+# its rarity tier). Unlisted tags default to 1.5.
+CAPABILITY_WEIGHT = {
+    # marquee / rare offensive + IR capabilities
+    "exploit": 3.0, "pwn": 3.0, "c2": 3.0, "payload": 3.0, "malware": 3.0,
+    "crack": 3.0, "redteam": 3.0, "dfir": 3.0, "forensics": 3.0, "reverse": 3.0,
+    "ransomware": 3.0,
+    # solid mid-tier capabilities
+    "recon": 2.0, "osint": 2.0, "fuzz": 2.0, "brute": 2.0, "crypto": 2.0,
+    "tls": 2.0, "dns": 2.0, "yara": 2.0, "pcap": 2.0, "vuln": 2.0, "cve": 2.0,
+    "ids": 2.0, "threat": 2.0, "nmap": 2.0,
+    # generic / scaffolding tags
+    "dev": 1.0, "build": 1.0, "lib": 1.0, "http": 1.0, "web": 1.0, "log": 1.0,
+    "network": 1.0, "audit": 1.0, "blue": 1.0, "training": 1.0, "lab": 1.0,
+    "security": 1.0, "smoke": 0.0, "slice": 0.0,
+}
+
 # Rarity by absolute PowerScore cutoff (user choice: stable & reproducible).
+# Calibrated against the live library distribution so tiers actually spread.
 RARITY_TIERS = [
-    ("Legendary", 825),
-    ("Epic", 650),
-    ("Rare", 450),
-    ("Uncommon", 250),
+    ("Legendary", 720),
+    ("Epic", 660),
+    ("Rare", 540),
+    ("Uncommon", 380),
     ("Common", 0),
 ]
 
@@ -82,37 +111,47 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 # ── the five value sub-scores ────────────────────────────────────────────────
 def _completeness(status: str, todo: list, blockers: list) -> float:
+    """Is it a real, finished VM? Near-binary gate; small cap by design."""
     s = (status or "").strip().lower()
-    base = 25.0 if s in ("done", "complete", "completed") else (12.0 if s == "in_progress" else 0.0)
+    base = COMP_MAX if s in ("done", "complete", "completed") else (10.0 if s == "in_progress" else 0.0)
     base -= min(len(todo) * 3, 12)
     base -= len(blockers) * 5
-    return _clamp(base, 0, 25)
+    return _clamp(base, 0, COMP_MAX)
 
 
 def _reusability(shareable: bool, share_path: str, artifact_kind: str) -> float:
-    v = 14.0 if (shareable and share_path) else 0.0
-    v += {"file": 6.0, "image": 2.0, "snapshot": 2.0}.get(artifact_kind, 0.0)
-    return _clamp(v, 0, 20)
+    """Can another agent actually pull and reuse it?"""
+    v = 10.0 if (shareable and share_path) else 0.0
+    v += {"file": 5.0, "image": 3.0, "snapshot": 2.0}.get(artifact_kind, 0.0)
+    return _clamp(v, 0, REUSE_MAX)
 
 
 def _richness(purpose: str, objective: str, tags: list, has_usage: bool) -> float:
+    """The discriminating axis: how self-describing + how rare its capabilities.
+
+    Rewards prose depth (purpose/objective length), tag breadth, *and* the
+    capability-rarity of those tags (a c2/exploit VM out-scores a dev-lib one)."""
     v = 0.0
-    v += 5 if purpose.strip() else 0
-    v += 5 if objective.strip() else 0
-    v += min(len(tags) * 2, 6)
-    v += 4 if has_usage else 0
-    return _clamp(v, 0, 20)
+    v += min(len(purpose.split()) * 0.8, 8)            # purpose prose depth
+    v += 5 if objective.strip() else 0                  # has a stated objective
+    v += min(len(tags) * 1.5, 9)                        # tag breadth
+    cap = sum(CAPABILITY_WEIGHT.get(t.strip().lower(), 1.5) for t in tags)
+    v += min(cap, 8)                                    # capability rarity
+    v += 4 if has_usage else 0                          # documents how to run
+    return _clamp(v, 0, RICH_MAX)
 
 
 def _pedigree(provenance: list, created_by: str) -> float:
-    v = min(len(provenance) * 3, 12)
-    v += 3 if created_by.strip().lower() not in ("", "smoke", "pulled") else 0
-    return _clamp(v, 0, 15)
+    """How battle-tested / hand-built its lineage is."""
+    v = min(len(provenance) * 3, 8)
+    v += 2 if created_by.strip().lower() not in ("", "smoke", "pulled") else 0
+    return _clamp(v, 0, PED_MAX)
 
 
 def _heft(size_bytes: int) -> float:
+    """Installed payload over the empty base — log-scaled so giants don't run away."""
     payload_mb = max(0.0, (size_bytes or 0) / 1e6 - BASE_MB)
-    return _clamp(4.0 * math.log2(1 + payload_mb / 8.0), 0, 20)
+    return _clamp(5.0 * math.log2(1 + payload_mb / 6.0), 0, HEFT_MAX)
 
 
 def _rarity_of(power: int) -> str:
@@ -226,12 +265,12 @@ def card_from_entry(entry: dict, manifest: dict | None = None) -> Card:
     payload_mb = max(0.0, (entry.get("size_bytes") or 0) / 1e6 - BASE_MB)
     speed_raw = _clamp(1 - payload_mb / 256)
     stats = {
-        "HP":      _stat(floor + 0.70 * (0.6 * heft / 20 + 0.4 * comp / 25)),
+        "HP":      _stat(floor + 0.70 * (0.6 * heft / HEFT_MAX + 0.4 * comp / COMP_MAX)),
         "Attack":  _stat(floor + 0.70 * off),
-        "Defense": _stat(floor + 0.70 * (0.5 * dfn + 0.5 * comp / 25)),
-        "SpAtk":   _stat(floor + 0.70 * (rich / 20)),
+        "Defense": _stat(floor + 0.70 * (0.5 * dfn + 0.5 * comp / COMP_MAX)),
+        "SpAtk":   _stat(floor + 0.70 * (rich / RICH_MAX)),
         "Speed":   _stat(floor + 0.70 * speed_raw),
-        "SpDef":   _stat(floor + 0.70 * (0.6 * reuse / 20 + 0.4 * ped / 15)),
+        "SpDef":   _stat(floor + 0.70 * (0.6 * reuse / REUSE_MAX + 0.4 * ped / PED_MAX)),
     }
 
     shiny = (_seed(label) >> 16) % 16 == 0   # ~1/16, the classic shiny odds
