@@ -1,0 +1,1857 @@
+[
+  {
+    "slug": "charizard-1",
+    "name": "Charizard",
+    "file": "charizard-1.png",
+    "element": [
+      "Fire",
+      "Dragon"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "dragon",
+      "fire",
+      "wings",
+      "flame",
+      "aggressive",
+      "flagship",
+      "attack"
+    ],
+    "source": "ytsearch1:charizard pokemon",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "charizard-2",
+    "name": "Charizard",
+    "file": "charizard-2.png",
+    "element": [
+      "Fire",
+      "Dragon"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "dragon",
+      "fire",
+      "wings",
+      "flame",
+      "aggressive",
+      "flagship",
+      "attack"
+    ],
+    "source": "ytsearch1:charizard pokemon",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "charizard-3",
+    "name": "Charizard",
+    "file": "charizard-3.png",
+    "element": [
+      "Fire",
+      "Dragon"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "dragon",
+      "fire",
+      "wings",
+      "flame",
+      "aggressive",
+      "flagship",
+      "attack"
+    ],
+    "source": "ytsearch1:charizard pokemon",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "pikachu",
+    "name": "Pikachu",
+    "file": "pikachu.png",
+    "element": [
+      "Electric"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "electric",
+      "thunder",
+      "spark",
+      "fast",
+      "speed",
+      "shock",
+      "energy",
+      "probe"
+    ],
+    "source": "ytsearch1:pikachu thunderbolt anime",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "mewtwo",
+    "name": "Mewtwo",
+    "file": "mewtwo.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "psychic",
+      "mind",
+      "recon",
+      "scan",
+      "intel",
+      "osint",
+      "mystic",
+      "powerful"
+    ],
+    "source": "ytsearch1:mewtwo psychic anime scene",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "gengar",
+    "name": "Gengar",
+    "file": "gengar.png",
+    "element": [
+      "Ghost"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "ghost",
+      "shadow",
+      "crypto",
+      "cipher",
+      "dark",
+      "stealth",
+      "haunt"
+    ],
+    "source": "ytsearch1:gengar pokemon anime",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "lucario",
+    "name": "Lucario",
+    "file": "lucario.png",
+    "element": [
+      "Steel"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "steel",
+      "armor",
+      "defense",
+      "harden",
+      "blue",
+      "audit",
+      "guardian"
+    ],
+    "source": "ytsearch1:lucario aura pokemon anime",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "greninja",
+    "name": "Greninja",
+    "file": "greninja.png",
+    "element": [
+      "Dark"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "dark",
+      "exploit",
+      "pwn",
+      "stealth",
+      "ninja",
+      "attack",
+      "payload",
+      "water"
+    ],
+    "source": "ytsearch1:greninja pokemon anime",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "goku",
+    "name": "Goku",
+    "file": "goku.png",
+    "element": [
+      "Fire",
+      "Normal"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "fire",
+      "fight",
+      "redteam",
+      "brute",
+      "power",
+      "aggressive",
+      "flagship"
+    ],
+    "source": "ytsearch1:goku super saiyan",
+    "credit": "Dragon Ball"
+  },
+  {
+    "slug": "gardevoir-1",
+    "name": "Gardevoir",
+    "file": "gardevoir-1.png",
+    "element": [
+      "Psychic",
+      "Fairy"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "psychic",
+      "elegant",
+      "guardian",
+      "embrace",
+      "protector"
+    ],
+    "source": "Gardevoir pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "gardevoir-2",
+    "name": "Gardevoir",
+    "file": "gardevoir-2.png",
+    "element": [
+      "Psychic",
+      "Fairy"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "psychic",
+      "elegant",
+      "guardian",
+      "embrace",
+      "protector"
+    ],
+    "source": "Gardevoir pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "gardevoir-3",
+    "name": "Gardevoir",
+    "file": "gardevoir-3.png",
+    "element": [
+      "Psychic",
+      "Fairy"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "psychic",
+      "elegant",
+      "guardian",
+      "embrace",
+      "protector"
+    ],
+    "source": "Gardevoir pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "snorlax-1",
+    "name": "Snorlax",
+    "file": "snorlax-1.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Uncommon",
+    "keywords": [
+      "heavy",
+      "sleepy",
+      "tank",
+      "bulk",
+      "immovable"
+    ],
+    "source": "Snorlax pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "snorlax-2",
+    "name": "Snorlax",
+    "file": "snorlax-2.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Uncommon",
+    "keywords": [
+      "heavy",
+      "sleepy",
+      "tank",
+      "bulk",
+      "immovable"
+    ],
+    "source": "Snorlax pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "snorlax-3",
+    "name": "Snorlax",
+    "file": "snorlax-3.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Uncommon",
+    "keywords": [
+      "heavy",
+      "sleepy",
+      "tank",
+      "bulk",
+      "immovable"
+    ],
+    "source": "Snorlax pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "eevee-1",
+    "name": "Eevee",
+    "file": "eevee-1.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Common",
+    "keywords": [
+      "adaptable",
+      "versatile",
+      "cute",
+      "evolving"
+    ],
+    "source": "Eevee pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "eevee-2",
+    "name": "Eevee",
+    "file": "eevee-2.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Common",
+    "keywords": [
+      "adaptable",
+      "versatile",
+      "cute",
+      "evolving"
+    ],
+    "source": "Eevee pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "eevee-3",
+    "name": "Eevee",
+    "file": "eevee-3.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Common",
+    "keywords": [
+      "adaptable",
+      "versatile",
+      "cute",
+      "evolving"
+    ],
+    "source": "Eevee pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "ditto-1",
+    "name": "Ditto",
+    "file": "ditto-1.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Common",
+    "keywords": [
+      "shapeshifter",
+      "clone",
+      "transform",
+      "copy",
+      "mimic"
+    ],
+    "source": "Ditto pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "ditto-2",
+    "name": "Ditto",
+    "file": "ditto-2.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Common",
+    "keywords": [
+      "shapeshifter",
+      "clone",
+      "transform",
+      "copy",
+      "mimic"
+    ],
+    "source": "Ditto pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "ditto-3",
+    "name": "Ditto",
+    "file": "ditto-3.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Common",
+    "keywords": [
+      "shapeshifter",
+      "clone",
+      "transform",
+      "copy",
+      "mimic"
+    ],
+    "source": "Ditto pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "regigigas-1",
+    "name": "Regigigas",
+    "file": "regigigas-1.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "titan",
+      "colossus",
+      "ancient",
+      "golem",
+      "legendary"
+    ],
+    "source": "Regigigas pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "regigigas-2",
+    "name": "Regigigas",
+    "file": "regigigas-2.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "titan",
+      "colossus",
+      "ancient",
+      "golem",
+      "legendary"
+    ],
+    "source": "Regigigas pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "regigigas-3",
+    "name": "Regigigas",
+    "file": "regigigas-3.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "titan",
+      "colossus",
+      "ancient",
+      "golem",
+      "legendary"
+    ],
+    "source": "Regigigas pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "agumon-1",
+    "name": "Agumon",
+    "file": "agumon-1.png",
+    "element": [
+      "Normal",
+      "Fire"
+    ],
+    "tier": "Common",
+    "keywords": [
+      "rookie",
+      "brave",
+      "dinosaur",
+      "partner",
+      "plucky"
+    ],
+    "source": "Agumon digimon render",
+    "credit": "Digimon"
+  },
+  {
+    "slug": "agumon-2",
+    "name": "Agumon",
+    "file": "agumon-2.png",
+    "element": [
+      "Normal",
+      "Fire"
+    ],
+    "tier": "Common",
+    "keywords": [
+      "rookie",
+      "brave",
+      "dinosaur",
+      "partner",
+      "plucky"
+    ],
+    "source": "Agumon digimon render",
+    "credit": "Digimon"
+  },
+  {
+    "slug": "agumon-3",
+    "name": "Agumon",
+    "file": "agumon-3.png",
+    "element": [
+      "Normal",
+      "Fire"
+    ],
+    "tier": "Common",
+    "keywords": [
+      "rookie",
+      "brave",
+      "dinosaur",
+      "partner",
+      "plucky"
+    ],
+    "source": "Agumon digimon render",
+    "credit": "Digimon"
+  },
+  {
+    "slug": "yugi-1",
+    "name": "Yugi",
+    "file": "yugi-1.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "duelist",
+      "strategist",
+      "heart",
+      "cards",
+      "hero"
+    ],
+    "source": "Yugi Muto Yu-Gi-Oh character art",
+    "credit": "Yu-Gi-Oh"
+  },
+  {
+    "slug": "yugi-2",
+    "name": "Yugi",
+    "file": "yugi-2.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "duelist",
+      "strategist",
+      "heart",
+      "cards",
+      "hero"
+    ],
+    "source": "Yugi Muto Yu-Gi-Oh character art",
+    "credit": "Yu-Gi-Oh"
+  },
+  {
+    "slug": "yugi-3",
+    "name": "Yugi",
+    "file": "yugi-3.png",
+    "element": [
+      "Normal"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "duelist",
+      "strategist",
+      "heart",
+      "cards",
+      "hero"
+    ],
+    "source": "Yugi Muto Yu-Gi-Oh character art",
+    "credit": "Yu-Gi-Oh"
+  },
+  {
+    "slug": "mew-1",
+    "name": "Mew",
+    "file": "mew-1.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "mythical",
+      "origin",
+      "playful",
+      "ancestor",
+      "rare"
+    ],
+    "source": "Mew pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "mew-2",
+    "name": "Mew",
+    "file": "mew-2.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "mythical",
+      "origin",
+      "playful",
+      "ancestor",
+      "rare"
+    ],
+    "source": "Mew pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "mew-3",
+    "name": "Mew",
+    "file": "mew-3.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "mythical",
+      "origin",
+      "playful",
+      "ancestor",
+      "rare"
+    ],
+    "source": "Mew pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "alakazam-1",
+    "name": "Alakazam",
+    "file": "alakazam-1.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "intellect",
+      "genius",
+      "spoons",
+      "brain",
+      "calculate"
+    ],
+    "source": "Alakazam pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "alakazam-2",
+    "name": "Alakazam",
+    "file": "alakazam-2.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "intellect",
+      "genius",
+      "spoons",
+      "brain",
+      "calculate"
+    ],
+    "source": "Alakazam pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "alakazam-3",
+    "name": "Alakazam",
+    "file": "alakazam-3.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "intellect",
+      "genius",
+      "spoons",
+      "brain",
+      "calculate"
+    ],
+    "source": "Alakazam pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "espeon-1",
+    "name": "Espeon",
+    "file": "espeon-1.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "foresight",
+      "elegant",
+      "sun",
+      "intuition",
+      "graceful"
+    ],
+    "source": "Espeon pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "espeon-2",
+    "name": "Espeon",
+    "file": "espeon-2.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "foresight",
+      "elegant",
+      "sun",
+      "intuition",
+      "graceful"
+    ],
+    "source": "Espeon pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "espeon-3",
+    "name": "Espeon",
+    "file": "espeon-3.png",
+    "element": [
+      "Psychic"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "foresight",
+      "elegant",
+      "sun",
+      "intuition",
+      "graceful"
+    ],
+    "source": "Espeon pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "darkmagician-1",
+    "name": "DarkMagician",
+    "file": "darkmagician-1.png",
+    "element": [
+      "Psychic",
+      "Ghost"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "spellcaster",
+      "arcane",
+      "sorcerer",
+      "magic",
+      "conjure"
+    ],
+    "source": "Dark Magician Yu-Gi-Oh artwork",
+    "credit": "Yu-Gi-Oh"
+  },
+  {
+    "slug": "darkmagician-2",
+    "name": "DarkMagician",
+    "file": "darkmagician-2.png",
+    "element": [
+      "Psychic",
+      "Ghost"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "spellcaster",
+      "arcane",
+      "sorcerer",
+      "magic",
+      "conjure"
+    ],
+    "source": "Dark Magician Yu-Gi-Oh artwork",
+    "credit": "Yu-Gi-Oh"
+  },
+  {
+    "slug": "darkmagician-3",
+    "name": "DarkMagician",
+    "file": "darkmagician-3.png",
+    "element": [
+      "Psychic",
+      "Ghost"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "spellcaster",
+      "arcane",
+      "sorcerer",
+      "magic",
+      "conjure"
+    ],
+    "source": "Dark Magician Yu-Gi-Oh artwork",
+    "credit": "Yu-Gi-Oh"
+  },
+  {
+    "slug": "rayquaza-1",
+    "name": "Rayquaza",
+    "file": "rayquaza-1.png",
+    "element": [
+      "Flying",
+      "Dragon"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "sky",
+      "serpent",
+      "ozone",
+      "legendary",
+      "skybound"
+    ],
+    "source": "Rayquaza pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "rayquaza-2",
+    "name": "Rayquaza",
+    "file": "rayquaza-2.png",
+    "element": [
+      "Flying",
+      "Dragon"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "sky",
+      "serpent",
+      "ozone",
+      "legendary",
+      "skybound"
+    ],
+    "source": "Rayquaza pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "rayquaza-3",
+    "name": "Rayquaza",
+    "file": "rayquaza-3.png",
+    "element": [
+      "Flying",
+      "Dragon"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "sky",
+      "serpent",
+      "ozone",
+      "legendary",
+      "skybound"
+    ],
+    "source": "Rayquaza pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "pidgeot-1",
+    "name": "Pidgeot",
+    "file": "pidgeot-1.png",
+    "element": [
+      "Flying",
+      "Normal"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "swift",
+      "raptor",
+      "scout",
+      "recon",
+      "aerial"
+    ],
+    "source": "Pidgeot pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "pidgeot-2",
+    "name": "Pidgeot",
+    "file": "pidgeot-2.png",
+    "element": [
+      "Flying",
+      "Normal"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "swift",
+      "raptor",
+      "scout",
+      "recon",
+      "aerial"
+    ],
+    "source": "Pidgeot pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "pidgeot-3",
+    "name": "Pidgeot",
+    "file": "pidgeot-3.png",
+    "element": [
+      "Flying",
+      "Normal"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "swift",
+      "raptor",
+      "scout",
+      "recon",
+      "aerial"
+    ],
+    "source": "Pidgeot pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "lugia-1",
+    "name": "Lugia",
+    "file": "lugia-1.png",
+    "element": [
+      "Flying",
+      "Psychic"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "guardian",
+      "sea",
+      "storm",
+      "diving",
+      "legendary"
+    ],
+    "source": "Lugia pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "lugia-2",
+    "name": "Lugia",
+    "file": "lugia-2.png",
+    "element": [
+      "Flying",
+      "Psychic"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "guardian",
+      "sea",
+      "storm",
+      "diving",
+      "legendary"
+    ],
+    "source": "Lugia pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "lugia-3",
+    "name": "Lugia",
+    "file": "lugia-3.png",
+    "element": [
+      "Flying",
+      "Psychic"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "guardian",
+      "sea",
+      "storm",
+      "diving",
+      "legendary"
+    ],
+    "source": "Lugia pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "blueeyes-1",
+    "name": "BlueEyes",
+    "file": "blueeyes-1.png",
+    "element": [
+      "Flying",
+      "Dragon"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "destruction",
+      "white",
+      "legendary",
+      "burst",
+      "power"
+    ],
+    "source": "Blue-Eyes White Dragon Yu-Gi-Oh artwork",
+    "credit": "Yu-Gi-Oh"
+  },
+  {
+    "slug": "blueeyes-2",
+    "name": "BlueEyes",
+    "file": "blueeyes-2.png",
+    "element": [
+      "Flying",
+      "Dragon"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "destruction",
+      "white",
+      "legendary",
+      "burst",
+      "power"
+    ],
+    "source": "Blue-Eyes White Dragon Yu-Gi-Oh artwork",
+    "credit": "Yu-Gi-Oh"
+  },
+  {
+    "slug": "blueeyes-3",
+    "name": "BlueEyes",
+    "file": "blueeyes-3.png",
+    "element": [
+      "Flying",
+      "Dragon"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "destruction",
+      "white",
+      "legendary",
+      "burst",
+      "power"
+    ],
+    "source": "Blue-Eyes White Dragon Yu-Gi-Oh artwork",
+    "credit": "Yu-Gi-Oh"
+  },
+  {
+    "slug": "metagross-1",
+    "name": "Metagross",
+    "file": "metagross-1.png",
+    "element": [
+      "Steel",
+      "Psychic"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "supercomputer",
+      "armored",
+      "quad",
+      "calculating",
+      "fortress"
+    ],
+    "source": "Metagross pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "metagross-2",
+    "name": "Metagross",
+    "file": "metagross-2.png",
+    "element": [
+      "Steel",
+      "Psychic"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "supercomputer",
+      "armored",
+      "quad",
+      "calculating",
+      "fortress"
+    ],
+    "source": "Metagross pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "metagross-3",
+    "name": "Metagross",
+    "file": "metagross-3.png",
+    "element": [
+      "Steel",
+      "Psychic"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "supercomputer",
+      "armored",
+      "quad",
+      "calculating",
+      "fortress"
+    ],
+    "source": "Metagross pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "aggron-1",
+    "name": "Aggron",
+    "file": "aggron-1.png",
+    "element": [
+      "Steel",
+      "Rock"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "iron",
+      "fortress",
+      "defense",
+      "armored",
+      "tank"
+    ],
+    "source": "Aggron pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "aggron-2",
+    "name": "Aggron",
+    "file": "aggron-2.png",
+    "element": [
+      "Steel",
+      "Rock"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "iron",
+      "fortress",
+      "defense",
+      "armored",
+      "tank"
+    ],
+    "source": "Aggron pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "aggron-3",
+    "name": "Aggron",
+    "file": "aggron-3.png",
+    "element": [
+      "Steel",
+      "Rock"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "iron",
+      "fortress",
+      "defense",
+      "armored",
+      "tank"
+    ],
+    "source": "Aggron pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "metalgreymon-1",
+    "name": "MetalGreymon",
+    "file": "metalgreymon-1.png",
+    "element": [
+      "Steel"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "cyborg",
+      "missiles",
+      "armored",
+      "machine",
+      "upgraded"
+    ],
+    "source": "MetalGreymon digimon render",
+    "credit": "Digimon"
+  },
+  {
+    "slug": "metalgreymon-2",
+    "name": "MetalGreymon",
+    "file": "metalgreymon-2.png",
+    "element": [
+      "Steel"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "cyborg",
+      "missiles",
+      "armored",
+      "machine",
+      "upgraded"
+    ],
+    "source": "MetalGreymon digimon render",
+    "credit": "Digimon"
+  },
+  {
+    "slug": "metalgreymon-3",
+    "name": "MetalGreymon",
+    "file": "metalgreymon-3.png",
+    "element": [
+      "Steel"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "cyborg",
+      "missiles",
+      "armored",
+      "machine",
+      "upgraded"
+    ],
+    "source": "MetalGreymon digimon render",
+    "credit": "Digimon"
+  },
+  {
+    "slug": "dusknoir-1",
+    "name": "Dusknoir",
+    "file": "dusknoir-1.png",
+    "element": [
+      "Ghost"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "reaper",
+      "spectral",
+      "netherworld",
+      "grim",
+      "sentinel"
+    ],
+    "source": "Dusknoir pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "dusknoir-2",
+    "name": "Dusknoir",
+    "file": "dusknoir-2.png",
+    "element": [
+      "Ghost"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "reaper",
+      "spectral",
+      "netherworld",
+      "grim",
+      "sentinel"
+    ],
+    "source": "Dusknoir pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "dusknoir-3",
+    "name": "Dusknoir",
+    "file": "dusknoir-3.png",
+    "element": [
+      "Ghost"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "reaper",
+      "spectral",
+      "netherworld",
+      "grim",
+      "sentinel"
+    ],
+    "source": "Dusknoir pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "chandelure-1",
+    "name": "Chandelure",
+    "file": "chandelure-1.png",
+    "element": [
+      "Ghost",
+      "Fire"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "spectral",
+      "flame",
+      "haunting",
+      "lantern",
+      "eerie"
+    ],
+    "source": "Chandelure pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "chandelure-2",
+    "name": "Chandelure",
+    "file": "chandelure-2.png",
+    "element": [
+      "Ghost",
+      "Fire"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "spectral",
+      "flame",
+      "haunting",
+      "lantern",
+      "eerie"
+    ],
+    "source": "Chandelure pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "chandelure-3",
+    "name": "Chandelure",
+    "file": "chandelure-3.png",
+    "element": [
+      "Ghost",
+      "Fire"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "spectral",
+      "flame",
+      "haunting",
+      "lantern",
+      "eerie"
+    ],
+    "source": "Chandelure pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "zapdos-1",
+    "name": "Zapdos",
+    "file": "zapdos-1.png",
+    "element": [
+      "Electric",
+      "Flying"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "thunder",
+      "storm",
+      "legendary",
+      "charged",
+      "bolt"
+    ],
+    "source": "Zapdos pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "zapdos-2",
+    "name": "Zapdos",
+    "file": "zapdos-2.png",
+    "element": [
+      "Electric",
+      "Flying"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "thunder",
+      "storm",
+      "legendary",
+      "charged",
+      "bolt"
+    ],
+    "source": "Zapdos pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "zapdos-3",
+    "name": "Zapdos",
+    "file": "zapdos-3.png",
+    "element": [
+      "Electric",
+      "Flying"
+    ],
+    "tier": "Legendary",
+    "keywords": [
+      "thunder",
+      "storm",
+      "legendary",
+      "charged",
+      "bolt"
+    ],
+    "source": "Zapdos pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "luxray-1",
+    "name": "Luxray",
+    "file": "luxray-1.png",
+    "element": [
+      "Electric"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "vision",
+      "predator",
+      "feline",
+      "hunt",
+      "piercing"
+    ],
+    "source": "Luxray pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "luxray-2",
+    "name": "Luxray",
+    "file": "luxray-2.png",
+    "element": [
+      "Electric"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "vision",
+      "predator",
+      "feline",
+      "hunt",
+      "piercing"
+    ],
+    "source": "Luxray pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "luxray-3",
+    "name": "Luxray",
+    "file": "luxray-3.png",
+    "element": [
+      "Electric"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "vision",
+      "predator",
+      "feline",
+      "hunt",
+      "piercing"
+    ],
+    "source": "Luxray pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "blaziken-1",
+    "name": "Blaziken",
+    "file": "blaziken-1.png",
+    "element": [
+      "Fire"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "blazing",
+      "martial",
+      "striker",
+      "kick",
+      "fierce"
+    ],
+    "source": "Blaziken pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "blaziken-2",
+    "name": "Blaziken",
+    "file": "blaziken-2.png",
+    "element": [
+      "Fire"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "blazing",
+      "martial",
+      "striker",
+      "kick",
+      "fierce"
+    ],
+    "source": "Blaziken pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "blaziken-3",
+    "name": "Blaziken",
+    "file": "blaziken-3.png",
+    "element": [
+      "Fire"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "blazing",
+      "martial",
+      "striker",
+      "kick",
+      "fierce"
+    ],
+    "source": "Blaziken pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "greymon-1",
+    "name": "Greymon",
+    "file": "greymon-1.png",
+    "element": [
+      "Fire"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "dinosaur",
+      "nova",
+      "blaze",
+      "horn",
+      "champion"
+    ],
+    "source": "Greymon digimon render",
+    "credit": "Digimon"
+  },
+  {
+    "slug": "greymon-2",
+    "name": "Greymon",
+    "file": "greymon-2.png",
+    "element": [
+      "Fire"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "dinosaur",
+      "nova",
+      "blaze",
+      "horn",
+      "champion"
+    ],
+    "source": "Greymon digimon render",
+    "credit": "Digimon"
+  },
+  {
+    "slug": "greymon-3",
+    "name": "Greymon",
+    "file": "greymon-3.png",
+    "element": [
+      "Fire"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "dinosaur",
+      "nova",
+      "blaze",
+      "horn",
+      "champion"
+    ],
+    "source": "Greymon digimon render",
+    "credit": "Digimon"
+  },
+  {
+    "slug": "sigilyph-1",
+    "name": "Sigilyph",
+    "file": "sigilyph-1.png",
+    "element": [
+      "Psychic",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "psychic",
+      "ward",
+      "guardian",
+      "mystic",
+      "scanner"
+    ],
+    "source": "Sigilyph pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "sigilyph-2",
+    "name": "Sigilyph",
+    "file": "sigilyph-2.png",
+    "element": [
+      "Psychic",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "psychic",
+      "ward",
+      "guardian",
+      "mystic",
+      "scanner"
+    ],
+    "source": "Sigilyph pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "sigilyph-3",
+    "name": "Sigilyph",
+    "file": "sigilyph-3.png",
+    "element": [
+      "Psychic",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "psychic",
+      "ward",
+      "guardian",
+      "mystic",
+      "scanner"
+    ],
+    "source": "Sigilyph pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "xatu-1",
+    "name": "Xatu",
+    "file": "xatu-1.png",
+    "element": [
+      "Psychic",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "foresight",
+      "totem",
+      "watcher",
+      "mystic",
+      "sun"
+    ],
+    "source": "Xatu pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "xatu-2",
+    "name": "Xatu",
+    "file": "xatu-2.png",
+    "element": [
+      "Psychic",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "foresight",
+      "totem",
+      "watcher",
+      "mystic",
+      "sun"
+    ],
+    "source": "Xatu pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "xatu-3",
+    "name": "Xatu",
+    "file": "xatu-3.png",
+    "element": [
+      "Psychic",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "foresight",
+      "totem",
+      "watcher",
+      "mystic",
+      "sun"
+    ],
+    "source": "Xatu pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "noctowl-1",
+    "name": "Noctowl",
+    "file": "noctowl-1.png",
+    "element": [
+      "Normal",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "night",
+      "watcher",
+      "owl",
+      "analyst",
+      "wise"
+    ],
+    "source": "Noctowl pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "noctowl-2",
+    "name": "Noctowl",
+    "file": "noctowl-2.png",
+    "element": [
+      "Normal",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "night",
+      "watcher",
+      "owl",
+      "analyst",
+      "wise"
+    ],
+    "source": "Noctowl pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "noctowl-3",
+    "name": "Noctowl",
+    "file": "noctowl-3.png",
+    "element": [
+      "Normal",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "night",
+      "watcher",
+      "owl",
+      "analyst",
+      "wise"
+    ],
+    "source": "Noctowl pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "staraptor-1",
+    "name": "Staraptor",
+    "file": "staraptor-1.png",
+    "element": [
+      "Normal",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "raptor",
+      "strike",
+      "swift",
+      "predator",
+      "aerial"
+    ],
+    "source": "Staraptor pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "staraptor-2",
+    "name": "Staraptor",
+    "file": "staraptor-2.png",
+    "element": [
+      "Normal",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "raptor",
+      "strike",
+      "swift",
+      "predator",
+      "aerial"
+    ],
+    "source": "Staraptor pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "staraptor-3",
+    "name": "Staraptor",
+    "file": "staraptor-3.png",
+    "element": [
+      "Normal",
+      "Flying"
+    ],
+    "tier": "Rare",
+    "keywords": [
+      "raptor",
+      "strike",
+      "swift",
+      "predator",
+      "aerial"
+    ],
+    "source": "Staraptor pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "braviary-1",
+    "name": "Braviary",
+    "file": "braviary-1.png",
+    "element": [
+      "Normal",
+      "Flying"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "eagle",
+      "valor",
+      "bold",
+      "patriot",
+      "warrior"
+    ],
+    "source": "Braviary pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "braviary-2",
+    "name": "Braviary",
+    "file": "braviary-2.png",
+    "element": [
+      "Normal",
+      "Flying"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "eagle",
+      "valor",
+      "bold",
+      "patriot",
+      "warrior"
+    ],
+    "source": "Braviary pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "braviary-3",
+    "name": "Braviary",
+    "file": "braviary-3.png",
+    "element": [
+      "Normal",
+      "Flying"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "eagle",
+      "valor",
+      "bold",
+      "patriot",
+      "warrior"
+    ],
+    "source": "Braviary pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "togekiss-1",
+    "name": "Togekiss",
+    "file": "togekiss-1.png",
+    "element": [
+      "Flying",
+      "Psychic"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "blessing",
+      "peace",
+      "serene",
+      "messenger",
+      "grace"
+    ],
+    "source": "Togekiss pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "togekiss-2",
+    "name": "Togekiss",
+    "file": "togekiss-2.png",
+    "element": [
+      "Flying",
+      "Psychic"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "blessing",
+      "peace",
+      "serene",
+      "messenger",
+      "grace"
+    ],
+    "source": "Togekiss pokemon official artwork",
+    "credit": "Pokemon"
+  },
+  {
+    "slug": "togekiss-3",
+    "name": "Togekiss",
+    "file": "togekiss-3.png",
+    "element": [
+      "Flying",
+      "Psychic"
+    ],
+    "tier": "Epic",
+    "keywords": [
+      "blessing",
+      "peace",
+      "serene",
+      "messenger",
+      "grace"
+    ],
+    "source": "Togekiss pokemon official artwork",
+    "credit": "Pokemon"
+  }
+]
