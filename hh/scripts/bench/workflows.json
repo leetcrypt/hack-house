@@ -1,0 +1,23 @@
+{
+  "_comment": "Workflow profiles weight per-language capability into one score. Weights need not sum to 1; they are normalised at scoring time. Add a profile here to teach the model-picker a new kind of user.",
+  "balanced": {
+    "label": "Balanced polyglot",
+    "weights": {"python": 1, "javascript": 1, "go": 1, "rust": 1, "bash": 1}
+  },
+  "ops": {
+    "label": "Ops / shell automation",
+    "weights": {"bash": 3, "python": 2, "go": 1, "javascript": 0.5, "rust": 0.5}
+  },
+  "backend": {
+    "label": "Backend services",
+    "weights": {"go": 3, "rust": 2, "python": 2, "javascript": 1, "bash": 1}
+  },
+  "webdev": {
+    "label": "Web development",
+    "weights": {"javascript": 3, "python": 2, "bash": 1, "go": 1, "rust": 0.5}
+  },
+  "systems": {
+    "label": "Systems programming",
+    "weights": {"rust": 3, "go": 2, "python": 1, "bash": 1, "javascript": 0.5}
+  }
+}

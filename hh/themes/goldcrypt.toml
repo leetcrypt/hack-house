@@ -1,0 +1,14 @@
+# goldcrypt — a saved random() roll: gold ink + steel borders on deep slate, ☩
+name = "goldcrypt"
+border = "#425e70"      # steel blue-gray chrome
+title = "#e8d00c"       # gold
+accent = "#e8d00c"      # gold (sigil / prompt)
+dim = "#6f7f8a"         # timestamps — muted slate
+me = "#fffdf2"          # your messages = warm near-white
+other = "#89b2cd"       # others = light desaturated blue
+system = "#7b8e9a"      # system / occult = legible blue-gray
+input = "#fffdf2"
+roster_me = "#e8d00c"   # you / owner = gold
+bg = "#0a0d0f"          # deep slate surface
+roster_width = 22
+sigil = "☩"             # cross of jerusalem

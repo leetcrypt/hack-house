@@ -1,0 +1,14 @@
+# matrix — digital rain: phosphor green cascading on the void
+name = "matrix"
+bg = "#000600"          # near-black with a green undertone
+border = "#0a5a1e"      # dim terminal-green chrome
+title = "#9dffb0"       # bright phosphor
+accent = "#00ff41"      # classic matrix green — glyph, prompt
+dim = "#1f7a33"         # faded rain trail
+me = "#00ff41"          # your messages — bright green
+other = "#39d353"       # others' messages — softer green
+system = "#7dffa0"      # system lines — pale phosphor
+input = "#00ff41"
+roster_me = "#aeff00"   # you — electric lime
+roster_width = 22
+sigil = "ⵣ"             # falling glyph

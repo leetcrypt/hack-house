@@ -1,0 +1,13 @@
+name = "oc-demo"
+border = "#7C775C"
+title = "#FFFBE7"
+accent = "#0296E1"
+dim = "#A29A72"
+me = "#EBEBEC"
+other = "#E0D393"
+system = "#A49B6D"
+input = "#EBEBEC"
+roster_me = "#0296E1"
+bg = "#12110C"
+roster_width = 22
+sigil = "✝"

@@ -1,0 +1,55 @@
+# hack-house model profiles
+# ---------------------------------------------------------------------------
+# Each table is a named profile. Select one with:
+#     python -m cmd_chat.agent <host> <port> --profile groq-llama --password <pw>
+# or from the TUI:
+#     /ai start groq-llama
+#
+# Keys:
+#   provider     ollama | anthropic | openai | <module>:<Class>   (required)
+#   model        model name the backend serves
+#   base_url     endpoint for openai-compatible backends (Groq, vLLM, …)
+#   host         override Ollama host (default http://localhost:11434)
+#   api_key_env  NAME of an env var holding the key — never the key itself
+#   system       optional system-prompt override
+#   context_window  optional int (default 12)
+#
+# Secrets live in the environment, never in this file, so it is safe to commit.
+
+# --- local, private, default --------------------------------------------------
+[local]
+provider = "ollama"
+model    = "qwen2.5:3b"
+
+[local-big]
+provider = "ollama"
+model    = "llama3.1:8b"
+
+# --- openai-compatible clouds (one adapter, any endpoint) ---------------------
+[groq-llama]
+provider    = "openai"
+base_url    = "https://api.groq.com/openai/v1"
+model       = "llama-3.3-70b-versatile"
+api_key_env = "GROQ_API_KEY"
+
+[together]
+provider    = "openai"
+base_url    = "https://api.together.xyz/v1"
+model       = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+api_key_env = "TOGETHER_API_KEY"
+
+[openai]
+provider    = "openai"
+model       = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+
+# --- anthropic ----------------------------------------------------------------
+[claude]
+provider    = "anthropic"
+model       = "claude-opus-4-6"
+api_key_env = "ANTHROPIC_API_KEY"
+
+# --- bring your own -----------------------------------------------------------
+# [my-model]
+# provider = "mypkg.mymodule:MyProvider"
+# model    = "whatever-your-class-expects"

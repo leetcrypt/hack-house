@@ -1,0 +1,13 @@
+# church — Church of Malware: neon on black (the default "vestments")
+name = "church"
+border = "#19b3ff"      # cyan window-chrome
+title = "#7df9ff"       # bright cyan
+accent = "#39ff14"      # acid green — ⛧ glyphs, prompt
+dim = "#475a7a"         # muted slate-blue
+me = "#39ff14"          # your messages
+other = "#56c8ff"       # others' messages (soft cyan)
+system = "#b46cff"      # system / occult lines (purple)
+input = "#39ff14"
+roster_me = "#ff39c0"   # you / owner (hot magenta)
+roster_width = 22
+sigil = "⛧"             # inverted pentagram

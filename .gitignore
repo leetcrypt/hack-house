@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+/venv/
+.venv/
+.pytest_cache/
+.benchmarks/
+build/
+dist/
+*.egg-info/
+cmd_chat.egg-info/
+secured_console_chat.egg-info/
+
+# Secrets / keys
+*.pem
+
+# Editor / OS
+.idea/
+
+# Logs / runtime scratch
+*.log
+err.log
+
+# Out-of-tree experiments (not part of hack-house)
+/experiments/
+/headroom/
+
+# Heavy / superseded demo-build kit (real demos live in video-toolkit)
+/docs/demo/
+
+# Project scratch
+/i-try/
+test_rsa.py
+commiter.py
+true.txt
+/downloads/
