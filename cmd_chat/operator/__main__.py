@@ -136,6 +136,13 @@ def _build_parser() -> argparse.ArgumentParser:
     op.add_argument("--cost", type=float, default=5.0)
     op.add_argument("--session", default=None)
 
+    wb = sub.add_parser("web", help="serve a mobile chat UI in front of the daemon")
+    wb.add_argument("--bind", default="127.0.0.1",
+                    help="listen address (default: 127.0.0.1 — loopback only; "
+                         "the control socket grants room-send, so keep it local)")
+    wb.add_argument("--port", type=int, default=8790, help="listen port (default: 8790)")
+    wb.add_argument("--session", default=None)
+
     sc = sub.add_parser("screen", help="print the relayed sandbox terminal buffer")
     sc.add_argument("--tail", type=int, default=None, help="last N bytes only")
     sc.add_argument("--ansi", action="store_true", help="keep ANSI codes (raw)")
@@ -560,6 +567,11 @@ def _run_registry(args) -> int:
     return 0
 
 
+def _run_web(args) -> int:
+    from .web import serve
+    return serve(args.session, args.bind, args.port)
+
+
 def _run_simple(args, op: str) -> int:
     resp = _client_request(args, {"op": op})
     print(json.dumps(resp))
@@ -599,6 +611,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_screen(args)
     if verb == "watch":
         return _run_watch(args)
+    if verb == "web":
+        return _run_web(args)
     if verb in ("roster", "status", "down"):
         return _run_simple(args, verb)
     return 2
