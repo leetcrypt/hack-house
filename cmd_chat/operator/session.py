@@ -2,7 +2,7 @@
 
 Each running daemon owns a session directory under a per-user runtime root:
 
-    ${XDG_RUNTIME_DIR:-/tmp}/hh-bridge/<session>/
+    ${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/hh-bridge/<session>/
         control.sock   unix socket the CLI verbs talk to
         inbox.jsonl    append-only event log (durability/debug; truth is in-RAM)
         meta.json      {host, port, user, pid, trigger, no_tls, started}
@@ -23,7 +23,9 @@ from pathlib import Path
 
 
 def runtime_root() -> Path:
-    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    # Prefer a real per-user runtime dir; else $TMPDIR (Termux/Android sets this
+    # to $PREFIX/tmp — there is no /tmp on Android); else /tmp on a normal box.
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
     return Path(base) / "hh-bridge"
 
 
