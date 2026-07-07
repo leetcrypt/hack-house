@@ -38,7 +38,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .cardex import Card, card_from_entry, load_entries, _registry_path, _seed
+from .cardex import Card, card_from_entry, load_entries, grade_curve, _registry_path, _seed
+from . import chardex
 
 # ── card geometry ─────────────────────────────────────────────────────────────
 W, H = 500, 700
@@ -210,8 +211,21 @@ def _art_runway(card: Card) -> bytes:
     raise RuntimeError("runway task timed out")
 
 
+def _art_chardex(card: Card) -> bytes:
+    """Use a harvested real character portrait matched to this VM (free, offline)."""
+    lib = chardex.load_library()
+    ch = chardex.match(card, lib)
+    if ch is None:
+        raise RuntimeError("empty/unmatched character library")
+    path = ch.path(chardex.chardex_dir())
+    if not path.exists():
+        raise RuntimeError(f"portrait missing: {path}")
+    return path.read_bytes()
+
+
 ART_BACKENDS = {
     "sigil": None,  # handled inline (no fetch)
+    "chardex": _art_chardex,
     "pollinations": _art_pollinations,
     "stability": _art_stability,
     "openai": _art_openai,
@@ -236,7 +250,7 @@ def _esc(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def _wrap(s: str, n: int) -> list[str]:
+def _wrap(s: str, n: int, maxlines: int = 3) -> list[str]:
     out, line = [], ""
     for w in s.split():
         if len(line) + len(w) + 1 > n:
@@ -246,55 +260,135 @@ def _wrap(s: str, n: int) -> list[str]:
             line = (line + " " + w).strip()
     if line:
         out.append(line)
-    return out[:3]
+    if len(out) > maxlines:
+        out = out[:maxlines]
+        out[-1] = out[-1][:n - 1] + "…"
+    return out
 
 
-def render_card_svg(card: Card, art_data_uri: str | None = None) -> str:
-    border, glow, accent = RARITY_THEME.get(card.rarity, RARITY_THEME["Common"])
-    s = card.stats
-    bst = sum(s.values())
-    p = [f'<svg xmlns="http://www.w3.org/2000/svg" '
-         f'xmlns:xlink="http://www.w3.org/1999/xlink" width="{W}" height="{H}" '
-         f'viewBox="0 0 {W} {H}" font-family="DejaVu Sans, Arial, sans-serif">']
-    # defs: backdrop + holo
-    p.append(f'<defs>'
-             f'<linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">'
-             f'<stop offset="0%" stop-color="#1a1d24"/>'
-             f'<stop offset="100%" stop-color="{glow}"/></linearGradient>'
-             f'<linearGradient id="holo" x1="0" y1="0" x2="1" y2="1">'
-             f'<stop offset="0%" stop-color="{accent}" stop-opacity="0.0"/>'
-             f'<stop offset="50%" stop-color="{accent}" stop-opacity="0.18"/>'
-             f'<stop offset="100%" stop-color="{accent}" stop-opacity="0.0"/>'
-             f'</linearGradient></defs>')
-    # frame
-    p.append(f'<rect x="0" y="0" width="{W}" height="{H}" rx="22" fill="url(#bg)"/>')
-    p.append(f'<rect x="6" y="6" width="{W-12}" height="{H-12}" rx="18" '
-             f'fill="none" stroke="{border}" stroke-width="5"/>')
-    if card.shiny:
-        p.append(f'<rect x="6" y="6" width="{W-12}" height="{H-12}" rx="18" '
-                 f'fill="url(#holo)"/>')
-    # header: name + dex (holo marker folded into the dex line to avoid PWR collision)
-    p.append(f'<text x="{PAD+6}" y="40" font-size="26" font-weight="bold" '
-             f'fill="#f4f6f8">{_esc(card.name)}</text>')
+# premium-card visual constants
+FOIL_RARITIES = {"Rare", "Epic", "Legendary"}
+RARITY_GLINT = {  # lighter metallic highlight per rarity for the beveled border
+    "Common": "#cfd4da", "Uncommon": "#c8f4d6", "Rare": "#cfe2ff",
+    "Epic": "#ecc9ff", "Legendary": "#fff0b0",
+}
+
+
+def _card_defs(card: Card, border, glow, accent) -> str:
+    """All gradients/filters/foil for one premium card (ids are card-local)."""
+    tc = TYPE_COLOR.get(card.types[0], "#a0a4ab")
+    glint = RARITY_GLINT.get(card.rarity, "#cfd4da")
+    d = ['<defs>']
+    # backdrop: deep vertical wash, type-tinted toward the foot
+    d.append(f'<linearGradient id="bg" x1="0" y1="0" x2="0.2" y2="1">'
+             f'<stop offset="0%" stop-color="#0c0e13"/>'
+             f'<stop offset="55%" stop-color="#13161d"/>'
+             f'<stop offset="100%" stop-color="{glow}"/></linearGradient>')
+    # type spotlight behind the art
+    d.append(f'<radialGradient id="spot" cx="50%" cy="34%" r="62%">'
+             f'<stop offset="0%" stop-color="{tc}" stop-opacity="0.32"/>'
+             f'<stop offset="100%" stop-color="{tc}" stop-opacity="0"/>'
+             f'</radialGradient>')
+    # brushed-metal border: light glint → rarity color → shadow, for a bevel
+    d.append(f'<linearGradient id="metal" x1="0" y1="0" x2="1" y2="1">'
+             f'<stop offset="0%" stop-color="{glint}"/>'
+             f'<stop offset="28%" stop-color="{border}"/>'
+             f'<stop offset="60%" stop-color="{border}"/>'
+             f'<stop offset="78%" stop-color="#0c0e13"/>'
+             f'<stop offset="100%" stop-color="{border}"/></linearGradient>')
+    # title-banner sheen
+    d.append(f'<linearGradient id="banner" x1="0" y1="0" x2="0" y2="1">'
+             f'<stop offset="0%" stop-color="{border}" stop-opacity="0.95"/>'
+             f'<stop offset="100%" stop-color="#0c0e13" stop-opacity="0.85"/>'
+             f'</linearGradient>')
+    # diagonal holographic foil (rainbow shimmer)
+    d.append('<linearGradient id="foil" x1="0" y1="0" x2="1" y2="1">'
+             '<stop offset="0%" stop-color="#ff5d8f" stop-opacity="0.0"/>'
+             '<stop offset="20%" stop-color="#ffd166" stop-opacity="0.16"/>'
+             '<stop offset="40%" stop-color="#06d6a0" stop-opacity="0.10"/>'
+             '<stop offset="60%" stop-color="#4cc9f0" stop-opacity="0.18"/>'
+             '<stop offset="80%" stop-color="#b8a6ff" stop-opacity="0.12"/>'
+             '<stop offset="100%" stop-color="#ff5d8f" stop-opacity="0.0"/>'
+             '</linearGradient>')
+    d.append(f'<radialGradient id="vig" cx="50%" cy="50%" r="75%">'
+             f'<stop offset="60%" stop-color="#000000" stop-opacity="0"/>'
+             f'<stop offset="100%" stop-color="#000000" stop-opacity="0.45"/>'
+             f'</radialGradient>')
+    d.append(f'<filter id="glow" x="-30%" y="-30%" width="160%" height="160%">'
+             f'<feGaussianBlur stdDeviation="6"/></filter>')
+    d.append('</defs>')
+    return "".join(d)
+
+
+def _corner_gem(p: list, cx, cy, accent, glint):
+    """A faceted diamond gem ornament at a frame corner."""
+    p.append(f'<g transform="translate({cx},{cy}) rotate(45)">'
+             f'<rect x="-9" y="-9" width="18" height="18" rx="3" fill="{accent}" '
+             f'stroke="{glint}" stroke-width="1.5"/>'
+             f'<rect x="-9" y="-9" width="18" height="9" rx="3" fill="{glint}" '
+             f'opacity="0.55"/></g>')
+
+
+def _frame_and_header(p: list, card: Card, border, glow, accent) -> tuple:
+    """Shared premium frame + title banner + type gem + header. Returns status pill."""
+    tc = TYPE_COLOR.get(card.types[0], "#a0a4ab")
+    glint = RARITY_GLINT.get(card.rarity, "#cfd4da")
+    p.append(_card_defs(card, border, glow, accent))
+    # backdrop + spotlight + vignette
+    p.append(f'<rect x="0" y="0" width="{W}" height="{H}" rx="24" fill="url(#bg)"/>')
+    p.append(f'<rect x="14" y="80" width="{W-28}" height="330" rx="16" fill="url(#spot)"/>')
+    # holo foil sheen for Rare+ / shiny
+    if card.shiny or card.rarity in FOIL_RARITIES:
+        p.append(f'<rect x="8" y="8" width="{W-16}" height="{H-16}" rx="20" '
+                 f'fill="url(#foil)"/>')
+        if card.shiny or card.rarity in ("Epic", "Legendary"):
+            h = _seed(card.label)
+            for k in range(7):
+                sx = 30 + (h >> (k * 3)) % (W - 60)
+                sy = 90 + (h >> (k * 3 + 1)) % (H - 180)
+                r = 1.5 + (h >> (k * 2)) % 3
+                p.append(f'<circle cx="{sx}" cy="{sy}" r="{r}" fill="#ffffff" '
+                         f'opacity="0.7"/>')
+    # multi-layer beveled border
+    if card.rarity == "Legendary":      # outer glow ring for legendaries
+        p.append(f'<rect x="9" y="9" width="{W-18}" height="{H-18}" rx="20" '
+                 f'fill="none" stroke="{border}" stroke-width="10" '
+                 f'filter="url(#glow)" opacity="0.7"/>')
+    p.append(f'<rect x="7" y="7" width="{W-14}" height="{H-14}" rx="19" '
+             f'fill="none" stroke="url(#metal)" stroke-width="8"/>')
+    p.append(f'<rect x="13" y="13" width="{W-26}" height="{H-26}" rx="14" '
+             f'fill="none" stroke="{accent}" stroke-width="1.5" opacity="0.7"/>')
+    p.append(f'<rect x="0" y="0" width="{W}" height="{H}" rx="24" fill="url(#vig)"/>')
+    for (gx, gy) in ((22, 22), (W - 22, 22), (22, H - 22), (W - 22, H - 22)):
+        _corner_gem(p, gx, gy, accent, glint)
+    # title banner + type energy gem + name
+    p.append(f'<rect x="{PAD}" y="20" width="{W-2*PAD}" height="50" rx="12" '
+             f'fill="url(#banner)" stroke="{accent}" stroke-width="1" opacity="0.96"/>')
+    p.append(f'<circle cx="{PAD+26}" cy="45" r="15" fill="{tc}" '
+             f'stroke="{glint}" stroke-width="2"/>')
+    p.append(f'<circle cx="{PAD+21}" cy="40" r="5" fill="#ffffff" opacity="0.7"/>')
+    p.append(f'<text x="{PAD+50}" y="44" font-size="25" font-weight="bold" '
+             f'fill="#f7f9fb">{_esc(card.name)}</text>')
     holo = " · ★HOLO" if card.shiny else ""
-    p.append(f'<text x="{PAD+6}" y="62" font-size="12" fill="{accent}">'
+    p.append(f'<text x="{PAD+50}" y="62" font-size="11" fill="{glint}">'
              f'No.{card.dex:03d} · {_esc(card.label)}{holo}</text>')
-    p.append(f'<text x="{W-PAD-6}" y="40" text-anchor="end" font-size="15" '
-             f'fill="#f4f6f8" font-weight="bold">PWR {card.power}</text>')
-    # status pill on the rarity ribbon's left (done = green check, else amber)
-    st_done = card.status in ("done", "complete", "completed")
-    st_col, st_txt = (("#3fae5a", f"✓ {card.status}") if st_done
-                      else ("#d8a23a", f"● {card.status or 'unknown'}"))
-    # type badges (top-right under PWR)
-    bx = W - PAD - 6
+    p.append(f'<text x="{W-PAD-8}" y="40" text-anchor="end" font-size="15" '
+             f'fill="#ffffff" font-weight="bold">PWR {card.power}</text>')
+    bx = W - PAD - 8
     for ty in reversed(card.types):
-        tc = TYPE_COLOR.get(ty, "#a0a4ab")
+        tcc = TYPE_COLOR.get(ty, "#a0a4ab")
         w = 16 + len(ty) * 8
-        p.append(f'<rect x="{bx-w}" y="50" width="{w}" height="20" rx="10" fill="{tc}"/>')
-        p.append(f'<text x="{bx-w/2}" y="64" text-anchor="middle" font-size="12" '
+        p.append(f'<rect x="{bx-w}" y="50" width="{w}" height="18" rx="9" fill="{tcc}" '
+                 f'stroke="{glint}" stroke-width="0.75"/>')
+        p.append(f'<text x="{bx-w/2}" y="63" text-anchor="middle" font-size="11" '
                  f'fill="#0c0f14" font-weight="bold">{_esc(ty)}</text>')
         bx -= w + 6
-    # art window
+    st_done = card.status in ("done", "complete", "completed")
+    return (("#3fae5a", f"✓ {card.status}") if st_done
+            else ("#d8a23a", f"● {card.status or 'unknown'}"))
+
+
+def _art_window(p: list, card: Card, art_data_uri, border, st_col, st_txt):
     p.append(f'<rect x="{ART_X}" y="{ART_Y}" width="{ART_W}" height="{ART_H}" rx="12" '
              f'fill="#0c0f14" stroke="{border}" stroke-width="3"/>')
     if art_data_uri:
@@ -305,22 +399,21 @@ def render_card_svg(card: Card, art_data_uri: str | None = None) -> str:
                  f'xlink:href="{art_data_uri}"/>')
     else:
         p.append(_sigil_svg(card))
-    # rarity ribbon
     p.append(f'<rect x="{ART_X}" y="{ART_Y+ART_H-26}" width="{ART_W}" height="26" '
              f'fill="{border}" opacity="0.85"/>')
     p.append(f'<text x="{W/2}" y="{ART_Y+ART_H-8}" text-anchor="middle" font-size="14" '
              f'fill="#0c0f14" font-weight="bold" letter-spacing="2">'
              f'{card.rarity.upper()}</text>')
-    # status pill (top-left corner of the art window)
     sw = 22 + len(st_txt) * 7
     p.append(f'<rect x="{ART_X+8}" y="{ART_Y+8}" width="{sw}" height="20" rx="10" '
              f'fill="{st_col}" opacity="0.92"/>')
     p.append(f'<text x="{ART_X+8+sw/2}" y="{ART_Y+22}" text-anchor="middle" '
              f'font-size="11" fill="#0c0f14" font-weight="bold">{_esc(st_txt)}</text>')
-    # stat bars
-    y0 = ART_Y + ART_H + 26
+
+
+def _stat_bars(p: list, card: Card, y0: int, border, accent):
+    s = card.stats
     bw = W - 2 * (PAD + 8)
-    maxstat = 255
     for i, (key, lbl) in enumerate(STAT_ORDER):
         y = y0 + i * 30
         val = s[key]
@@ -328,18 +421,72 @@ def render_card_svg(card: Card, art_data_uri: str | None = None) -> str:
                  f'font-weight="bold">{lbl}</text>')
         p.append(f'<rect x="{PAD+50}" y="{y}" width="{bw-90}" height="16" rx="8" '
                  f'fill="#2a2e36"/>')
-        fillw = max(6, (bw - 90) * val / maxstat)
+        fillw = max(6, (bw - 90) * val / 255)
         p.append(f'<rect x="{PAD+50}" y="{y}" width="{fillw:.0f}" height="16" rx="8" '
                  f'fill="{border}"/>')
         p.append(f'<text x="{W-PAD-8}" y="{y+13}" text-anchor="end" font-size="13" '
                  f'fill="#f4f6f8">{val}</text>')
-    # footer: BST + flavor
-    fy = y0 + 6 * 30 + 6
-    p.append(f'<text x="{PAD+8}" y="{fy+8}" font-size="12" fill="{accent}" '
-             f'font-weight="bold">BST {bst}</text>')
-    for j, ln in enumerate(_wrap(card.flavor, 58)):
-        p.append(f'<text x="{PAD+8}" y="{fy+26+j*15}" font-size="11" '
-                 f'fill="#9aa0a8"><tspan>{_esc(ln)}</tspan></text>')
+
+
+def render_card_svg(card: Card, art_data_uri: str | None = None,
+                    face: str = "full") -> str:
+    """Render a card SVG. face: 'full' (art+stats), 'front' (art+description),
+    'back' (stats+subscores) — front/back drive the flippable hub cards."""
+    border, glow, accent = RARITY_THEME.get(card.rarity, RARITY_THEME["Common"])
+    bst = sum(card.stats.values())
+    p = [f'<svg xmlns="http://www.w3.org/2000/svg" '
+         f'xmlns:xlink="http://www.w3.org/1999/xlink" width="{W}" height="{H}" '
+         f'viewBox="0 0 {W} {H}" font-family="DejaVu Sans, Arial, sans-serif">']
+    st_col, st_txt = _frame_and_header(p, card, border, glow, accent)
+
+    if face in ("full", "front"):
+        _art_window(p, card, art_data_uri, border, st_col, st_txt)
+
+    if face == "front":
+        # DOSSIER panel where stats live on the back — the VM's description.
+        y0 = ART_Y + ART_H + 24
+        p.append(f'<text x="{PAD+8}" y="{y0}" font-size="13" fill="{accent}" '
+                 f'font-weight="bold" letter-spacing="2">VM DOSSIER</text>')
+        p.append(f'<line x1="{PAD+8}" y1="{y0+8}" x2="{W-PAD-8}" y2="{y0+8}" '
+                 f'stroke="{border}" stroke-width="1.5" opacity="0.6"/>')
+        desc = card.purpose or card.flavor or "an unknown sandbox"
+        for j, ln in enumerate(_wrap(desc, 46, maxlines=8)):
+            p.append(f'<text x="{PAD+8}" y="{y0+30+j*22}" font-size="15" '
+                     f'fill="#d6dae0">{_esc(ln)}</text>')
+        p.append(f'<text x="{PAD+8}" y="{H-46}" font-size="12" fill="{accent}" '
+                 f'font-weight="bold">PWR {card.power} · BST {bst} · '
+                 f'{card.rarity}</text>')
+        p.append(f'<text x="{PAD+26}" y="{H-30}" font-size="11" fill="#7f868f">'
+                 f'tap to flip → stats</text>')
+    elif face == "back":
+        _stat_bars(p, card, ART_Y + 6, border, accent)
+        # subscore breakdown + flavor under the bars
+        fy = ART_Y + 6 + 6 * 30 + 14
+        p.append(f'<text x="{PAD+8}" y="{fy}" font-size="13" fill="{accent}" '
+                 f'font-weight="bold" letter-spacing="2">VALUE BREAKDOWN</text>')
+        order = ["completeness", "reusability", "richness", "pedigree", "heft"]
+        for k, sk in enumerate(order):
+            v = card.subscores.get(sk, 0)
+            p.append(f'<text x="{PAD+8}" y="{fy+24+k*20}" font-size="12" '
+                     f'fill="#b8bdc4">{sk.capitalize():<14}</text>')
+            p.append(f'<text x="{W-PAD-8}" y="{fy+24+k*20}" text-anchor="end" '
+                     f'font-size="12" fill="#f4f6f8">{v}</text>')
+        gy = fy + 24 + 5 * 20 + 18
+        p.append(f'<text x="{PAD+8}" y="{gy}" font-size="13" fill="{accent}" '
+                 f'font-weight="bold">BST {bst}</text>')
+        for j, ln in enumerate(_wrap(card.flavor, 52, maxlines=3)):
+            p.append(f'<text x="{PAD+8}" y="{gy+22+j*16}" font-size="11" '
+                     f'fill="#9aa0a8">{_esc(ln)}</text>')
+        p.append(f'<text x="{W-PAD-26}" y="{H-30}" text-anchor="end" font-size="11" '
+                 f'fill="#7f868f">← tap to flip</text>')
+    else:  # full
+        _stat_bars(p, card, ART_Y + ART_H + 26, border, accent)
+        fy = ART_Y + ART_H + 26 + 6 * 30 + 6
+        p.append(f'<text x="{PAD+8}" y="{fy+8}" font-size="12" fill="{accent}" '
+                 f'font-weight="bold">BST {bst}</text>')
+        for j, ln in enumerate(_wrap(card.flavor, 58)):
+            p.append(f'<text x="{PAD+8}" y="{fy+26+j*15}" font-size="11" '
+                     f'fill="#9aa0a8">{_esc(ln)}</text>')
     p.append("</svg>")
     return "".join(p)
 
@@ -382,8 +529,13 @@ def render_card(card: Card, out_dir: Path, backend: str, fmt: str) -> Path:
 RARITY_ORDER = {"Legendary": 0, "Epic": 1, "Rare": 2, "Uncommon": 3, "Common": 4}
 
 
-def build_gallery(cards: list[Card], out_dir: Path, backend: str) -> Path:
-    """Render every card as an inline SVG and lay them out in one index.html."""
+def build_gallery(cards: list[Card], out_dir: Path, backend: str,
+                  flip: bool = False) -> Path:
+    """Render every card as an inline SVG and lay them out in one index.html.
+
+    flip=False → a static grid of 'full' cards (art + stats), good for PNG export.
+    flip=True  → an interactive hub: each card shows its VM dossier on the front
+                 and flips on hover/click to reveal the stat block on the back."""
     out_dir.mkdir(parents=True, exist_ok=True)
     cards = sorted(cards, key=lambda c: (RARITY_ORDER.get(c.rarity, 9), -c.power))
     tally: dict[str, int] = {}
@@ -396,28 +548,59 @@ def build_gallery(cards: list[Card], out_dir: Path, backend: str) -> Path:
             except Exception as e:
                 print(f"  ! {c.label}: {backend} art failed ({e}); sigil", file=sys.stderr)
         tally[c.rarity] = tally.get(c.rarity, 0) + 1
-        cells.append(f'<div class="card">{render_card_svg(c, art_uri)}</div>')
+        if flip:
+            front = render_card_svg(c, art_uri, face="front")
+            back = render_card_svg(c, art_uri, face="back")
+            cells.append(
+                f'<div class="flip-card" tabindex="0"><div class="flip-inner">'
+                f'<div class="flip-face flip-front">{front}</div>'
+                f'<div class="flip-face flip-back">{back}</div>'
+                f'</div></div>')
+        else:
+            cells.append(f'<div class="card">{render_card_svg(c, art_uri)}</div>')
         print(f"  rendered {c.rarity:<10} {c.label}")
     spread = " · ".join(f"{n}× {r}" for r, n in
                         sorted(tally.items(), key=lambda kv: RARITY_ORDER.get(kv[0], 9)))
-    html = (
-        '<!doctype html><html><head><meta charset="utf-8">'
-        '<style>'
-        'body{margin:0;background:#0a0c10;color:#e8eaed;'
-        'font-family:DejaVu Sans,Arial,sans-serif}'
-        '.hd{padding:28px 36px 8px}'
-        '.hd h1{margin:0;font-size:30px}'
-        '.hd p{margin:6px 0 0;color:#9aa0a8;font-size:15px}'
+    flip_css = (
+        '.grid{display:grid;grid-template-columns:repeat(4,500px);gap:30px;'
+        'padding:24px 36px 60px;justify-content:center}'
+        '.flip-card{width:500px;height:700px;perspective:1600px;cursor:pointer;'
+        'outline:none}'
+        '.flip-inner{position:relative;width:100%;height:100%;'
+        'transition:transform .7s cubic-bezier(.2,.7,.2,1);transform-style:preserve-3d}'
+        '.flip-card:hover .flip-inner,.flip-card:focus .flip-inner,'
+        '.flip-card.flipped .flip-inner{transform:rotateY(180deg)}'
+        '.flip-face{position:absolute;inset:0;backface-visibility:hidden;'
+        'border-radius:22px;box-shadow:0 10px 36px rgba(0,0,0,.65);overflow:hidden}'
+        '.flip-face svg{width:500px;height:700px;display:block}'
+        '.flip-back{transform:rotateY(180deg)}'
+        '@media(max-width:2100px){.grid{grid-template-columns:repeat(3,500px)}}')
+    static_css = (
         '.grid{display:grid;grid-template-columns:repeat(4,500px);gap:26px;'
         'padding:24px 36px 40px;justify-content:center}'
         '.card svg{width:500px;height:700px;display:block;'
         'border-radius:22px;box-shadow:0 8px 30px rgba(0,0,0,.6)}'
-        '@media(max-width:2100px){.grid{grid-template-columns:repeat(3,500px)}}'
+        '@media(max-width:2100px){.grid{grid-template-columns:repeat(3,500px)}}')
+    sub = ('hover or tap a card to flip → stats' if flip
+           else f'{len(cards)} saved VMs · {spread}')
+    script = ('<script>document.querySelectorAll(".flip-card").forEach(c=>'
+              'c.addEventListener("click",()=>c.classList.toggle("flipped")));'
+              '</script>') if flip else ''
+    html = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<style>'
+        'body{margin:0;background:radial-gradient(1200px 700px at 50% -10%,'
+        '#161b24,#0a0c10 60%);color:#e8eaed;'
+        'font-family:DejaVu Sans,Arial,sans-serif}'
+        '.hd{padding:28px 36px 8px}'
+        '.hd h1{margin:0;font-size:30px;letter-spacing:1px}'
+        '.hd p{margin:6px 0 0;color:#9aa0a8;font-size:15px}'
+        f'{flip_css if flip else static_css}'
         '</style></head><body>'
         f'<div class="hd"><h1>hack-house VM Cardex</h1>'
-        f'<p>{len(cards)} saved VMs · {spread}</p></div>'
+        f'<p>{len(cards)} saved VMs · {spread}{"  —  " + sub if flip else ""}</p></div>'
         f'<div class="grid">{"".join(cells)}</div>'
-        '</body></html>')
+        f'{script}</body></html>')
     idx = out_dir / "index.html"
     idx.write_text(html)
     return idx
@@ -438,6 +621,8 @@ def main(argv=None) -> int:
                    help="just print the AI-art prompt(s) and exit")
     p.add_argument("--gallery", action="store_true",
                    help="emit a single browser index.html grid of all cards")
+    p.add_argument("--flip", action="store_true",
+                   help="with --gallery: interactive flip cards (front=dossier, back=stats)")
     args = p.parse_args(argv)
 
     entries = load_entries(Path(args.registry))
@@ -451,6 +636,10 @@ def main(argv=None) -> int:
         return 2
 
     cards = [card_from_entry(e) for e in entries]
+    # rarity is a population quota — grade the full library on the curve so the
+    # gallery matches `hh-cardex`. A lone --label card keeps its absolute rarity.
+    if not args.label:
+        grade_curve(cards)
     if args.prompt:
         for c in cards:
             print(f"# {c.label} [{c.rarity} {('/'.join(c.types))}]\n{build_prompt(c)}\n")
@@ -458,7 +647,7 @@ def main(argv=None) -> int:
 
     out = Path(args.out)
     if args.gallery:
-        idx = build_gallery(cards, out, args.art)
+        idx = build_gallery(cards, out, args.art, flip=args.flip)
         print(f"gallery → {idx}")
         return 0
     for c in cards:

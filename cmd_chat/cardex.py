@@ -60,13 +60,26 @@ CAPABILITY_WEIGHT = {
     "security": 1.0, "smoke": 0.0, "slice": 0.0,
 }
 
-# Rarity by absolute PowerScore cutoff (user choice: stable & reproducible).
-# Calibrated against the live library distribution so tiers actually spread.
+# Rarity as a population QUOTA (a curve). PowerScore still ranks the cards, but
+# the quota fixes the *shape* of the pyramid so a tight cluster of loop-built
+# near-clones can't all land Legendary — scarcity is guaranteed regardless of how
+# the raw scores inflate. This is the primary rarity mechanism (see grade_curve).
+RARITY_QUOTA = [
+    ("Legendary", 0.08),
+    ("Epic", 0.15),
+    ("Rare", 0.25),
+    ("Uncommon", 0.27),
+    ("Common", 0.25),
+]
+
+# Absolute PowerScore cutoffs — a *fallback* used only when a single card is
+# scored in isolation (no population to curve against). Calibrated to the live
+# fixed-axis distribution so a lone card still grades sanely.
 RARITY_TIERS = [
-    ("Legendary", 720),
-    ("Epic", 660),
-    ("Rare", 540),
-    ("Uncommon", 380),
+    ("Legendary", 830),
+    ("Epic", 800),
+    ("Rare", 720),
+    ("Uncommon", 560),
     ("Common", 0),
 ]
 
@@ -142,16 +155,32 @@ def _richness(purpose: str, objective: str, tags: list, has_usage: bool) -> floa
 
 
 def _pedigree(provenance: list, created_by: str) -> float:
-    """How battle-tested / hand-built its lineage is."""
-    v = min(len(provenance) * 3, 8)
-    v += 2 if created_by.strip().lower() not in ("", "smoke", "pulled") else 0
-    return _clamp(v, 0, PED_MAX)
+    """How hand-built its lineage is — registry-derivable from the author, then
+    deepened by manifest provenance when a deep manifest is supplied.
+
+    The author tier is the load-bearing signal the CLI actually has: a VM built by
+    a named human outranks a loop-mass-produced near-clone, which outranks a
+    pulled/smoke throwaway. (Provenance lives in the deep .hh-agent manifest and
+    is absent for registry-only scoring, so it can only *add*, never gate.)"""
+    cb = (created_by or "").strip().lower()
+    if cb in ("", "smoke"):
+        base = 0.0
+    elif cb == "pulled":
+        base = 1.0
+    elif cb == "hh-loop":
+        base = 4.0            # a real, reproducible automated build
+    else:
+        base = 8.0            # hand-authored by a named human
+    base += min(len(provenance) * 2.0, PED_MAX - base)   # manifest deepens lineage
+    return _clamp(base, 0, PED_MAX)
 
 
 def _heft(size_bytes: int) -> float:
-    """Installed payload over the empty base — log-scaled so giants don't run away."""
+    """Installed payload over the empty base — log-scaled against a 512MB
+    reference so heft spreads across the payload range instead of pinning every
+    mid-size VM at the cap (the old /6.0 scale saturated by ~350MB)."""
     payload_mb = max(0.0, (size_bytes or 0) / 1e6 - BASE_MB)
-    return _clamp(5.0 * math.log2(1 + payload_mb / 6.0), 0, HEFT_MAX)
+    return _clamp(HEFT_MAX * math.log2(1 + payload_mb) / math.log2(1 + 512), 0, HEFT_MAX)
 
 
 def _rarity_of(power: int) -> str:
@@ -159,6 +188,12 @@ def _rarity_of(power: int) -> str:
         if power >= floor:
             return name
     return "Common"
+
+
+def _flavor(rarity: str, types: list, purpose: str, bst: int) -> str:
+    ty = "/".join(types)
+    return (f"A {rarity.lower()} {ty}-type born from {purpose.rstrip('.')}. "
+            f"Base stat total {bst}.")
 
 
 # ── stats: the same sub-scores, re-projected onto the 6 classic stats ─────────
@@ -222,6 +257,7 @@ class Card:
     subscores: dict = field(default_factory=dict)
     shiny: bool = False             # deterministic "holo pull"
     status: str = ""                # VM build status (done / in_progress / …)
+    purpose: str = ""               # the VM's human description (card front text)
     flavor: str = ""
 
     def to_dict(self) -> dict:
@@ -277,14 +313,46 @@ def card_from_entry(entry: dict, manifest: dict | None = None) -> Card:
     shiny = (_seed(label) >> 16) % 16 == 0   # ~1/16, the classic shiny odds
     name = _name(label, types[0], rarity)
     purpose = entry.get("purpose") or objective or "an unknown sandbox"
-    ty = "/".join(types)
-    flavor = (f"A {rarity.lower()} {ty}-type born from {purpose.rstrip('.')}. "
-              f"Base stat total {sum(stats.values())}.")
+    flavor = _flavor(rarity, types, purpose, sum(stats.values()))
 
     status = (entry.get("status") or "unknown").strip().lower()
     return Card(label=label, name=name, dex=_dex(label), rarity=rarity, power=power,
                 types=types, stats=stats, subscores=subs, shiny=shiny,
-                status=status, flavor=flavor)
+                status=status, purpose=purpose, flavor=flavor)
+
+
+# ── population rarity curve ───────────────────────────────────────────────────
+def _apply_rarity(card: Card, rarity: str) -> None:
+    """Reassign a card's rarity (e.g. after curve grading) and rebuild the
+    rarity-dependent fields — the procedural name suffix and the flavor line."""
+    card.rarity = rarity
+    card.name = _name(card.label, card.types[0], rarity)
+    card.flavor = _flavor(rarity, card.types, card.purpose, sum(card.stats.values()))
+
+
+def grade_curve(cards: list[Card]) -> list[Card]:
+    """Re-grade a whole library's rarity on the population curve (in place).
+
+    PowerScore is the ranking key; RARITY_QUOTA fixes the shape of the pyramid so
+    a tight cluster of loop-built near-clones can't all land Legendary. Rank ties
+    break deterministically on the VM label, so a fixed library always grades the
+    same way — and each card's name/flavor is rebuilt to match its new tier.
+
+    Use this whenever scoring a *library*; a single card scored alone keeps its
+    absolute-threshold rarity (there is no population to rank it against)."""
+    if not cards:
+        return cards
+    order = sorted(cards, key=lambda c: (-c.power, _seed(c.label)))
+    n = len(order)
+    cuts, acc = [], 0.0
+    for name, q in RARITY_QUOTA:
+        acc += q
+        cuts.append((name, acc))
+    for i, c in enumerate(order):
+        f = (i + 0.5) / n
+        rarity = next((name for name, cum in cuts if f <= cum), "Common")
+        _apply_rarity(c, rarity)
+    return cards
 
 
 # ── registry I/O + CLI ────────────────────────────────────────────────────────
@@ -327,12 +395,17 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     entries = load_entries(Path(args.registry))
-    if args.label:
+    single = bool(args.label)
+    if single:
         entries = [e for e in entries if e.get("label") == args.label]
         if not entries:
             print(f"no VM labelled '{args.label}' in {args.registry}")
             return 1
     cards = [card_from_entry(e) for e in entries]
+    # rarity is a population quota: grade the whole library on the curve. A lone
+    # --label card keeps its absolute-threshold rarity (nothing to rank against).
+    if not single:
+        grade_curve(cards)
 
     if args.json:
         out = [c.to_dict() for c in cards]
