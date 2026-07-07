@@ -28,6 +28,36 @@ $HH manifest push --root /root --name <vm> --purpose … --objective …    # ha
 $HH spawn "<objective incl. the full join cmd>" --room-host … --go --skip-permissions
 ```
 
+## Mobile operator on Android / Termux — the phone is REACHABLE, use it
+
+Spec: `docs/termux-operator.md`. The operator side is pure Python and runs on
+the **Fairphone-6** in Termux. You can drive that device directly over SSH — so
+**verify reachability before ever telling the user "this can only run on-device,
+paste it back."** That framing is wrong when the phone is a live SSH host.
+
+```bash
+# Fairphone-6 Termux over Tailscale (verified 2026-07-07). sshd on port 8022.
+ssh -i ~/.ssh/phone-deploy -p 8022 u0_a203@100.95.202.68
+```
+
+- Tailscale device `fairphone-6` = **`100.95.202.68`**, port **8022**, user
+  **`u0_a203`**, key **`~/.ssh/phone-deploy`**. Confirm it's up first:
+  `tailscale status | grep fairphone` and a TCP probe of `:8022`.
+- **Trap:** the `~/.ssh/config` aliases `phone` / `phone-deploy` point at
+  `100.95.180.14` (`trilluminati`), a *different, usually-offline* phone —
+  `ssh phone` will time out. Use the Fairphone IP above, not the alias.
+- Termux facts: Python 3.13 (≥3.11); **no `/tmp`** — `$TMPDIR` is
+  `$HOME/.claude-temp`; `$PREFIX=/data/data/com.termux/files/usr`; `rustc`/
+  `openssl` not installed by default.
+- Deps that work: `pkg install python-cryptography` (avoid a rust build),
+  `pip install requests rich websockets`; **skip `srp`** — the client falls back
+  to `cmd_chat/client/_srp_pure` (pure-Python SRP-6a shim).
+- Push-restricted work: copy this tree to the phone with tar-over-ssh rather
+  than a stale gitea clone —
+  `tar czf - cmd_chat scripts requirements-operator.txt | ssh … 'tar xzf - -C ~/hh-mobile'`.
+- Phase-0 gate: `python scripts/termux-preflight.py` on the phone → expect
+  `RESULT: PASS`. Operator files currently staged at `~/hh-mobile` on-device.
+
 ## Key components
 
 | What | Where |
