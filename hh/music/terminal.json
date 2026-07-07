@@ -1,0 +1,13 @@
+{
+  "name": "terminal",
+  "about": "Hacker synth & chiptune — neon arcades and late-night shells.",
+  "license": "CC BY 4.0 — Kevin MacLeod (incompetech.com)",
+  "tracks": [
+    { "title": "Neon Laser Horizon", "artist": "Kevin MacLeod", "src": "terminal/01-neon-laser-horizon.mp3", "secs": 178 },
+    { "title": "Cyborg Ninja", "artist": "Kevin MacLeod", "src": "terminal/02-cyborg-ninja.mp3", "secs": 180 },
+    { "title": "Space Fighter Loop", "artist": "Kevin MacLeod", "src": "terminal/03-space-fighter-loop.mp3", "secs": 101 },
+    { "title": "Voltaic", "artist": "Kevin MacLeod", "src": "terminal/04-voltaic.mp3", "secs": 196 },
+    { "title": "Blip Stream", "artist": "Kevin MacLeod", "src": "terminal/05-blip-stream.mp3", "secs": 284 },
+    { "title": "Pixelland", "artist": "Kevin MacLeod", "src": "terminal/06-pixelland.mp3", "secs": 233 }
+  ]
+}

@@ -397,6 +397,25 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
             ],
         },
         HelpCluster {
+            title: "MUSIC (session soundtrack)",
+            items: vec![
+                kv(
+                    "/music  ·  /music list",
+                    "list albums (bundled 'crypt'/'terminal' + your imports) and what's playing",
+                ),
+                kv("/music play <album>", "start an album — tracks auto-advance and loop"),
+                kv(
+                    "/music play  ·  random",
+                    "blank or 'random' shuffles to a random album",
+                ),
+                kv("/music stop  ·  next", "stop playback  ·  skip to the next track"),
+                kv(
+                    "/music import <path>",
+                    "add a file/folder of your own audio as a new album (… as <name>)",
+                ),
+            ],
+        },
+        HelpCluster {
             title: "LAYOUT (resize panes)",
             items: vec![
                 kv("F4", "fullscreen the terminal (cycle: terminal → chat → split)"),
@@ -655,7 +674,7 @@ fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme
     } else {
         "✖ closed · Ctrl-R to reconnect"
     };
-    let bar = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" {0} hack-house {0} ", theme.sigil),
             Style::default()
@@ -667,8 +686,15 @@ fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme
             format!("· house {}/{} ", app.users.len(), cap),
             Style::default().fg(theme.title),
         ),
-    ]);
-    f.render_widget(Paragraph::new(bar), area);
+    ];
+    // Now-playing indicator — shown only while background music is running.
+    if let Some(np) = &app.now_playing {
+        spans.push(Span::styled(
+            format!("· ♪ {np} "),
+            Style::default().fg(theme.accent),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Render one chat record into one-or-more visual lines. A record may carry
