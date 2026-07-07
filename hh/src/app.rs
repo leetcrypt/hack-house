@@ -2,6 +2,7 @@
 
 use crate::ft;
 use crate::layout::{Dir, Layout, Resize};
+use crate::music;
 use crate::net::{self, Session};
 use crate::registry;
 use crate::sbx;
@@ -318,6 +319,10 @@ pub struct App {
     /// and creds aren't cached). While `Some`, keystrokes feed this masked
     /// buffer instead of chat — the secret never leaves the client.
     pub sudo_prompt: Option<SudoPrompt>,
+    /// "album ▸ Track" for the music now-playing indicator, or None when no
+    /// background music is playing. Mirrors the `music::Player` label so the UI
+    /// never has to touch the player's process handle.
+    pub now_playing: Option<String>,
 }
 
 impl App {
@@ -355,6 +360,7 @@ impl App {
             layout: Layout::default(),
             focused_pane: None,
             sudo_prompt: None,
+            now_playing: None,
         }
     }
 
@@ -1024,6 +1030,8 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
     let mut send_seq: u64 = 0;
     // The local AI agent subprocess this client spawned via `/ai start`, if any.
     let mut agent: Option<std::process::Child> = None;
+    // Background-music session this client started via `/music play`, if any.
+    let mut music: Option<music::Player> = None;
     let downloads = PathBuf::from("./downloads");
 
     enable_raw_mode()?;
@@ -1433,7 +1441,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     handle_command(&line, &mut app, &mut theme, &mut send_seq,
                                         &mut broker, &mut broker_meta, &mut launching, &mut announced_dims,
                                         &out_tx, &pty_tx, &broker_tx, &app_tx, &session, &term,
-                                        &mut agent, &params);
+                                        &mut agent, &mut music, &params);
                                 }
                                 KeyCode::Backspace => { app.input.pop(); }
                                 // Scroll: ↑/↓ scroll the sandbox terminal if one is up,
@@ -1813,7 +1821,18 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
             }
             _ = sigterm.recv() => { break Ok(()); }
             _ = sighup.recv() => { break Ok(()); }
-            _ = tick.tick() => { app.spin = app.spin.wrapping_add(1); }
+            _ = tick.tick() => {
+                app.spin = app.spin.wrapping_add(1);
+                // Advance background music when the current track ends. Compute
+                // the event before touching `music`/`app` so the player borrow
+                // is released first.
+                let ev = music.as_mut().and_then(|p| p.tick());
+                match ev {
+                    Some(Ok(label)) => app.now_playing = Some(label),
+                    Some(Err(e)) => { music = None; app.now_playing = None; app.err(e); }
+                    None => {}
+                }
+            }
         }
     };
 
@@ -1826,6 +1845,9 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
     if let Some(mut child) = agent.take() {
         let _ = child.kill();
         let _ = child.wait();
+    }
+    if let Some(mut p) = music.take() {
+        p.stop();
     }
     disable_raw_mode()?;
     execute!(
@@ -1916,6 +1938,7 @@ fn handle_command(
     session: &Session,
     term: &Terminal<CrosstermBackend<std::io::Stdout>>,
     agent: &mut Option<std::process::Child>,
+    music: &mut Option<music::Player>,
     params: &net::ConnParams,
 ) {
     let room = &session.room;
@@ -1935,6 +1958,102 @@ fn handle_command(
             app.sys("† no room password (joined without one)");
         } else {
             app.sys(format!("† room password: {}", app.password));
+        }
+    } else if let Some(rest) = line.strip_prefix("/music") {
+        // Background music for the session. Plays bundled CC-BY albums or the
+        // operator's imported files through an external player (ffplay/mpv/cvlc);
+        // the run loop's tick auto-advances tracks. Local to this client — never
+        // broadcast, so each member scores their own session.
+        let rest = rest.trim();
+        let (cmd, arg) = rest
+            .split_once(char::is_whitespace)
+            .map(|(c, a)| (c, a.trim()))
+            .unwrap_or((rest, ""));
+        // Start (or restart into) an album by name, replacing any current session.
+        let play = |app: &mut App, music: &mut Option<music::Player>, name: &str| {
+            if let Some(mut p) = music.take() {
+                p.stop();
+            }
+            match music::Player::start(name) {
+                Ok(p) => {
+                    let label = p.label();
+                    *music = Some(p);
+                    app.now_playing = Some(label.clone());
+                    app.sys(format!("♪ playing {label}"));
+                }
+                Err(e) => app.err(e),
+            }
+        };
+        match cmd {
+            "" | "list" | "ls" => {
+                app.sys(format!(
+                    "♪ albums: {} — /music play [album] (blank/random = shuffle) · stop · next · import <path> [as <name>]",
+                    music::once_or_none(music::available())
+                ));
+                if let Some(np) = &app.now_playing {
+                    app.sys(format!("♪ now playing: {np}"));
+                }
+            }
+            "play" | "start" => {
+                // Bare `/music play`, or `/music play random|shuffle`, rolls a
+                // random album; otherwise play the named one.
+                let pick = if arg.is_empty()
+                    || arg.eq_ignore_ascii_case("random")
+                    || arg.eq_ignore_ascii_case("shuffle")
+                {
+                    music::random()
+                } else {
+                    Some(arg.to_string())
+                };
+                match pick {
+                    Some(name) => play(app, music, &name),
+                    None => app.err("no albums installed"),
+                }
+            }
+            "stop" | "off" | "pause" => {
+                if let Some(mut p) = music.take() {
+                    p.stop();
+                    app.now_playing = None;
+                    app.sys("♪ music stopped");
+                } else {
+                    app.sys("♪ nothing playing");
+                }
+            }
+            "next" | "skip" => match music.as_mut() {
+                Some(p) => match p.skip() {
+                    Ok(label) => {
+                        app.now_playing = Some(label.clone());
+                        app.sys(format!("♪ playing {label}"));
+                    }
+                    Err(e) => {
+                        *music = None;
+                        app.now_playing = None;
+                        app.err(e);
+                    }
+                },
+                None => app.sys("♪ nothing playing — /music play <album>"),
+            },
+            "random" | "shuffle" => match music::random() {
+                Some(name) => play(app, music, &name),
+                None => app.err("no albums installed"),
+            },
+            "import" | "add" if !arg.is_empty() => {
+                // `/music import <path> [as <name>]`
+                let (path, as_name) = match arg.rsplit_once(" as ") {
+                    Some((p, n)) => (p.trim(), Some(n.trim())),
+                    None => (arg, None),
+                };
+                match music::import(path, as_name) {
+                    Ok((name, n)) => app.sys(format!(
+                        "♪ imported {n} track(s) as album '{name}' — /music play {name}"
+                    )),
+                    Err(e) => app.err(e),
+                }
+            }
+            "import" | "add" => app.err("usage: /music import <file-or-dir> [as <name>]"),
+            other => app.err(format!(
+                "unknown /music '{other}' — list · play <album> · stop · next · random · import <path>"
+            )),
         }
     } else if let Some(rest) = line.strip_prefix("/theme") {
         // Live vestment switch: `/theme <name>`, or bare `/theme` to list options.
@@ -3058,7 +3177,7 @@ fn local_ollama_models() -> Result<Vec<String>, String> {
 /// known command family that legitimately falls through to chat (e.g. `/ai
 /// <question>`) and as the candidate set for the "did you mean" suggester.
 const KNOWN_COMMANDS: &[&str] = &[
-    "/help", "/?", "/clear", "/cls", "/pw", "/password", "/theme", "/layout", "/drive",
+    "/help", "/?", "/clear", "/cls", "/pw", "/password", "/theme", "/layout", "/music", "/drive",
     "/sendroom", "/send", "/accept", "/reject", "/sbx", "/unsudo", "/sudo", "/grant", "/revoke",
     "/ai",
 ];

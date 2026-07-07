@@ -8,6 +8,7 @@ mod app;
 mod crypto;
 mod ft;
 mod layout;
+mod music;
 mod net;
 mod registry;
 mod sbx;
