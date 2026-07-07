@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-import srp
+try:
+    import srp
+except ImportError:  # no aarch64 wheel / C-ext build under Termux — use the shim
+    from . import _srp_pure as srp
 import requests
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
