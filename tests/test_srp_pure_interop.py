@@ -107,3 +107,82 @@ def test_pure_client_full_http_handshake(test_client):
 
     assert usr.authenticated(), "server accepted us but H_AMK did not match"
     assert verify["ws_token"], "no ws_token issued — cannot join the room"
+
+
+# --- Inverse direction: the pure *Verifier* (server side) --------------------
+# When the server itself runs on Termux (no srp C-extension — e.g. a room HOSTED
+# ON THE PHONE) srp_auth.py falls back to pure.Verifier. These tests exercise
+# that server surface, so a broken constant in the shim's Verifier can't ship.
+
+
+def test_real_user_authenticates_against_pure_verifier():
+    """A real srp.User (C-ext client, e.g. a laptop) must authenticate against
+    the pure Verifier — the exact cross-implementation handshake proven live
+    when the laptop joined a phone-hosted room."""
+    salt, vkey = srp.create_salted_verification_key(
+        b"chat", PASSWORD, hash_alg=srp.SHA256
+    )
+
+    usr = srp.User(b"chat", PASSWORD, hash_alg=srp.SHA256)
+    _, A = usr.start_authentication()
+
+    svr = pure.Verifier(b"chat", salt, vkey, A, hash_alg=pure.SHA256)
+    s, B = svr.get_challenge()
+    assert B is not None, "pure Verifier aborted the SRP-6a safety check"
+
+    M = usr.process_challenge(s, B)
+    assert M is not None, "real client failed the SRP-6a safety checks"
+
+    H_AMK = svr.verify_session(M)
+    assert H_AMK is not None, "pure Verifier rejected the real client's proof M1"
+
+    usr.verify_session(H_AMK)
+    assert usr.authenticated(), "real client rejected the pure Verifier's H_AMK"
+    assert svr.authenticated()
+    # Both sides must derive the identical session key or encryption breaks.
+    assert usr.get_session_key() == svr.get_session_key()
+
+
+def test_pure_user_authenticates_against_pure_verifier():
+    """Both ends on Termux (pure client + pure Verifier) — a room hosted and
+    joined entirely without the C-extension must still complete the handshake."""
+    salt, vkey = pure.create_salted_verification_key(
+        b"chat", PASSWORD, hash_alg=pure.SHA256
+    )
+
+    usr = pure.User(b"chat", PASSWORD, hash_alg=pure.SHA256)
+    _, A = usr.start_authentication()
+
+    svr = pure.Verifier(b"chat", salt, vkey, A, hash_alg=pure.SHA256)
+    s, B = svr.get_challenge()
+    assert B is not None
+
+    M = usr.process_challenge(s, B)
+    assert M is not None
+
+    H_AMK = svr.verify_session(M)
+    assert H_AMK is not None
+
+    usr.verify_session(H_AMK)
+    assert usr.authenticated()
+    assert svr.authenticated()
+    assert usr.get_session_key() == svr.get_session_key()
+
+
+def test_pure_verifier_rejects_wrong_password():
+    """Negative control for the pure Verifier: a bad password must never
+    authenticate, proving the positive tests aren't passing trivially."""
+    salt, vkey = srp.create_salted_verification_key(
+        b"chat", PASSWORD, hash_alg=srp.SHA256
+    )
+
+    usr = srp.User(b"chat", b"wrongpassword", hash_alg=srp.SHA256)
+    _, A = usr.start_authentication()
+
+    svr = pure.Verifier(b"chat", salt, vkey, A, hash_alg=pure.SHA256)
+    s, B = svr.get_challenge()
+
+    M = usr.process_challenge(s, B)
+    assert svr.verify_session(M) is None
+    assert not svr.authenticated()
+    assert svr.get_session_key() is None

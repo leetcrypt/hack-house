@@ -5,7 +5,7 @@ often fails to build under Termux/Android. This module reproduces the *exact*
 client-side derivation of that package's pure-Python reference (``srp._pysrp``)
 with ``rfc5054_enable()`` active, using only the standard library.
 
-Only the surface ``cmd_chat/client/client.py`` consumes is provided:
+The client surface ``cmd_chat/client/client.py`` consumes:
 
     rfc5054_enable()                                  # module-level toggle
     SHA256                                            # hash-alg constant
@@ -15,10 +15,19 @@ Only the surface ``cmd_chat/client/client.py`` consumes is provided:
     usr.verify_session(H_AMK)                          # sets authenticated flag
     usr.authenticated()                               # -> bool
 
-The server uses the real ``srp`` library (see cmd_chat/server/srp_auth.py), so
-every constant, padding rule, and hash input here mirrors ``srp._pysrp`` byte
-for byte — otherwise the M1 / H_AMK proofs would not match and auth would fail.
-Correctness is gated by tests/test_srp_pure_interop.py.
+The server surface ``cmd_chat/server/srp_auth.py`` consumes (so a phone/Termux
+box with no ``srp`` C-ext can *host* a room, not only join one):
+
+    salt, vkey = create_salted_verification_key(b"chat", pw, hash_alg=SHA256)
+    svr  = Verifier(b"chat", salt, vkey, A, hash_alg=SHA256)
+    s, B = svr.get_challenge()                         # -> (salt, B_bytes)
+    H_AMK = svr.verify_session(M)                      # -> H_AMK or None
+    K    = svr.get_session_key()
+
+Both sides mirror ``srp._pysrp`` byte for byte — every constant, padding rule,
+and hash input — otherwise the M1 / H_AMK proofs would not match the real
+library and auth would fail. Correctness is gated by
+tests/test_srp_pure_interop.py (pure↔real in both directions).
 """
 
 import hashlib
@@ -334,3 +343,109 @@ class User:
     def verify_session(self, host_HAMK) -> None:
         if self.H_AMK == host_HAMK:
             self._authenticated = True
+
+
+# ── server side ──────────────────────────────────────────────────────────────
+def create_salted_verification_key(
+    username,
+    password,
+    hash_alg=SHA1,
+    ng_type=NG_2048,
+    n_hex=None,
+    g_hex=None,
+    salt_len=4,
+):
+    """Return ``(salt, vkey)`` for a password — mirrors srp._pysrp exactly.
+
+    ``v = g**x mod N`` where ``x = H(salt, H(username:password))``; the salt is
+    ``salt_len`` random bytes. This is what the room stores in place of the
+    password (SRP never sees the password on the wire)."""
+    if ng_type == NG_CUSTOM and (n_hex is None or g_hex is None):
+        raise ValueError("Both n_hex and g_hex are required when ng_type = NG_CUSTOM")
+    hash_class = _hash_map[hash_alg]
+    N, g = _get_ng(ng_type, n_hex, g_hex)
+    _s = _long_to_bytes(_get_random(salt_len))
+    _v = _long_to_bytes(pow(g, _gen_x(hash_class, _s, username, password), N))
+    return _s, _v
+
+
+class Verifier:
+    """Server side of the SRP-6a exchange, matching srp._pysrp.Verifier's surface."""
+
+    def __init__(
+        self,
+        username,
+        bytes_s,
+        bytes_v,
+        bytes_A,
+        hash_alg=SHA1,
+        ng_type=NG_2048,
+        n_hex=None,
+        g_hex=None,
+        bytes_b=None,
+    ):
+        if ng_type == NG_CUSTOM and (n_hex is None or g_hex is None):
+            raise ValueError("Both n_hex and g_hex are required when ng_type = NG_CUSTOM")
+        if bytes_b and len(bytes_b) != 32:
+            raise ValueError("32 bytes required for bytes_b")
+
+        self.A = _bytes_to_long(bytes_A)
+        self.M = None
+        self.K = None
+        self.H_AMK = None
+        self._authenticated = False
+        self.I = username
+        self.s = bytes_s
+        self.v = _bytes_to_long(bytes_v)
+
+        N, g = _get_ng(ng_type, n_hex, g_hex)
+        hash_class = _hash_map[hash_alg]
+        k = _bytes_to_long(_H(hash_class, N, g, width=len(_long_to_bytes(N))))
+
+        self.hash_class = hash_class
+        self.N = N
+        self.g = g
+        self.k = k
+
+        # SRP-6a safety check: abort (no challenge) if A is a multiple of N.
+        self.safety_failed = False
+        if (self.A % N) == 0:
+            self.safety_failed = True
+            self.B = None
+            return
+
+        if bytes_b:
+            self.b = _bytes_to_long(bytes_b)
+        else:
+            self.b = _get_random_of_length(32)
+        self.B = (k * self.v + pow(g, self.b, N)) % N
+        self.u = _bytes_to_long(_H(hash_class, self.A, self.B, width=len(_long_to_bytes(N))))
+        self.S = pow(self.A * pow(self.v, self.u, N), self.b, N)
+        self.K = hash_class(_long_to_bytes(self.S)).digest()
+        self.M = _calculate_M(hash_class, N, g, self.I, self.s, self.A, self.B, self.K)
+        self.H_AMK = _calculate_H_AMK(hash_class, self.A, self.M, self.K)
+
+    def authenticated(self) -> bool:
+        return self._authenticated
+
+    def get_username(self):
+        return self.I
+
+    def get_ephemeral_secret(self) -> bytes:
+        return _long_to_bytes(self.b)
+
+    def get_session_key(self):
+        return self.K if self._authenticated else None
+
+    def get_challenge(self):
+        """Return ``(salt, B_bytes)`` or ``(None, None)`` if the safety check failed."""
+        if self.safety_failed:
+            return None, None
+        return (self.s, _long_to_bytes(self.B))
+
+    def verify_session(self, user_M):
+        """Check the client proof M; return H_AMK (bytes) on success, else None."""
+        if not self.safety_failed and user_M == self.M:
+            self._authenticated = True
+            return self.H_AMK
+        return None
