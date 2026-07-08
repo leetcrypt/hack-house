@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# hh — hack-house mobile launcher (Termux/Fairphone friendly).
+#
+#   hh host  [NAME] [PORT]        start a room ON THIS DEVICE (tmux window)
+#   hh join  HOST PORT [NAME]     join an existing room as an operator (daemon)
+#   hh web   [PORT]               serve the mobile web console (tmux window)
+#   hh op    <operator args...>   passthrough to `python -m cmd_chat.operator`
+#   hh status                     what's running + listening
+#   hh stop  [all|host|web|join]  tear it down
+#
+# Config via env (all optional):
+#   HH_PASSWORD  room password        (default: hh-mobile)
+#   HH_PORT      host port            (default: 8799)
+#   HH_WEB_PORT  web console port     (default: 8790)
+#   HH_NAME      room / operator name (default: current dir basename)
+#   HH_BIND      host/web bind addr   (default: 0.0.0.0 — reachable over Tailscale)
+#   HH_TLS       set to 1 to drop --no-tls (default: no-tls)
+set -euo pipefail
+
+# --- locate the repo root (this script lives in <root>/scripts/hh) -----------
+_self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$_self")"
+cd "$ROOT"
+
+PY="${HH_PY:-python}"
+PW="${HH_PASSWORD:-hh-mobile}"
+PORT="${HH_PORT:-8799}"
+WEB_PORT="${HH_WEB_PORT:-8790}"
+BIND="${HH_BIND:-0.0.0.0}"
+NAME="${HH_NAME:-$(basename "$ROOT")}"
+TLS_FLAG="--no-tls"; [ "${HH_TLS:-0}" = "1" ] && TLS_FLAG=""
+TMUX_SES="hh"
+OP="$PY -m cmd_chat.operator"
+
+_die() { echo "hh: $*" >&2; exit 1; }
+command -v "$PY" >/dev/null || _die "python ('$PY') not found"
+
+# run a long-lived process in a named tmux window (survives SSH disconnect)
+_tmux_run() {  # <window> <command string>
+  local win="$1"; shift
+  command -v tmux >/dev/null || _die "tmux not found (pkg install tmux)"
+  tmux has-session -t "$TMUX_SES" 2>/dev/null || tmux new-session -d -s "$TMUX_SES" -n main
+  if tmux list-windows -t "$TMUX_SES" -F '#W' 2>/dev/null | grep -qx "$win"; then
+    echo "hh: window '$win' already running (hh stop $win to replace)"; return 0
+  fi
+  tmux new-window -t "$TMUX_SES" -n "$win" "cd '$ROOT'; $*; echo '[$win exited — press enter]'; read"
+}
+
+# best-effort Tailscale IP for the "reachable at" hint
+_ts_ip() { command -v tailscale >/dev/null && tailscale ip -4 2>/dev/null | head -1 || true; }
+
+cmd="${1:-status}"; shift || true
+case "$cmd" in
+  host)
+    [ $# -ge 1 ] && NAME="$1"; [ $# -ge 2 ] && PORT="$2"
+    # window name is port-scoped so several rooms (one per direnv dir) coexist
+    _tmux_run "host-$PORT" "$PY cmd_chat.py serve '$BIND' '$PORT' --password '$PW' $TLS_FLAG"
+    ip="$(_ts_ip)"
+    echo "hh: hosting room '$NAME' on $BIND:$PORT (password: $PW)"
+    [ -n "$ip" ] && echo "    reachable at: $ip:$PORT"
+    ;;
+  join)
+    [ $# -ge 2 ] || _die "usage: hh join HOST PORT [NAME]"
+    local_host="$1"; local_port="$2"; jname="${3:-$NAME}"
+    $OP up "$local_host" "$local_port" "$jname" --password "$PW" $TLS_FLAG
+    echo "hh: joined $local_host:$local_port as '$jname' — use: hh op read --wait / hh op say '...'"
+    ;;
+  web)
+    [ $# -ge 1 ] && WEB_PORT="$1"
+    _tmux_run "web-$WEB_PORT" "$OP web --bind '$BIND' --port '$WEB_PORT'"
+    ip="$(_ts_ip)"
+    echo "hh: web console on $BIND:$WEB_PORT"
+    [ -n "$ip" ] && echo "    open on phone browser: http://127.0.0.1:$WEB_PORT  |  from laptop: http://$ip:$WEB_PORT"
+    ;;
+  op)   exec $OP "$@" ;;
+  status)
+    wins="$(tmux list-windows -t "$TMUX_SES" -F '#W' 2>/dev/null || true)"
+    echo "=== tmux windows (session $TMUX_SES) ==="
+    [ -n "$wins" ] && echo "$wins" | sed 's/^/  /' || echo "  (no $TMUX_SES session)"
+    echo "=== rooms (curl health per host-* window, Android-reliable) ==="
+    echo "$wins" | grep '^host-' | while read -r w; do
+      p="${w#host-}"; h="$(curl -s --max-time 3 "http://127.0.0.1:$p/health" 2>/dev/null || true)"
+      [ -n "$h" ] && echo "  host  :$p  UP  ($h)" || echo "  host  :$p  down"
+    done
+    echo "$wins" | grep '^web-' | while read -r w; do
+      p="${w#web-}"; c="$(curl -s --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$p/" 2>/dev/null || true)"
+      [ "$c" = "200" ] && echo "  web   :$p  UP" || echo "  web   :$p  down"
+    done
+    echo "$wins" | grep -qE '^(host|web)-' || echo "  (no rooms/web running)"
+    echo "=== operator daemons ($(basename "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}")/hh-bridge) ==="
+    _br="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/hh-bridge"
+    if [ -d "$_br" ] && ls -1 "$_br" >/dev/null 2>&1 && [ -n "$(ls -A "$_br" 2>/dev/null)" ]; then
+      for d in "$_br"/*/; do
+        [ -S "$d/control.sock" ] && echo "  $(basename "$d")  (socket live)" || echo "  $(basename "$d")  (stale — no socket)"
+      done
+    else echo "  (no operator sessions)"; fi
+    ;;
+  stop)
+    what="${1:-all}"; arg="${2:-}"
+    _kill_windows() {  # <prefix> [port]
+      local pfx="$1" port="${2:-}"
+      local pat; [ -n "$port" ] && pat="^${pfx}-${port}$" || pat="^${pfx}-"
+      tmux list-windows -t "$TMUX_SES" -F '#W' 2>/dev/null | grep -E "$pat" | while read -r w; do
+        tmux kill-window -t "$TMUX_SES:$w" 2>/dev/null && echo "hh: stopped $w"
+      done
+    }
+    case "$what" in
+      host) _kill_windows host "$arg" ;;
+      web)  _kill_windows web  "$arg" ;;
+      join) $OP down 2>/dev/null && echo "hh: operator down" || echo "hh: no operator session" ;;
+      all)
+        _kill_windows host; _kill_windows web
+        $OP down 2>/dev/null && echo "hh: operator down" || true ;;
+      *) _die "usage: hh stop [all|host [PORT]|web [PORT]|join]" ;;
+    esac
+    ;;
+  -h|--help|help) awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "${BASH_SOURCE[0]}" ;;
+  *) _die "unknown command '$cmd' (try: hh help)" ;;
+esac

@@ -10,6 +10,10 @@ reverse-SSH documented as alternates.
 Target device is the Murena Fairphone 6 (Android 15/16 base) running Termux. A
 future postmarketOS path (full Linux userland) is noted in Appendix C.
 
+> **Operators:** for the day-to-day how-to (the `hh` launcher, direnv auto-host,
+> the mobile web console, and pulling captures back to the laptop) see
+> [`mobile-quickstart.md`](mobile-quickstart.md). This document is the design spec.
+
 ---
 
 ## 1. Why this is tractable

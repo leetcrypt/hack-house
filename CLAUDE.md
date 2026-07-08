@@ -31,32 +31,45 @@ $HH spawn "<objective incl. the full join cmd>" --room-host … --go --skip-perm
 ## Mobile operator on Android / Termux — the phone is REACHABLE, use it
 
 Spec: `docs/termux-operator.md`. The operator side is pure Python and runs on
-the **Fairphone-6** in Termux. You can drive that device directly over SSH — so
-**verify reachability before ever telling the user "this can only run on-device,
-paste it back."** That framing is wrong when the phone is a live SSH host.
+the **Fairphone-6** in Termux — it can both **join** and **host** rooms (the SRP
+shim now covers the server side too, so no Rust / no `srp` C-ext). You can drive
+the device directly over SSH — so **verify reachability before ever telling the
+user "this can only run on-device, paste it back."** That framing is wrong when
+the phone answers SSH.
 
+One canonical, hardened invocation (use this prefix everywhere — it sidesteps
+the wrong-alias trap and never hangs):
 ```bash
-# Fairphone-6 Termux over Tailscale (verified 2026-07-07). sshd on port 8022.
-ssh -i ~/.ssh/phone-deploy -p 8022 u0_a203@100.95.202.68
+PHONE='ssh -i ~/.ssh/phone-deploy -p 8022 -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=accept-new u0_a203@100.95.202.68'
+$PHONE 'uname -m; python --version'    # aarch64 / Python 3.13.x
 ```
 
-- Tailscale device `fairphone-6` = **`100.95.202.68`**, port **8022**, user
-  **`u0_a203`**, key **`~/.ssh/phone-deploy`**. Confirm it's up first:
-  `tailscale status | grep fairphone` and a TCP probe of `:8022`.
+- **Reachability gate — probe the PORT, not `tailscale status`:**
+  `timeout 8 bash -c 'cat </dev/null >/dev/tcp/100.95.202.68/8022' && echo REACHABLE || echo OFFLINE`.
+  Tailscale reports `fairphone-6` **`active` even when sshd is dead** — Android
+  kills backgrounded Termux, taking `sshd` with it. The tailnet line is NOT
+  proof; the TCP probe is. If OFFLINE, the fix is **on-device** (wake the phone,
+  relaunch Termux, `termux-wake-lock` + start `sshd`) — say so, don't retry a
+  dead port.
 - **Trap:** the `~/.ssh/config` aliases `phone` / `phone-deploy` point at
   `100.95.180.14` (`trilluminati`), a *different, usually-offline* phone —
-  `ssh phone` will time out. Use the Fairphone IP above, not the alias.
+  `ssh phone` will time out. Use the Fairphone IP `100.95.202.68` (the `$PHONE`
+  prefix), not the alias.
 - Termux facts: Python 3.13 (≥3.11); **no `/tmp`** — `$TMPDIR` is
   `$HOME/.claude-temp`; `$PREFIX=/data/data/com.termux/files/usr`; `rustc`/
   `openssl` not installed by default.
 - Deps that work: `pkg install python-cryptography` (avoid a rust build),
-  `pip install requests rich websockets`; **skip `srp`** — the client falls back
-  to `cmd_chat/client/_srp_pure` (pure-Python SRP-6a shim).
+  `pip install requests rich websockets`; **skip `srp`** — both client and
+  server fall back to `cmd_chat/client/_srp_pure` (pure-Python SRP-6a shim).
 - Push-restricted work: copy this tree to the phone with tar-over-ssh rather
   than a stale gitea clone —
-  `tar czf - cmd_chat scripts requirements-operator.txt | ssh … 'tar xzf - -C ~/hh-mobile'`.
+  `tar czf - cmd_chat scripts requirements-operator.txt | $PHONE 'tar xzf - -C ~/hh-mobile'`.
 - Phase-0 gate: `python scripts/termux-preflight.py` on the phone → expect
-  `RESULT: PASS`. Operator files currently staged at `~/hh-mobile` on-device.
+  `RESULT: PASS`. Operator files staged at `~/hh-mobile` on-device.
+- **Proven live (2026-07-07):** phone JOINS a dev-box room; the phone HOSTS a
+  room the laptop joins (cross-impl SRP: laptop C-ext ↔ phone pure Verifier);
+  and the stdlib mobile web console (`python -m cmd_chat.operator web`) mirrors a
+  real room (terminal + keystroke drive + chat) in a mobile browser.
 
 ## Key components
 
