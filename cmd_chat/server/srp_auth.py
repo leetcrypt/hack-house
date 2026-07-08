@@ -3,7 +3,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 from uuid import uuid4
 
-import srp
+try:
+    import srp
+except ImportError:  # no aarch64 wheel / C-ext build (Termux) — use the shim
+    from ..client import _srp_pure as srp
 
 
 srp.rfc5054_enable()
