@@ -134,6 +134,48 @@ A room often has an `/ai <name>` Ollama agent. To offload a task, just `say`
 `/ai <name> !<task>` and read its reply — cheaper than doing trivial work
 yourself. (Direct operator→Ollama delegation is a later phase.)
 
+## 5. Mobile / Termux (Fairphone) — the phone is a live SSH host
+
+The operator is **pure Python** and runs on the Fairphone-6 in Termux — it can
+both **join** and (with the SRP shim's server side) **host** rooms, no Rust, no
+`srp` C-ext. Drive the phone directly over SSH. **Never tell the user "run this
+on-device, paste it back" without probing reachability first** — that framing is
+wrong when the phone answers SSH.
+
+**One canonical, hardened invocation** (kills the wrong-alias trap — see below):
+```bash
+PHONE='ssh -i ~/.ssh/phone-deploy -p 8022 -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=accept-new u0_a203@100.95.202.68'
+$PHONE 'uname -m; python --version'    # aarch64 / Python 3.13.x
+```
+`BatchMode=yes` fails fast instead of hanging on a password prompt;
+`ConnectTimeout=8` stops indefinite hangs; `accept-new` avoids the first-connect
+host-key prompt while still pinning after.
+
+**Reachability gate — probe the PORT, not `tailscale status`:**
+```bash
+timeout 8 bash -c 'cat </dev/null >/dev/tcp/100.95.202.68/8022' && echo REACHABLE || echo OFFLINE
+```
+`tailscale status` reports `fairphone-6` **`active` even when sshd is dead** —
+Android kills backgrounded Termux, taking `sshd` with it. So the tailnet line is
+NOT proof; the TCP probe is. If the gate says OFFLINE the fix is **on-device**
+(wake the phone, relaunch Termux, `termux-wake-lock` + start `sshd`), not a
+retry loop from here — say so plainly rather than hammering a dead port.
+
+**The wrong-alias trap:** `~/.ssh/config` aliases `phone` / `phone-deploy` point
+at `100.95.180.14` (`trilluminati`), a *different, usually-offline* device.
+`ssh phone` will time out. Always use the Fairphone IP `100.95.202.68` (the
+`$PHONE` prefix above), never the alias.
+
+**Termux env quirks that break naive commands:**
+- **No `/tmp`** — `$TMPDIR` is `$HOME/.claude-temp`; `$PREFIX` =
+  `/data/data/com.termux/files/usr`.
+- `rustc`/`openssl` binaries absent by default; `git/clang/make/pkg-config` present.
+- Deps: `pkg install python-cryptography` (avoids a rust build); `pip install
+  requests rich websockets`; **skip `srp`** → the shim (`cmd_chat/client/
+  _srp_pure`) covers both client and server.
+- Sync the tree with tar-over-ssh, not a stale clone:
+  `tar czf - cmd_chat scripts | $PHONE 'tar xzf - -C ~/hh-mobile'`.
+
 ## Safety
 
 - One bad action's blast radius is the container; `local` exec is opt-in only.
