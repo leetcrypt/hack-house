@@ -42,15 +42,19 @@ _ship(){  # <file>
   [ -x "$TG_SEND" ] || _die "tg-send.sh not found at $TG_SEND"
   echo "→ Telegram ($TGT): $1"; "$TG_SEND" "$1" "$TGT" "phone capture $TS"
 }
-_adb_ready(){ adb devices 2>/dev/null | grep -qE "$IP.*device$"; }
+# first fully-authorized adb device serial (wireless debugging uses a dynamic
+# port, so don't assume :5555 — read whatever 'adb devices' actually shows)
+_adb_serial(){ adb devices 2>/dev/null | awk '$2=="device"{print $1; exit}'; }
+_adb_ready(){ [ -n "$(_adb_serial)" ]; }
 _adb_help(){
   cat >&2 <<EOF
-ADB not connected. One-time setup on the phone:
+ADB not connected. One-time setup on the phone (ports are shown on-device;
+the IP can be the Tailscale IP $IP since adbd binds all interfaces):
   1. Settings → System → Developer options → Wireless debugging: ON
-  2. Tap "Pair device with pairing code" — note the IP:PORT and 6-digit code
-  3. On the laptop:  adb pair <IP>:<PAIR_PORT>   (enter the code)
-  4. Then:           adb connect $IP:<DEBUG_PORT>   (the port under Wireless debugging)
-Re-run this command once 'adb devices' shows $IP as 'device'.
+  2. Tap "Pair device with pairing code" — note the PAIR_PORT and 6-digit code
+  3. On the laptop:  adb pair $IP:<PAIR_PORT>     (enter the code)
+  4. Then:           adb connect $IP:<DEBUG_PORT>   (port under "Wireless debugging")
+Re-run this command once 'adb devices' shows a 'device' line.
 EOF
 }
 
@@ -73,16 +77,18 @@ case "$cmd" in
   shot)
     loc="${1:-$OUTDIR/phone-shot-$TS.png}"
     _adb_ready || { _adb_help; exit 1; }
-    adb -s "$IP:5555" exec-out screencap -p > "$loc" 2>/dev/null || adb exec-out screencap -p > "$loc"
+    dev="$(_adb_serial)"
+    adb -s "$dev" exec-out screencap -p > "$loc"
     [ -s "$loc" ] || _die "screencap produced no data"
     echo "device screenshot → $loc"; _ship "$loc"
     ;;
   screen)
     secs="${1:-15}"; loc="${2:-$OUTDIR/phone-screen-$TS.mp4}"
     _adb_ready || { _adb_help; exit 1; }
+    dev="$(_adb_serial)"
     echo "recording ${secs}s of the device screen…"
-    adb shell screenrecord --time-limit "$secs" /sdcard/hh-rec.mp4
-    adb pull /sdcard/hh-rec.mp4 "$loc" >/dev/null && adb shell rm -f /sdcard/hh-rec.mp4
+    adb -s "$dev" shell screenrecord --time-limit "$secs" /sdcard/hh-rec.mp4
+    adb -s "$dev" pull /sdcard/hh-rec.mp4 "$loc" >/dev/null && adb -s "$dev" shell rm -f /sdcard/hh-rec.mp4
     echo "device screen recording → $loc"; _ship "$loc"
     ;;
   webshot)
