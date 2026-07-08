@@ -25,15 +25,8 @@ Two devices are in play:
 
 ## 1. One-time on-device setup
 
-```bash
-# in Termux, on the phone
-pkg install python tmux git python-cryptography      # cryptography avoids a rust build
-pip install requests rich websockets                 # skip `srp` — the pure shim covers it
-termux-wake-lock                                      # keep Termux/sshd alive when backgrounded
-```
-
-Sync the repo onto the phone (tar-over-ssh from the laptop — no gitea clone
-needed if the branch is unpushed):
+**Step 1 — sync the tree** onto the phone (tar-over-ssh from the laptop; no gitea
+clone needed if the branch is unpushed):
 
 ```bash
 # from the laptop, in this repo
@@ -41,11 +34,21 @@ tar czf - cmd_chat scripts requirements-operator.txt \
   | ssh -i ~/.ssh/phone-deploy -p 8022 u0_a203@100.95.202.68 'mkdir -p ~/hh-mobile && tar xzf - -C ~/hh-mobile'
 ```
 
-Add the launcher alias to `~/.bashrc` on the phone:
+**Step 2 — run the bootstrap** in Termux on the phone. It installs deps
+(`python-cryptography` to dodge a rust build; pure/wheeled pip deps; **no** `srp`
+C-ext — the shim covers it), holds a wake-lock, installs the `hh` alias, and runs
+the Phase-0 preflight. Idempotent — safe to re-run.
 
 ```bash
-alias hh='bash "$HOME/hh-mobile/scripts/hh"'
+# in Termux, on the phone
+bash ~/hh-mobile/scripts/termux-bootstrap.sh
+source ~/.bashrc            # activate the 'hh' alias
 ```
+
+Expect the preflight to end `RESULT: PASS`. (Manual equivalent, if you'd rather:
+`pkg install python tmux git python-cryptography openssh` · `pip install requests
+rich websockets` · `termux-wake-lock` · add `alias hh='bash
+"$HOME/hh-mobile/scripts/hh"'` to `~/.bashrc`.)
 
 ---
 
