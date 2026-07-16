@@ -193,6 +193,40 @@ function ansiToHtml(raw) {
   return out;
 }
 
+/* ── carriage-return overwrite (mini vt) ──
+   A real terminal treats a lone \\r as "cursor to column 0" so readline's
+   in-place prompt redraw (…└─# \\r└─# cmd) overwrites the old line. The DOM
+   instead turns \\r into \\n, stacking the pre-redraw prompt as a phantom
+   extra line. Resolve overwrites per \\n-delimited line, treating ANSI escapes
+   as zero-width (attached to the next column) so colours survive; honour
+   erase-to-EOL (\\x1b[K) so a shrinking redraw leaves no tail chars. */
+function collapseCR(raw) {
+  const escRe = /^(?:\\x1b\\[[0-9;?]*[ -\\/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)|\\x1b[@-Z\\\\-_])/;
+  const elRe = /^\\x1b\\[[02]?K$/;
+  const lines = [];
+  let cells = [], col = 0, pending = "";
+  function flush() {
+    let s = "";
+    for (let k = 0; k < cells.length; k++) s += cells[k] ? (cells[k].pre + cells[k].ch) : "";
+    lines.push(s + pending); pending = ""; cells = []; col = 0;
+  }
+  for (let i = 0; i < raw.length; ) {
+    const m = escRe.exec(raw.slice(i));
+    if (m) {
+      const seq = m[0];
+      if (elRe.test(seq)) cells.length = col;   // erase to end of line
+      else pending += seq;                      // zero-width; ride the next char
+      i += seq.length; continue;
+    }
+    const ch = raw[i++];
+    if (ch === "\\n") flush();
+    else if (ch === "\\r") col = 0;             // overwrite from column 0
+    else { cells[col] = {pre: pending, ch: ch}; pending = ""; col++; }
+  }
+  flush();
+  return lines.join("\\n");
+}
+
 /* ── terminal poll ── */
 async function pollScreen() {
   for (;;) {
@@ -204,7 +238,7 @@ async function pollScreen() {
           termSeq = d.seq;
           const t = $("term");
           const bottom = t.scrollHeight - t.scrollTop - t.clientHeight < 40;
-          if (d.text && d.text.length) t.innerHTML = ansiToHtml(d.text);
+          if (d.text && d.text.length) t.innerHTML = ansiToHtml(collapseCR(d.text));
           if (bottom) t.scrollTop = t.scrollHeight;
         }
       }
