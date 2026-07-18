@@ -1,0 +1,166 @@
+# Curated security-focused brief queue for the hh-loop VM library.
+#
+# Each [[brief]] guides one loop execution to build ONE in-depth, reusable VM:
+# targeted software + curated data + meticulous tooling + a complete .hh-agent
+# manifest. The value bar (see the hh-loop skill) is: reusable, self-describing,
+# verified-before-save, distinct, and bounded (build on the base image, prefer
+# light pip installs + generated/curated datasets over heavy metapackages).
+#
+# All data is synthetic/curated or industry-standard safe test material (e.g. the
+# EICAR test string). No live malware, no real targets. Topology is advisory.
+
+[[brief]]
+label = "crypto-ctf-kit"
+title = "Crypto CTF kit — classic & modern cipher breakers with a graded challenge set"
+mission = "A ready bench for cryptography CTF work: identify, attack, and solve common ciphers, with a curated challenge set + solutions to learn from."
+topology = "solo"
+software = ["python3-pip", "pip:pycryptodome"]
+data = "12 graded challenges (caesar/vigenere/xor/base-layered/RSA-weak-modulus) under /root/challenges/ each with a solution + writeup; a frequency table for English."
+deliverables = [
+  "/root/cryptokit/solve.py — auto-identify + attack (caesar brute, vigenere kasiski, xor single/multi, RSA factor-small-n)",
+  "/root/challenges/*.txt + /root/challenges/SOLUTIONS.md",
+  "/root/README.md with usage + a writeup template",
+]
+verify = "solve.py auto-solves at least the caesar, xor, and RSA-weak challenges; SOLUTIONS.md matches solver output"
+tags = ["crypto", "ctf", "security"]
+
+[[brief]]
+label = "osint-recon-kit"
+title = "OSINT recon kit — passive DNS/cert/subdomain enumeration with reporting"
+mission = "One-stop passive reconnaissance: resolve, enumerate, and fingerprint a domain's footprint without touching the target offensively, then write a clean report."
+topology = "planner+builder"
+software = ["pip:dnspython", "pip:requests"]
+data = "curated subdomain wordlist (500 common names) + a TLD/record reference + sample report against example.com"
+deliverables = [
+  "/root/osint/recon.py — DNS record sweep, subdomain brute (wordlist), CT-log lookup (crt.sh), reverse-DNS, report.md generator",
+  "/root/osint/wordlists/subdomains-500.txt",
+  "/root/README.md + a sample /root/osint/report-example.md",
+]
+verify = "recon.py example.com produces report.md with resolved A/MX/NS records and a subdomain section"
+tags = ["osint", "recon", "dns", "security"]
+
+[[brief]]
+label = "web-fuzz-lab"
+title = "Web fuzzing lab — concurrent content/param fuzzer + curated wordlists + a target"
+mission = "A self-contained web fuzzing range: a fast pure-python fuzzer, real wordlists, and a local vulnerable app to practice against safely."
+topology = "planner+builder+tester"
+software = ["pip:requests"]
+data = "curated wordlists (common dirs ~1000, params ~200, extensions); a seeded local Flask target with hidden endpoints"
+deliverables = [
+  "/root/fuzz/fuzz.py — threaded dir/param fuzzer (status/size filtering, recursion depth 1)",
+  "/root/fuzz/wordlists/{dirs.txt,params.txt,ext.txt}",
+  "/root/target/app.py — local target with hidden /admin, /backup, ?debug= endpoints",
+  "/root/README.md (run target, then fuzz it)",
+]
+verify = "fuzz.py against the local target discovers the hidden /admin and /backup paths"
+tags = ["web", "fuzzing", "security"]
+
+[[brief]]
+label = "log-ir-triage-vm"
+title = "Log IR triage VM — brute-force/anomaly detectors over realistic sample logs"
+mission = "Incident-response triage bench: detectors that turn raw auth/web logs into findings, with realistic datasets and sigma-lite rules to extend."
+topology = "planner+builder"
+software = []
+data = "generated realistic datasets: /root/data/auth.log (with an SSH brute-force burst) and access.log (with a scan + SQLi probe); an IOC list"
+deliverables = [
+  "/root/ir/triage.py — auth brute-force detector (failed-login thresholds per IP), web anomaly finder (4xx bursts, suspicious UA/paths), IOC matcher",
+  "/root/ir/rules/*.yml — sigma-lite detection rules",
+  "/root/data/{auth.log,access.log,iocs.txt}",
+  "/root/README.md + a sample findings.md",
+]
+verify = "triage.py flags the brute-force source IP from auth.log and the SQLi probe from access.log"
+tags = ["dfir", "logs", "detection", "security"]
+
+[[brief]]
+label = "pcap-forensics-vm"
+title = "PCAP forensics VM — scapy dissector + credential/DNS/HTTP extractors + sample captures"
+mission = "Network forensics bench: craft and dissect pcaps, extract credentials/DNS/HTTP artifacts, and summarize flows — with sample captures to analyze."
+topology = "planner+builder"
+software = ["pip:scapy"]
+data = "scapy-crafted sample pcaps under /root/pcaps/ (an HTTP login, a DNS exfil pattern, a port scan)"
+deliverables = [
+  "/root/pcapkit/dissect.py — flow summary, DNS/HTTP extraction, cleartext-credential finder",
+  "/root/pcapkit/make_samples.py — regenerates the sample pcaps",
+  "/root/pcaps/*.pcap",
+  "/root/README.md",
+]
+verify = "dissect.py on the sample HTTP pcap extracts the planted username/password; flags the DNS-exfil domain"
+tags = ["network", "forensics", "pcap", "security"]
+
+[[brief]]
+label = "password-audit-lab"
+title = "Password audit lab — hash ID + dictionary/rule cracker + curated wordlist + sample sets"
+mission = "Offline password-auditing bench: identify hash types, crack with a dictionary + rules, and measure policy strength — all with safe sample hash sets."
+topology = "solo"
+software = ["pip:passlib", "pip:bcrypt"]
+data = "a curated mini-wordlist (~5000) + rule set; sample hash sets (md5/sha1/sha256/bcrypt) of known plaintexts under /root/hashes/"
+deliverables = [
+  "/root/pwaudit/crack.py — hash-type identifier, dictionary cracker with rule mangling, strength report",
+  "/root/pwaudit/wordlists/common-5000.txt + rules/best64-lite.rule",
+  "/root/hashes/*.txt (with a SOLUTIONS map)",
+  "/root/README.md",
+]
+verify = "crack.py recovers the known plaintexts for the md5 and sha1 sample sets using the wordlist"
+tags = ["passwords", "hashes", "audit", "security"]
+
+[[brief]]
+label = "threat-intel-vm"
+title = "Threat-intel VM — IOC aggregation, normalization, enrichment + STIX-lite export"
+mission = "A threat-intel processing bench: ingest messy IOC feeds, normalize+dedup, enrich, and emit a clean STIX-lite bundle — with curated sample feeds."
+topology = "planner+builder"
+software = ["pip:requests"]
+data = "curated sample feeds under /root/feeds/ (CSV + JSON of IPs/domains/hashes, intentionally messy/duplicated) + a TI reference"
+deliverables = [
+  "/root/ti/aggregate.py — multi-format ingest, normalize (defang/refang), dedup, type-classify, STIX-lite JSON export, summary report",
+  "/root/feeds/*.{csv,json}",
+  "/root/README.md + a sample /root/ti/bundle.json",
+]
+verify = "aggregate.py merges the sample feeds into a deduped bundle.json with correctly typed indicators (ipv4/domain/sha256)"
+tags = ["threat-intel", "ioc", "security"]
+
+[[brief]]
+label = "vuln-flask-lab"
+title = "Vulnerable Flask lab — a training target (SQLi/XSS/IDOR/SSTI) + exploits + remediation"
+mission = "A deliberately vulnerable web app as a safe local training range, paired with working exploit scripts and a remediation guide for each flaw."
+topology = "planner+builder+tester"
+software = ["pip:flask"]
+data = "a seeded sqlite db (users/notes) demonstrating each vuln class"
+deliverables = [
+  "/root/vlab/app.py — Flask app with intentional SQLi, reflected XSS, IDOR, SSTI (clearly labeled, localhost-only)",
+  "/root/vlab/exploits/*.py — one PoC per vuln",
+  "/root/vlab/REMEDIATION.md + /root/README.md (LAB USE ONLY warning)",
+]
+verify = "the SQLi exploit script dumps the users table; the IDOR PoC reads another user's note"
+tags = ["web", "training", "appsec", "security"]
+
+[[brief]]
+label = "net-scan-kit"
+title = "Network scan kit — pure-python host discovery + TCP/UDP scan + banner grab + lab"
+mission = "A dependency-light scanning toolkit (no nmap needed) with host discovery, port scanning, banner grabbing, and a local multi-service lab to scan."
+topology = "solo"
+software = []
+data = "a service-fingerprint DB (port->service + banner signatures); a local lab launching several services to discover"
+deliverables = [
+  "/root/scankit/scan.py — threaded TCP connect scan, UDP probe, banner grab, fingerprint match, nmap-style grepable output",
+  "/root/scankit/fingerprints.json",
+  "/root/scankit/lab.py — spins up sample services on localhost",
+  "/root/README.md",
+]
+verify = "scan.py against the local lab finds the open ports and fingerprints at least the HTTP service"
+tags = ["network", "scanning", "recon", "security"]
+
+[[brief]]
+label = "yara-triage-vm"
+title = "YARA triage VM — curated ruleset + safe test samples + scanning orchestrator"
+mission = "A malware-triage bench built around YARA: a curated, documented ruleset, safe test samples (EICAR + benign), and an orchestrator that scans + reports."
+topology = "planner+builder"
+software = ["pip:yara-python"]
+data = "curated YARA rules (packers, suspicious-strings, EICAR, script-droppers — detection patterns only) + safe samples (EICAR test file, benign scripts) under /root/samples/"
+deliverables = [
+  "/root/yaratriage/scan.py — recursive scan, rule-hit report, severity scoring",
+  "/root/yaratriage/rules/*.yar (documented)",
+  "/root/samples/* (EICAR + benign only)",
+  "/root/README.md",
+]
+verify = "scan.py flags the EICAR test file via the EICAR rule and reports zero hits on the benign samples"
+tags = ["malware", "yara", "triage", "security"]

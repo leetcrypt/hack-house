@@ -1,0 +1,128 @@
+# library-10 — curated deep-build brief queue (target: 10 high-value VMs).
+#
+# These briefs are written to maximize the cardex value model: each VM must
+# install REAL software and/or seed REAL data (→ heft + richness), be verified
+# done (→ completeness), be shareable + well-tagged (→ reusability), and be
+# distinct from the existing library (calc-vm, dev-vm, vmhub, http-probe-kit).
+#
+# "Meticulous & valuable" contract every operator must honour:
+#   - software:  actually install the named tooling INTO the VM (apt/pip/source),
+#                don't stub it. The artifact must carry the capability offline.
+#   - data:      bake the named dataset in (a real corpus/feed/ruleset/wordlist),
+#                not a 3-line sample. Heft comes from genuine payload.
+#   - tool:      one ergonomic entrypoint (`/root/<tool>`), --help, sane output.
+#   - tests:     a self-test that proves `verify` WITHOUT network at run time.
+#   - manifest:  /root/.hh-agent stamped status=done with purpose/objective/usage.
+#   - verify:    the listed command must pass before save. No green → no publish.
+#
+# topology: solo (operator builds+verifies) unless a brief needs independent QA.
+
+[[brief]]
+label       = "cve-triage-db"
+title       = "Offline CVE triage database — query CVEs by product/severity"
+mission     = "A self-contained CVE knowledge base an analyst queries offline to triage exposure by product, year, and CVSS severity."
+software    = "python3 stdlib sqlite3 (no pip); FTS5 full-text index"
+data        = "A curated corpus of real, high-impact CVEs (Log4Shell, Heartbleed, EternalBlue, Shellshock, Spring4Shell, etc.) with id/product/cvss/vector/summary, plus as many recent NVD entries as can be fetched and baked in at build time."
+deliverable = "/root/cve.py (search/show/stats subcommands) + SQLite db at /root/data/cve.db + README"
+verify      = "python3 /root/cve.py search openssl  → returns Heartbleed; cve.py stats prints severity histogram"
+tags        = "cve, vuln, recon, security"
+topology    = "solo"
+
+[[brief]]
+label       = "yara-malscan"
+title       = "YARA static malware scanner with a real ruleset"
+mission     = "Point it at a file or dir and get a YARA verdict offline — a triage scanner for suspected malware."
+software    = "apt: yara + python3-yara (or yara-python via pip); the yara engine baked in"
+data        = "A curated YARA ruleset (packers, webshells, common droppers, suspicious strings) under /root/rules/"
+deliverable = "/root/scan.sh <path> wrapping yara with the bundled rules + match report; README"
+verify      = "scan.sh detects an EICAR test file and a planted webshell sample; clean file reports no match"
+tags        = "malware, yara, blue, security"
+topology    = "planner+builder+tester"
+
+[[brief]]
+label       = "wordlist-forge"
+title       = "Wordlist forge — curated lists + a mutation/permutation engine"
+mission     = "Ship the wordlists a pentester reaches for AND a generator that mutates/combines them for a target."
+software    = "python3 stdlib; rule-based mutator (leetspeak, case, affixes, dates)"
+data        = "Curated wordlists baked in: common passwords subset, top web dirs/files, common subdomains, default creds — under /root/lists/"
+deliverable = "/root/forge.py (slice/merge/mutate, --rules) + /root/lists/*; README with each list's provenance"
+verify      = "forge.py mutate --base admin --rules leet,years produces a deduped list incl. 'Adm1n2024'"
+tags        = "wordlist, brute, recon, security"
+topology    = "solo"
+
+[[brief]]
+label       = "tls-auditor"
+title       = "TLS/certificate auditor — chain, expiry, weak-cipher report"
+mission     = "Audit any TLS endpoint (or local cert) for chain validity, expiry, and weak protocols/ciphers, offline-capable."
+software    = "apt: openssl; python3 ssl/socket; the weak-cipher knowledge baked in"
+data        = "Bundled reference data: known-weak cipher list, deprecated protocol matrix, common CA fingerprints under /root/ref/"
+deliverable = "/root/tlsaudit.sh <host:port|certfile> → graded report (A–F) + findings; README"
+verify      = "generate a self-signed cert in the VM; tlsaudit.sh flags it self-signed + grades weak settings"
+tags        = "tls, crypto, audit, security"
+topology    = "planner+builder+tester"
+
+[[brief]]
+label       = "log-ioc-hunter"
+title       = "Log IOC hunter — sweep logs against a threat-intel indicator set"
+mission     = "Sweep system/web/auth logs for indicators of compromise and emit a ranked findings timeline."
+software    = "python3 stdlib; pluggable parsers (syslog, apache/nginx, auth.log)"
+data        = "A baked IOC set (malicious IPs, hashes, UA strings, suspicious paths) + realistic sample logs containing seeded hits under /root/samples/"
+deliverable = "/root/hunt.py --logs <dir> --iocs <file> → findings.json + human report; README"
+verify      = "hunt.py over the bundled sample flags the seeded malicious IP and webshell request with correct line refs"
+tags        = "forensics, blue, log, security"
+topology    = "planner+builder+tester"
+
+[[brief]]
+label       = "dns-recon-pack"
+title       = "DNS/OSINT recon pack — subdomain + record enumeration"
+mission     = "Enumerate a domain's DNS surface (records, subdomains via bundled wordlist, zone-transfer probe) into a tidy map."
+software    = "python3 stdlib socket/resolver (no external pip); concurrency via threads"
+data        = "Baked subdomain wordlist + public resolver list + common record-type matrix under /root/data/"
+deliverable = "/root/dnsrecon.py <domain> → map.json + report (records, found subs, AXFR result); README"
+verify      = "against a localhost mock zone the tool resolves seeded records and reports a successful AXFR"
+tags        = "dns, osint, recon, security"
+topology    = "solo"
+
+[[brief]]
+label       = "hashcrack-kit"
+title       = "Hash identify + dictionary cracker"
+mission     = "Identify a hash's likely type and crack it against bundled wordlists — a self-contained offline cracking lab."
+software    = "python3 hashlib (md5/sha1/sha256/ntlm) + a format-signature identifier"
+data        = "Baked wordlist + a hash-format signature table + a seeded set of crackable challenge hashes under /root/challenges/"
+deliverable = "/root/crack.py identify <hash> | crack --hashfile <f> --wordlist <w>; README"
+verify      = "crack.py cracks the seeded md5 of 'password123' and correctly identifies a sample SHA-256"
+tags        = "crypto, brute, crack, security"
+topology    = "solo"
+
+[[brief]]
+label       = "vuln-web-lab"
+title       = "Deliberately-vulnerable web lab for authorized practice"
+mission     = "A safe, self-contained vulnerable web app (SQLi/XSS/IDOR) for training and tool-testing — runs entirely in the VM."
+software    = "python3 stdlib http.server app + sqlite3 backend (no external framework)"
+data        = "Seeded app DB (users, posts, flags) so the vulns are demonstrable end-to-end under /root/app/"
+deliverable = "/root/serve.sh starts the lab on :8080 + /root/SOLUTIONS.md documenting each planted vuln"
+verify      = "serve.sh up; a documented SQLi on /login returns the admin flag; XSS reflects on /search"
+tags        = "lab, web, training, security"
+topology    = "planner+builder+tester"
+
+[[brief]]
+label       = "dfir-collector"
+title       = "DFIR triage collector — live-system artifact timeline"
+mission     = "Collect volatile + persistence artifacts from a Linux host into a single triage timeline for incident response."
+software    = "python3 stdlib reading /proc, /etc, journald fallbacks; no agents installed"
+data        = "Baked triage checklist + persistence-location catalog + parser templates under /root/ref/"
+deliverable = "/root/collect.py → timeline.json + report.md (processes, net, users, cron, suid, recent files); README"
+verify      = "collect.py run inside the VM produces a timeline.json with the running shell and a planted cron persistence entry"
+tags        = "dfir, forensics, blue, security"
+topology    = "planner+builder+tester"
+
+[[brief]]
+label       = "net-mapper-kit"
+title       = "One-command network/service mapper + banner grabber"
+mission     = "Map a host/subnet to open ports, grabbed banners, and a service-guess report — the recon staple, self-contained."
+software    = "apt: nmap; plus a python3 stdlib fallback scanner + banner grabber for no-nmap hosts"
+data        = "Baked port→service map + common-banner signature table under /root/data/"
+deliverable = "/root/map.sh <target> → report.md (ports, banners, guessed services) using nmap when present; README"
+verify      = "map.sh 127.0.0.1 reports an open port the VM itself listens on, with a grabbed banner"
+tags        = "recon, network, nmap, security"
+topology    = "planner+builder+tester"

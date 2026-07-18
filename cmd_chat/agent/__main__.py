@@ -31,8 +31,8 @@ import argparse
 import sys
 
 from .bridge import AgentBridge
-from .profiles import load_profiles, provider_from_profile
-from .providers import OllamaEmbedder, make_provider, preflight
+from cmd_chat.ai.profiles import load_profiles, provider_from_profile
+from cmd_chat.ai.providers import OllamaEmbedder, make_provider, preflight
 
 
 def _build_provider(args, ap):

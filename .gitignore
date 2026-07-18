@@ -23,6 +23,10 @@ err.log
 
 # Sandbox save/load snapshots (large runtime tarballs, not source)
 /hh/hh-snapshots/
+# VM-library /loop artifacts — exported snapshot tars (repo-root, when `sbx`
+# is run from here) + per-run logs. Generated; the VMs live in the host registry.
+/hh-snapshots/
+/.loop-runs/
 
 # Out-of-tree experiments (not part of hack-house)
 /experiments/

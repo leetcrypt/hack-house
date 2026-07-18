@@ -1,0 +1,183 @@
+---
+name: hh-operator
+description: Operate inside a hack-house chat room as a first-class participant — join, read/answer humans and AI, and (when granted) drive a sandbox with full shell + keystroke control. Use when asked to enter/run/watch a hackhouse room, bridge a Claude session into one, or autonomously monitor and respond in a room.
+---
+
+# hh-operator — drive a hack-house room from a Claude Code session
+
+You become a room member. A small **daemon** owns the encrypted websocket; you
+poll it through the **`hh-bridge` CLI**. The daemon survives across your tool
+calls, so you can read → think → act → read again, indefinitely.
+
+```bash
+# Run from the hack-house repo. Pin the interpreter to its venv.
+HH=".venv/bin/python -m cmd_chat.operator"          # = "hh-bridge"
+```
+
+## 1. Join (once)
+
+```bash
+$HH up <host> <port> <name> --password <pw> [--no-tls] [--trigger "@bot"]
+```
+Spawns the daemon detached and waits until it's connected. `<name>` is your room
+display name **and** the session id. `--trigger` adds an extra phrase that marks
+a line "addressed" to you (your name / `@name` always count). Re-running `up`
+when already connected is a no-op.
+
+`$HH status` → connection, roster, grant state, sandbox target, last seq.
+
+## 2. The operator loop
+
+This is the core pattern. Long-poll for activity, decide, respond, repeat.
+
+```bash
+$HH read --wait --timeout 30     # blocks until events arrive (or timeout)
+# → JSONL events; cursor auto-advances so the next bare `read` is "since last"
+$HH say "your reply here"        # send a chat line to the room
+```
+
+Each event: `{seq, ts, kind, ...}`. Kinds you act on:
+- `message` — `{from, text, addressed}`. Answer when `addressed:true` (or when
+  context clearly invites you). Ignore idle chatter unless asked to.
+- `roster` — who's present. `acl` — grant changes (`granted`, `can_sudo`).
+- `sandbox` — a room sandbox came up/down. `system` — connect/reconnect.
+
+**In-turn autonomy:** chain `read --wait` → act → `read --wait` within one turn
+to stay responsive without burning idle tokens (the poll blocks server-side).
+
+**Indefinite watch (`/loop`):** keep looping across turns — the daemon persists,
+so you lose nothing between calls. Stop the loop when:
+- the room/owner tells you to (`stop`, `halt`, `that's all`, `you can leave`),
+- your given objective/stop-condition is met, or
+- you're idle past your remit.
+Then `$HH down` to leave cleanly (drops the socket, leaves the roster).
+
+## 3. Sandbox drive (when granted)
+
+Sandbox actions are **permission-gated**: the room owner runs `/grant <name>`.
+Until then exec/keys are refused/inert — that's by design, not a bug.
+
+Two surfaces:
+
+**Co-located exec** — capture output, scriptable, invisible to the room:
+```bash
+$HH sbx launch [--image IMG] [--engine podman|docker]  # your own container
+$HH sbx status                                          # what you'd target
+$HH exec 'whoami; uname -a'                             # run a shell command
+echo "data" | $HH write /root/file.txt                 # stdin → file (binary-safe)
+$HH get /root/file.txt [--out local.txt]               # read a file out
+$HH sbx down                                            # tear your container down
+```
+`sbx launch` makes a throwaway container you own (podman→Kali, docker→Parrot).
+When the **room** has a sandbox and you're granted, `exec`/`write`/`get` target
+it directly (you're co-located on the host) — no launch needed.
+
+**Keystroke relay** — drive the room's *shared* terminal live, like a human.
+The relay loop is **type → wait → read**:
+```bash
+$HH keys "make build" enter             # type + run
+$HH watch --for "BUILD (SUCCESS|FAIL)" --in screen --timeout 120   # wait
+$HH screen                               # read the relayed terminal (ansi-stripped)
+$HH keys ctrl-c                          # interrupt the running program
+$HH keys --help-keys                     # print the full vocabulary
+```
+`watch` is the stop-condition engine — it blocks until a regex matches (in
+`screen` output or chat `events`), or `--idle N` quiet, or `--timeout` — then
+reports which fired. This is how you stay autonomous without busy-polling.
+
+### Keystroke cheat-sheet (how to *stop* things matters most)
+
+Tokens combine: literal text types verbatim; named keys send control bytes;
+`text:<x>` forces verbatim; `hex:<bytes>` sends raw.
+
+| Key | Effect |
+|-----|--------|
+| `enter` `tab` `space` `esc` | `\r` `\t` `' '` `\x1b` |
+| **`ctrl-c`** | **SIGINT — interrupt the foreground program (your main "stop")** |
+| `ctrl-d` | EOF — end stdin / exit an empty shell |
+| `ctrl-z` | suspend to background (resume with `fg`); `ctrl-\` = SIGQUIT |
+| `ctrl-u` `ctrl-l` | clear a half-typed line / clear the screen |
+| `up` `down` `left` `right` `home` `end` `pageup` `pagedown` `delete` `backspace` | navigation |
+| `q` | quits most pagers (`less`/`man`); `:q` + `enter` quits vim |
+
+**Rule:** end a stuck command with `ctrl-c`; if ignored, `ctrl-\` then `ctrl-c`
+again. Always know how to exit an interactive program *before* you start it.
+
+## 3b. Agent manifest — make a VM carry its own handoff record
+
+A sandbox becomes **shareable/tradeable** when it documents itself. `manifest`
+writes an ICM-style `.hh-agent/` bundle *inside* the target sandbox so the next
+agent (human or a spawned Claude) can resume without a briefing:
+
+```bash
+# stamp a fresh VM with purpose, goal, user intent, stop conditions
+$HH manifest push --root /root --name kali-recon-vm \
+  --purpose "Kali recon sandbox" \
+  --objective "map the target and hand off" \
+  --intent "tradeable VM state across handoffs" --stop "scan complete"
+# as work progresses, record state + a provenance line
+$HH manifest update --root /root --status done --progress "scan done" \
+  --done "ran nmap" --todo "exploit phase" --note "oracle → child handoff"
+# what a spawn/handoff reads first to resume exactly where you left off
+$HH manifest pull --root /root      # → parsed manifest.yaml
+```
+
+Bundle written under `<root>/.hh-agent/`: `manifest.yaml` (canonical machine
+record), `AGENT.md` (read this first), `last-state.md`, `summary.md`,
+`goals.yaml`. The yaml is the source of truth; the rest are rendered from it.
+Pair with `spawn`: stamp → push → spawn a child whose objective is "load the
+`.hh-agent` manifest and continue."
+
+## 4. Delegate to a local model (optional)
+
+A room often has an `/ai <name>` Ollama agent. To offload a task, just `say`
+`/ai <name> !<task>` and read its reply — cheaper than doing trivial work
+yourself. (Direct operator→Ollama delegation is a later phase.)
+
+## 5. Mobile / Termux (Fairphone) — the phone is a live SSH host
+
+The operator is **pure Python** and runs on the Fairphone-6 in Termux — it can
+both **join** and (with the SRP shim's server side) **host** rooms, no Rust, no
+`srp` C-ext. Drive the phone directly over SSH. **Never tell the user "run this
+on-device, paste it back" without probing reachability first** — that framing is
+wrong when the phone answers SSH.
+
+**One canonical, hardened invocation** (kills the wrong-alias trap — see below):
+```bash
+PHONE='ssh -i ~/.ssh/phone-deploy -p 8022 -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=accept-new u0_a203@100.95.202.68'
+$PHONE 'uname -m; python --version'    # aarch64 / Python 3.13.x
+```
+`BatchMode=yes` fails fast instead of hanging on a password prompt;
+`ConnectTimeout=8` stops indefinite hangs; `accept-new` avoids the first-connect
+host-key prompt while still pinning after.
+
+**Reachability gate — probe the PORT, not `tailscale status`:**
+```bash
+timeout 8 bash -c 'cat </dev/null >/dev/tcp/100.95.202.68/8022' && echo REACHABLE || echo OFFLINE
+```
+`tailscale status` reports `fairphone-6` **`active` even when sshd is dead** —
+Android kills backgrounded Termux, taking `sshd` with it. So the tailnet line is
+NOT proof; the TCP probe is. If the gate says OFFLINE the fix is **on-device**
+(wake the phone, relaunch Termux, `termux-wake-lock` + start `sshd`), not a
+retry loop from here — say so plainly rather than hammering a dead port.
+
+**The wrong-alias trap:** `~/.ssh/config` aliases `phone` / `phone-deploy` point
+at `100.95.180.14` (`trilluminati`), a *different, usually-offline* device.
+`ssh phone` will time out. Always use the Fairphone IP `100.95.202.68` (the
+`$PHONE` prefix above), never the alias.
+
+**Termux env quirks that break naive commands:**
+- **No `/tmp`** — `$TMPDIR` is `$HOME/.claude-temp`; `$PREFIX` =
+  `/data/data/com.termux/files/usr`.
+- `rustc`/`openssl` binaries absent by default; `git/clang/make/pkg-config` present.
+- Deps: `pkg install python-cryptography` (avoids a rust build); `pip install
+  requests rich websockets`; **skip `srp`** → the shim (`cmd_chat/client/
+  _srp_pure`) covers both client and server.
+- Sync the tree with tar-over-ssh, not a stale clone:
+  `tar czf - cmd_chat scripts | $PHONE 'tar xzf - -C ~/hh-mobile'`.
+
+## Safety
+
+- One bad action's blast radius is the container; `local` exec is opt-in only.
+- Never run destructive host commands. Keystrokes/exec require an owner grant.
+- Leave with `$HH down` when done — don't abandon a live daemon.

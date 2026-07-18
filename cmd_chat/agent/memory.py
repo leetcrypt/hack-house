@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .providers import Msg
+from cmd_chat.ai.providers import Msg
 
 
 @dataclass

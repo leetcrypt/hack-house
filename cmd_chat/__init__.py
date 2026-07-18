@@ -2,8 +2,11 @@ import argparse
 import getpass
 import os
 
-from cmd_chat.server.server import run_server
-from cmd_chat.client.client import Client
+# NOTE: the server (run_server) and client (Client) are imported lazily inside
+# main() below. Importing them here would pull sanic/pydantic (server) at
+# package-init time for *any* `cmd_chat.*` import — including
+# `python -m cmd_chat.operator` on a phone/Termux where those server-only deps
+# aren't installed. See docs/termux-operator.md (Phase 0).
 
 
 def resolve_password(args_password: str | None, prompt: str = "Room password: ") -> str:
@@ -43,6 +46,8 @@ def main():
     args = parser.parse_args()
 
     if args.command == "serve":
+        from cmd_chat.server.server import run_server
+
         password = resolve_password(args.password)
         run_server(
             host=args.ip_address,
@@ -53,6 +58,8 @@ def main():
             no_tls=args.no_tls,
         )
     elif args.command == "connect":
+        from cmd_chat.client.client import Client
+
         password = resolve_password(args.password)
         Client(
             server=args.ip_address,
