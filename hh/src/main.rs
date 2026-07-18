@@ -10,6 +10,7 @@ mod ft;
 mod layout;
 mod music;
 mod net;
+mod persona;
 mod sbx;
 mod theme;
 mod ui;

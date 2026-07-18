@@ -19,6 +19,8 @@ fernet = "0.2"
 base64 = "0.22"
 rand = "0.8"
 hex = "0.4"
+# pseudonymous attribution (persona signing keys, ESA-style)
+ed25519-dalek = "2"
 
 # net
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

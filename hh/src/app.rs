@@ -4,6 +4,7 @@ use crate::ft;
 use crate::layout::{Dir, Layout, Resize};
 use crate::music;
 use crate::net::{self, Session};
+use crate::persona::{self, Persona};
 use crate::sbx;
 use crate::theme::Theme;
 use crate::ui;
@@ -220,6 +221,9 @@ pub struct SudoPrompt {
 
 pub struct App {
     pub me: String,
+    /// This client's pseudonymous signing identity. Signs every file offer and
+    /// backs `/export-signed`; loaded/persisted once at startup.
+    pub persona: Arc<Persona>,
     pub lines: Vec<ChatLine>,
     pub users: Vec<User>,
     pub capacity: usize,
@@ -295,6 +299,7 @@ impl App {
     fn new(me: String) -> Self {
         Self {
             me,
+            persona: Arc::new(Persona::load_or_create()),
             lines: Vec::new(),
             users: Vec::new(),
             capacity: 0,
@@ -442,7 +447,7 @@ impl App {
                 self.connected = true;
                 self.chat_scroll = 0;
                 self.sys(format!("joined as {} †", self.me));
-                self.sys("/sbx <docker|podman|multipass|vbox|local> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys("/sbx <docker|podman|multipass|vbox|local> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /export-signed <dir> · /pw show password · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => {
                 // An agent announces itself with "<name> (ai) online …" — record
@@ -664,6 +669,83 @@ fn send_frame(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, value: serde_
     let _ = out.send(WsMsg::Text(room.encrypt(value.to_string().as_bytes())));
 }
 
+/// The bundled Encrypt-Share-Attribution builder (Princess_Pi's ESA scheme,
+/// non-interactive). Embedded in the binary so `/export-signed` is self-contained;
+/// materialized to a temp file and run when invoked.
+const ESA_BUILD: &str = include_str!("../tools/esa/esa_build.sh");
+
+/// Split a trailing `--attest <passphrase>` off a send/export command. Returns
+/// `(payload_part, Some(passphrase))`, or `(whole, None)` if the flag is absent
+/// or has no value.
+fn split_attest(s: &str) -> (&str, Option<&str>) {
+    match s.split_once("--attest ") {
+        Some((head, pass)) => {
+            let pass = pass.trim();
+            (head.trim_end(), (!pass.is_empty()).then_some(pass))
+        }
+        None => (s, None),
+    }
+}
+
+/// `/export-signed <dir>`: build a portable ESA archive (fresh Ed25519 key signs
+/// an inner 7z of `dir`, SHA-512 checksums, self-contained verify scripts, and —
+/// with `--attest` — a revealable attribution commitment). Runs off the UI thread
+/// (7z + ssh-keygen are slow) and reports the archive path back via the channel.
+fn export_signed(app: &mut App, app_tx: &UnboundedSender<Net>, src: &str, attest: Option<&str>) {
+    let src = src.to_string();
+    let attest = attest.map(str::to_string);
+    let tx = app_tx.clone();
+    app.sys(format!("† building attributable archive from {src}…"));
+    tokio::task::spawn_blocking(move || match run_esa_build(&src, attest.as_deref()) {
+        Ok(out) => {
+            let _ = tx.send(Net::Sys(format!(
+                "† signed archive ready: {out} — recipients run ./verify-everything.sh (inside) to check integrity + signature"
+            )));
+        }
+        Err(e) => {
+            let _ = tx.send(Net::Err(format!("export-signed failed: {e}")));
+        }
+    });
+}
+
+/// Materialize the embedded ESA script and run it non-interactively. Returns the
+/// path to the produced `verifiable_archive_<ts>.7z` (the script's last stdout
+/// line), or an error carrying the script's stderr.
+fn run_esa_build(src: &str, attest: Option<&str>) -> anyhow::Result<String> {
+    let script = std::env::temp_dir().join(format!("hh-esa-build-{}.sh", std::process::id()));
+    std::fs::write(&script, ESA_BUILD)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(&script).arg("--src").arg(src);
+    if let Some(p) = attest {
+        cmd.arg("--attrib-pass").arg(p);
+    }
+    let out = cmd.output();
+    let _ = std::fs::remove_file(&script);
+    let out = out?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "{}",
+            msg.trim().lines().last().unwrap_or("archive build failed")
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let path = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    anyhow::ensure!(!path.is_empty(), "archive built but no path reported");
+    Ok(path)
+}
+
 /// Read `path` and broadcast a file/dir offer. `to = Some(user)` targets one
 /// member (only they're prompted); `to = None` offers to the whole room. The
 /// payload is staged in `active_send` and streamed once an /accept arrives.
@@ -675,11 +757,16 @@ fn offer_payload(
     app_tx: &UnboundedSender<Net>,
     path: &str,
     to: Option<&str>,
+    // Optional ESA-style attribution passphrase: when set, the offer carries a
+    // `SHA-512(passphrase || sha256)` commitment the sender can later open.
+    attest: Option<&str>,
 ) {
     *send_seq += 1;
     let id = format!("{}-{}", app.me, send_seq);
     let path = path.to_string();
     let to = to.map(str::to_string);
+    let attest = attest.map(str::to_string);
+    let persona = app.persona.clone();
     let out = out_tx.clone();
     let room = room.clone();
     let atx = app_tx.clone();
@@ -698,9 +785,20 @@ fn offer_payload(
                 size: s.size,
                 to: to.clone(),
             });
+            // Attribution: sign the content hash (+ name/size) with our persona
+            // key so receivers can verify authorship. Additive JSON fields — a
+            // Python receiver just ignores them.
+            let sig = persona.sign_b64(&persona::attest_msg(&s.sha256, &s.name, s.size));
             let mut frame = json!({
-                "_ft":"offer","id": id,"name": s.name,"size": s.size,"sha256": s.sha256,"dir": s.dir
+                "_ft":"offer","id": id,"name": s.name,"size": s.size,"sha256": s.sha256,"dir": s.dir,
+                "persona": persona.pub_b64(), "sig": sig
             });
+            if let Some(pass) = &attest {
+                frame["attrib"] = json!(persona::commitment(pass, &s.sha256));
+                let _ = atx.send(Net::Sys(
+                    "† attribution commitment attached — reveal the passphrase later to prove authorship".into(),
+                ));
+            }
             if let Some(t) = &to {
                 frame["to"] = json!(t);
             }
@@ -799,6 +897,31 @@ fn handle_ft(
                 if o.dir { ", directory" } else { "" },
                 if o.to.is_some() { " directly to you" } else { "" },
             ));
+            // Attribution: verify the sender's persona signature over the content
+            // hash, and surface the pseudonym fingerprint so peers can recognize
+            // "the same author" across offers.
+            match (&o.persona, &o.sig) {
+                (Some(pk), Some(sig)) => {
+                    let msg = persona::attest_msg(&o.sha256, &o.name, o.size);
+                    if persona::verify(pk, sig, &msg) {
+                        let fp = persona::fingerprint_of(pk).unwrap_or_else(|| "unknown".into());
+                        app.sys(format!(
+                            "   † signed by persona †{fp} ✓ (attributable){}",
+                            if o.attrib.is_some() {
+                                " · attribution passphrase committed"
+                            } else {
+                                ""
+                            }
+                        ));
+                    } else {
+                        app.err(format!(
+                            "   ⚠ {} — BAD persona signature; author UNVERIFIED",
+                            o.name
+                        ));
+                    }
+                }
+                _ => app.sys("   (unsigned — no attribution proof)"),
+            }
             app.transfers.insert(
                 o.id.clone(),
                 Transfer {
@@ -2040,12 +2163,15 @@ fn handle_command(
             app.sys("you don't have drive permission — the owner can /grant you");
         }
     } else if let Some(rest) = line.strip_prefix("/sendroom ") {
-        // Offer a file/dir to the whole room — anyone may /accept.
-        offer_payload(app, send_seq, out_tx, room, app_tx, rest.trim(), None);
+        // Offer a file/dir to the whole room — anyone may /accept. An optional
+        // trailing `--attest <passphrase>` attaches a revealable attribution proof.
+        let (path, attest) = split_attest(rest.trim());
+        offer_payload(app, send_seq, out_tx, room, app_tx, path, None, attest);
     } else if let Some(rest) = line.strip_prefix("/send ") {
         // Direct send to one member: `/send <user> <path>`. Everyone receives the
-        // broadcast offer, but only <user> is prompted to /accept.
-        let rest = rest.trim();
+        // broadcast offer, but only <user> is prompted to /accept. An optional
+        // trailing `--attest <passphrase>` attaches a revealable attribution proof.
+        let (rest, attest) = split_attest(rest.trim());
         match rest.split_once(char::is_whitespace) {
             Some((who, path)) => {
                 let (who, path) = (who.trim(), path.trim());
@@ -2063,7 +2189,7 @@ fn handle_command(
                         .join(" · ");
                     app.err(format!("no member '{who}' in the room — try: {roster}"));
                 } else {
-                    offer_payload(app, send_seq, out_tx, room, app_tx, path, Some(who));
+                    offer_payload(app, send_seq, out_tx, room, app_tx, path, Some(who), attest);
                 }
             }
             None => app.sys("usage: /send <user> <path>  ·  /sendroom <path> for everyone"),
@@ -2085,6 +2211,15 @@ fn handle_command(
             app.sys("rejected the offer");
         } else {
             app.sys("no pending offer");
+        }
+    } else if let Some(rest) = line.strip_prefix("/export-signed") {
+        // Package a directory into a portable, self-verifying ESA archive.
+        let (src, attest) = split_attest(rest.trim());
+        let src = src.trim();
+        if src.is_empty() {
+            app.sys("usage: /export-signed <dir> [--attest <passphrase>] — build a portable ESA-signed 7z");
+        } else {
+            export_signed(app, app_tx, src, attest);
         }
     } else if let Some(rest) = line.strip_prefix("/sbx") {
         let mut p = rest.split_whitespace();
