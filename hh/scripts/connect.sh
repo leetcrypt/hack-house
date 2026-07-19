@@ -4,7 +4,7 @@
 # The password lives only in RAM: it is read into a shell variable (never a
 # file), and the interactive prompt keeps it out of your shell history. Supply
 # it three ways, most to least private:
-#   1) interactive (recommended):  ./connect.sh alice 100.117.177.50
+#   1) interactive (recommended):  ./connect.sh alice <host>
 #        → prompts "room password:" with no echo
 #   2) environment:                HH_PASSWORD=secret ./connect.sh alice <host>
 #   3) flag:                       ./connect.sh alice <host> -p secret
