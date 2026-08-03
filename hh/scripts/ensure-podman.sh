@@ -83,7 +83,10 @@ case "$(uname -s)" in
         if command -v apt-get >/dev/null 2>&1; then
             # Wrapped in `sh -c` so a single `$SUDO …` escalation covers BOTH the
             # update and the install (a bare `$SUDO a && b` would only sudo `a`).
-            install_cmd="sh -c 'apt-get update && apt-get install -y podman'"
+            # catatonit is only a *Recommends* of podman on Debian/Ubuntu, but
+            # we launch sandboxes with `--init` (PID 1 must reap orphans or they
+            # pile up as zombies), so pull it in explicitly.
+            install_cmd="sh -c 'apt-get update && apt-get install -y podman catatonit'"
             plan_cmd="apt-cache policy podman"
             need_sudo=1
         elif command -v dnf >/dev/null 2>&1; then
@@ -91,7 +94,7 @@ case "$(uname -s)" in
             plan_cmd="dnf info podman"
             need_sudo=1
         elif command -v pacman >/dev/null 2>&1; then
-            install_cmd="pacman -S --noconfirm podman"
+            install_cmd="pacman -S --noconfirm podman catatonit"  # catatonit = `--init` PID 1
             plan_cmd="pacman -Si podman"
             need_sudo=1
         fi

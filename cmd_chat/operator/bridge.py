@@ -221,6 +221,13 @@ class OperatorBridge(Client):
                 pass
             if self._inbox_fp is not None:
                 self._inbox_fp.close()
+            # The daemon's own co-located container is scoped to the daemon: if
+            # we're going away it has no owner left, so tear it down rather than
+            # leave it running `sleep infinity` until someone notices. A SIGKILL
+            # skips this — `sandbox.sweep_stale` reclaims those on next launch.
+            if self._own_engine:
+                await sbx.teardown_container(self._own_engine, self._own_name)
+                self._own_engine, self._own_name = None, ""
             self.session.cleanup()
 
     async def _reconnect_loop(self) -> None:

@@ -767,6 +767,9 @@ pub fn prepare(
                     );
                 }
             }
+            // Reclaim sandboxes abandoned by hack-house sessions that died
+            // without running `teardown` (SIGKILL/panic) before adding our own.
+            sweep_stale(backend);
             // Persistent container so we can exec in to provision users + shells.
             let _ = Command::new(engine)
                 .args(["rm", "-f", name])
@@ -776,7 +779,17 @@ pub fn prepare(
             // Capture output so a failure can't paint over the TUI; the reason is
             // surfaced through the returned error (shown in the error popup).
             let mut run = Command::new(engine);
-            run.args(["run", "-d", "--name", name, "--hostname", name, "-w", "/root"]);
+            // `--init` puts a real init (catatonit) at PID 1 instead of the
+            // `sleep infinity` below. `sleep` only ever calls nanosleep() — it
+            // never wait()s — so every process orphaned inside the sandbox
+            // reparented to it and stayed an unreapable zombie for the life of
+            // the container. catatonit reaps them.
+            run.args(["run", "-d", "--init", "--name", name, "--hostname", name, "-w", "/root"]);
+            // Ownership labels: `teardown` handles every clean exit path, but a
+            // SIGKILL/panic can't run it. The labels let `sweep_stale` (below)
+            // reclaim containers whose owning hack-house is gone.
+            let owner = format!("{OWNER_PID_LABEL}={}", std::process::id());
+            run.args(["--label", &format!("{SANDBOX_LABEL}=1"), "--label", &owner]);
             // The native harness runs the model host-side and only execs commands
             // into the container, so the sandbox no longer needs to reach host
             // Ollama. The old in-container Ollama gateway (Docker host-gateway /
@@ -793,6 +806,65 @@ pub fn prepare(
             Ok(())
         }
     }
+}
+
+/// Label marking a container as an hh sandbox we're allowed to reclaim.
+pub const SANDBOX_LABEL: &str = "hh.sandbox";
+/// Label carrying the PID of the hack-house process that created it.
+pub const OWNER_PID_LABEL: &str = "hh.owner-pid";
+
+/// Reclaim sandbox containers whose owning hack-house process is gone.
+///
+/// `teardown` covers every *clean* exit (quit, SIGTERM, SIGHUP), but a SIGKILL,
+/// a panic, or a yanked terminal leaves the container running `sleep infinity`
+/// forever — and with it a pile of orphaned processes. Containers are stamped
+/// with the creator's PID at launch, so a container whose PID no longer exists
+/// in /proc is unambiguously abandoned. Called before each launch, so a crashed
+/// session is cleaned up by the next one. Best-effort and silent: never block a
+/// launch on cleanup. Returns how many were removed.
+pub fn sweep_stale(backend: Backend) -> usize {
+    let engine = match backend {
+        Backend::Docker | Backend::Podman => engine_bin(backend),
+        _ => return 0,
+    };
+    let out = match Command::new(engine)
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={SANDBOX_LABEL}=1"),
+            "--format",
+            &format!("{{{{.Names}}}} {{{{index .Labels \"{OWNER_PID_LABEL}\"}}}}"),
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return 0,
+    };
+    let mut swept = 0;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let (name, pid) = match line.trim().split_once(' ') {
+            Some((n, p)) if !n.is_empty() => (n, p.trim()),
+            // No PID label (or a stray blank line): not ours to judge — leave it.
+            _ => continue,
+        };
+        // An unparseable PID means we can't prove the owner is dead. Leave it.
+        let Ok(pid) = pid.parse::<u32>() else { continue };
+        if pid == std::process::id() || std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            continue; // owner still alive — hands off
+        }
+        if Command::new(engine)
+            .args(["rm", "-f", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            swept += 1;
+        }
+    }
+    swept
 }
 
 /// Destroy ephemeral resources after stop. Multipass instance is purged;

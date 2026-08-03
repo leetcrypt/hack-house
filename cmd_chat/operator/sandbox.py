@@ -22,6 +22,7 @@ Nothing here opens a websocket or holds state; the bridge wires these in.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 
 # CSI / OSC / single-char escape sequences + carriage returns, so relayed PTY
@@ -109,13 +110,52 @@ async def exec_capture(argv: list[str], stdin: bytes | None = None,
     return s, rc
 
 
+# Ownership labels, matching hh/src/sbx.rs so either side can reclaim the
+# other's abandoned sandboxes.
+SANDBOX_LABEL = "hh.sandbox"
+OWNER_PID_LABEL = "hh.owner-pid"
+
+
+async def sweep_stale(engine: str) -> int:
+    """Remove sandbox containers whose creating process is gone.
+
+    `teardown_container` covers clean shutdown, but a SIGKILLed daemon leaves a
+    container running `sleep infinity` forever. Every sandbox is stamped with
+    its creator's PID, so one that's absent from /proc is abandoned. Called
+    before each launch; best-effort. Returns the count removed."""
+    out, rc = await exec_capture(
+        [engine, "ps", "-a", "--filter", f"label={SANDBOX_LABEL}=1",
+         "--format", '{{.Names}} {{index .Labels "' + OWNER_PID_LABEL + '"}}'])
+    if rc != 0:
+        return 0
+    swept = 0
+    for line in str(out).splitlines():
+        cname, _, pid = line.strip().partition(" ")
+        if not cname or not pid.strip().isdigit():
+            continue  # unlabelled or unparseable — can't prove it's abandoned
+        if int(pid) == os.getpid() or os.path.exists(f"/proc/{int(pid)}"):
+            continue  # owner still alive — hands off
+        _, rm_rc = await exec_capture([engine, "rm", "-f", cname])
+        swept += rm_rc == 0
+    return swept
+
+
 async def launch_container(engine: str, name: str, image: str) -> tuple[bool, str]:
-    """Start a persistent throwaway container we can exec into: remove any stale
-    one, then `run -d --name … --hostname … -w /root <image> sleep infinity`
-    (argv-identical to hh/src/sbx.rs:779). Returns (ok, message)."""
+    """Start a persistent throwaway container we can exec into: reclaim any
+    abandoned sandboxes, drop a stale same-name one, then `run -d --init --name
+    … --hostname … -w /root <image> sleep infinity` (argv-identical to
+    hh/src/sbx.rs). Returns (ok, message).
+
+    `--init` is load-bearing: without it PID 1 is `sleep infinity`, which only
+    calls nanosleep() and never wait()s, so every process orphaned inside the
+    sandbox becomes a permanently unreapable zombie. `--init` puts catatonit at
+    PID 1 to reap them."""
+    await sweep_stale(engine)
     await exec_capture([engine, "rm", "-f", name])  # ignore "no such container"
     out, rc = await exec_capture(
-        [engine, "run", "-d", "--name", name, "--hostname", name,
+        [engine, "run", "-d", "--init", "--name", name, "--hostname", name,
+         "--label", f"{SANDBOX_LABEL}=1",
+         "--label", f"{OWNER_PID_LABEL}={os.getpid()}",
          "-w", "/root", image, "sleep", "infinity"])
     if rc != 0:
         tail = (out or "").strip().splitlines()[-1:] or [""]
