@@ -127,7 +127,7 @@ network. No sandbox.
 
 Layout on device (clone or rsync the repo; operator only needs `cmd_chat/`):
 ```bash
-git clone <gitea>/hacker-house && cd hacker-house
+git clone <gitea>/hack-house && cd hack-house
 python -m venv .venv && . .venv/bin/activate
 pip install requests rich websockets cryptography   # + srp or the shim
 HH=".venv/bin/python -m cmd_chat.operator"

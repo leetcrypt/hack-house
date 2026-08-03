@@ -16,14 +16,14 @@
 
 ---
 
-Fork from https://github.com/diorwave/cmd-chat
+Fork of [cmd-chat](https://github.com/diorwave/cmd-chat) — a privacy- and
+security-oriented chatroom, extended with file sharing and shared terminal
+sessions.
 
-This tool a privacy and security oriented chatroom that we added file sharing as well as shared terminal sessions. 
-
-For sharing. For learnng. For hacking. For building. For demos. For teaching. For mentorhsip for the people who dont want to trust corporations to manage their data and communications.
-
-
-Encrypted chat that runs in your terminal. You host the server, you control the room. Close the window — everything's gone. Messages and files are encrypted client-side before the server ever sees them.
+Encrypted chat that runs in your terminal. You host the server, you control the
+room. Close the window — everything's gone. Messages and files are encrypted
+client-side before the server ever sees them. Built for people who'd rather not
+trust a corporation with their conversations: pairing, teaching, demos, hacking.
 
 
 ## Features

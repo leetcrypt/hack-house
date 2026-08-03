@@ -327,6 +327,23 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "list local VirtualBox VMs · a VM's snapshots",
                 ),
                 kv("/sbx gui <vm> [yes]", "alias of /sbx vbox gui <vm> [yes]"),
+                // ── trade saved VMs with peers (host-global registry) ──
+                kv(
+                    "/sbx browse",
+                    "your saved-VM registry — what each one is FOR and where the work stands (pruned snapshots drop out)",
+                ),
+                kv(
+                    "/sbx publish <label> [tag…]",
+                    "mark a saved VM shareable so peers can pull it (exports a portable .tar if needed)",
+                ),
+                kv(
+                    "/sbx catalog @<user>",
+                    "ask a peer which VMs they offer",
+                ),
+                kv(
+                    "/sbx pull @<user> <label>",
+                    "request a peer's published VM — /accept to receive + auto-import it",
+                ),
                 kv("/drive  ·  F2", "type into the shared shell (F2 releases; Esc reaches vim)"),
             ],
         },

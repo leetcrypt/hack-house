@@ -16,7 +16,8 @@ skill orchestrates several of those sessions and adds save/publish + batching.
 
 ```bash
 # Run from the hack-house repo root; pin the venv interpreter.
-cd ~/coding/learning/hacker-house
+HHREPO="${HHREPO:-$HOME/coding/hack-house/main}"  # repo root — override if elsewhere
+cd "$HHREPO"
 HH=".venv/bin/python -m cmd_chat.operator"        # the hh-bridge CLI
 HHBIN="hh/target/debug/hack-house"                # the Rust client + sbx CLI
 ```
@@ -84,7 +85,7 @@ LABEL="kali-recon-kit"
 # 0. one-time per run: a private room server + the visible tmux session
 tmux -L hh-loop new-session -d -s "$RUN" -x 220 -y 50
 tmux -L hh-loop send-keys -t "$RUN" \
-  "cd ~/coding/learning/hacker-house && .venv/bin/python cmd_chat.py serve 127.0.0.1 $PORT --password $PW --no-tls" Enter
+  "cd $HHREPO && .venv/bin/python cmd_chat.py serve 127.0.0.1 $PORT --password $PW --no-tls" Enter
 
 # 1. join as the planner (spawns the bridge daemon), grant the sandbox, summon it
 $HH up 127.0.0.1 $PORT planner --password "$PW" --no-tls --session "$RUN"
@@ -154,7 +155,7 @@ Capture the operation for review/demos. Two channels, combinable:
 
 - **logs** (default-cheap): tee the bridge + server output and dump the session.
   ```bash
-  LOGDIR=~/coding/learning/hacker-house/.loop-runs/$RUN; mkdir -p "$LOGDIR"
+  LOGDIR="$HHREPO/.loop-runs/$RUN"; mkdir -p "$LOGDIR"
   tmux -L hh-loop pipe-pane -t "$RUN" -o "cat >> $LOGDIR/tmux.log"   # live tap
   $HH read --since 0 > "$LOGDIR/events.jsonl"                        # full event log
   $HH screen > "$LOGDIR/screen.txt"                                  # final TUI frame
