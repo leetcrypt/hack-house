@@ -49,7 +49,14 @@ def register_lifecycle(app: Sanic) -> None:
 
 
 async def cleanup_stale_sessions(app: Sanic) -> None:
-    while True:
-        with suppress(asyncio.CancelledError):
+    # `suppress` wraps the loop, never a single iteration. Inside it, the
+    # CancelledError raised in `asyncio.sleep` was swallowed and the loop went
+    # straight back to sleeping — so `task.cancel()` in teardown could never
+    # land, `await cleanup_task` blocked forever, and the worker hung at
+    # "Stopping worker" instead of exiting. SIGTERM therefore did nothing: the
+    # server could only be SIGKILLed, which is how test servers came to survive
+    # for weeks on a developer box.
+    with suppress(asyncio.CancelledError):
+        while True:
             await asyncio.sleep(300)
             app.ctx.session_store.cleanup_stale()
