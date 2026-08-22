@@ -61,7 +61,7 @@ def pick_engine() -> str | None:
 
 def default_image(engine: str) -> str:
     """Match the Rust/agent defaults: Podman→Kali, Docker→Parrot."""
-    return "kalilinux/kali-rolling" if engine == "podman" else "parrotsec/core"
+    return "docker.io/kalilinux/kali-rolling" if engine == "podman" else "docker.io/parrotsec/core"
 
 
 # ── co-located exec ─────────────────────────────────────────────────────────
@@ -140,6 +140,26 @@ async def sweep_stale(engine: str) -> int:
     return swept
 
 
+def _hardening_flags() -> list[str]:
+    """Container isolation flags for the sandbox launch (kept argv-identical to
+    hh/src/sbx.rs). A safe DoS bound (`--pids-limit`, env-tunable) is ALWAYS on —
+    it never affects normal use. `HH_SBX_HARDEN=strict` adds the full escape-
+    resistant posture (cap-drop=ALL, no-new-privileges, read-only, network=none);
+    that breaks apt/pip/git/su, so it is for EMPTY or locked-down/escape-sensitive
+    rooms only, not the general functional sandbox. See the hh-redteam skill.
+    Envs: HH_SBX_PIDS (default 4096), HH_SBX_MEMORY (e.g. 8g; off if unset),
+    HH_SBX_HARDEN (strict|escape|max → full posture)."""
+    flags = ["--pids-limit", os.environ.get("HH_SBX_PIDS", "4096")]
+    mem = os.environ.get("HH_SBX_MEMORY", "").strip()
+    if mem:
+        flags += ["--memory", mem, "--memory-swap", mem]
+    if os.environ.get("HH_SBX_HARDEN", "").strip().lower() in ("strict", "escape", "max"):
+        flags += ["--cap-drop=ALL", "--security-opt=no-new-privileges",
+                  "--read-only", "--tmpfs", "/tmp", "--tmpfs", "/root:rw,exec",
+                  "--network=none"]
+    return flags
+
+
 async def launch_container(engine: str, name: str, image: str) -> tuple[bool, str]:
     """Start a persistent throwaway container we can exec into: reclaim any
     abandoned sandboxes, drop a stale same-name one, then `run -d --init --name
@@ -156,7 +176,7 @@ async def launch_container(engine: str, name: str, image: str) -> tuple[bool, st
         [engine, "run", "-d", "--init", "--name", name, "--hostname", name,
          "--label", f"{SANDBOX_LABEL}=1",
          "--label", f"{OWNER_PID_LABEL}={os.getpid()}",
-         "-w", "/root", image, "sleep", "infinity"])
+         "-w", "/root", *_hardening_flags(), image, "sleep", "infinity"])
     if rc != 0:
         tail = (out or "").strip().splitlines()[-1:] or [""]
         return False, f"{engine} run failed (exit={rc}): {tail[0]}"

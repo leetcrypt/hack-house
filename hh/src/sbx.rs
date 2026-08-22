@@ -673,11 +673,11 @@ impl Backend {
             // apt-only sandbox-bootstrap.sh path works unchanged. `parrotsec/core`
             // is the minimal base (bootstrap fills the toolchain); swap for
             // `parrotsec/security` per-launch if you want the full pentest set.
-            Backend::Docker => "parrotsec/core",
+            Backend::Docker => "docker.io/parrotsec/core",
             // Podman defaults to Kali (rolling). Still Debian/apt-based, so the
             // apt-only sandbox-bootstrap.sh path works unchanged; base is minimal
             // (no pentest metapackages pulled by default — keep first launch fast).
-            Backend::Podman => "kalilinux/kali-rolling",
+            Backend::Podman => "docker.io/kalilinux/kali-rolling",
             Backend::Local => "",
         }
     }
@@ -795,6 +795,28 @@ pub fn prepare(
             // Ollama. The old in-container Ollama gateway (Docker host-gateway /
             // Podman slirp4netns host-loopback) is therefore gone — and with it the
             // rootless-Podman loopback bug it used to work around.
+            // Isolation hardening — argv-identical to cmd_chat/operator/sandbox.py
+            // `_hardening_flags`. A safe DoS bound (`--pids-limit`, env-tunable) is
+            // ALWAYS on and never affects normal use. `HH_SBX_HARDEN=strict` adds
+            // the full escape-resistant posture (cap-drop=ALL, no-new-privileges,
+            // read-only, network=none) — that breaks apt/pip/git/su, so it is for
+            // EMPTY or locked-down/escape-sensitive rooms only. See the hh-redteam skill.
+            let pids = std::env::var("HH_SBX_PIDS").unwrap_or_else(|_| "4096".into());
+            run.args(["--pids-limit", &pids]);
+            let mem = std::env::var("HH_SBX_MEMORY").unwrap_or_default();
+            let mem = mem.trim();
+            if !mem.is_empty() {
+                run.args(["--memory", mem, "--memory-swap", mem]);
+            }
+            if matches!(
+                std::env::var("HH_SBX_HARDEN").unwrap_or_default().trim().to_lowercase().as_str(),
+                "strict" | "escape" | "max"
+            ) {
+                run.args([
+                    "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+                    "--tmpfs", "/tmp", "--tmpfs", "/root:rw,exec", "--network=none",
+                ]);
+            }
             run.args([image, "sleep", "infinity"]);
             let out = run
                 .output()
