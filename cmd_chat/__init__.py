@@ -28,6 +28,10 @@ def main():
     serve_p.add_argument("--cert", default=None, help="Path to TLS certificate")
     serve_p.add_argument("--key", default=None, help="Path to TLS private key")
     serve_p.add_argument("--no-tls", action="store_true", help="Disable TLS (insecure)")
+    serve_p.add_argument(
+        "--tor", action="store_true",
+        help="Expose this room via an ephemeral Tor v3 onion service (spec-tor-p2p-relay.md)",
+    )
 
     connect_p = subparsers.add_parser("connect", help="Connect to server")
     connect_p.add_argument("ip_address")
@@ -49,14 +53,27 @@ def main():
         from cmd_chat.server.server import run_server
 
         password = resolve_password(args.password)
-        run_server(
-            host=args.ip_address,
-            port=int(args.port),
-            password=password,
-            cert_path=args.cert,
-            key_path=args.key,
-            no_tls=args.no_tls,
-        )
+
+        onion = None
+        if args.tor:
+            from cmd_chat.tor.onion import EphemeralOnion
+
+            onion = EphemeralOnion()
+            service = onion.start(target_port=int(args.port), virtual_port=int(args.port))
+            print(f"[tor] ephemeral onion service: {service.address}:{service.port}")
+
+        try:
+            run_server(
+                host=args.ip_address,
+                port=int(args.port),
+                password=password,
+                cert_path=args.cert,
+                key_path=args.key,
+                no_tls=args.no_tls,
+            )
+        finally:
+            if onion is not None:
+                onion.stop()
     elif args.command == "connect":
         from cmd_chat.client.client import Client
 
