@@ -126,6 +126,28 @@ def test_failed_authentication_raises_tor_unavailable(monkeypatch):
         EphemeralOnion().start(target_port=9001, virtual_port=9001)
 
 
+def test_control_socket_path_is_used_instead_of_a_tcp_port(monkeypatch):
+    controller = FakeController()
+    calls = []
+
+    class FakeControllerModule:
+        @staticmethod
+        def from_port(port=9051):
+            raise AssertionError("must not fall back to a TCP ControlPort when a socket is given")
+
+        @staticmethod
+        def from_socket_file(path):
+            calls.append(path)
+            return controller
+
+    monkeypatch.setattr("cmd_chat.tor.onion.Controller", FakeControllerModule)
+
+    onion = EphemeralOnion(control_socket="/run/tor/control.sock")
+    onion.start(target_port=9001, virtual_port=9001)
+
+    assert calls == ["/run/tor/control.sock"]
+
+
 def test_stem_not_installed_raises_tor_unavailable(monkeypatch):
     monkeypatch.setattr("cmd_chat.tor.onion.Controller", None)
 
