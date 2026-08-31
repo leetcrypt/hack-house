@@ -2,6 +2,8 @@ import argparse
 import getpass
 import os
 
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
 # NOTE: the server (run_server) and client (Client) are imported lazily inside
 # main() below. Importing them here would pull sanic/pydantic (server) at
 # package-init time for *any* `cmd_chat.*` import — including
@@ -28,6 +30,18 @@ def main():
     serve_p.add_argument("--cert", default=None, help="Path to TLS certificate")
     serve_p.add_argument("--key", default=None, help="Path to TLS private key")
     serve_p.add_argument("--no-tls", action="store_true", help="Disable TLS (insecure)")
+    serve_p.add_argument(
+        "--tor", action="store_true",
+        help="Expose this room via an ephemeral Tor v3 onion service (spec-tor-p2p-relay.md)",
+    )
+    serve_p.add_argument(
+        "--tor-allow-public-bind", action="store_true",
+        help="Allow --tor with a non-loopback bind address (dual public+onion exposure; see spec §4.2)",
+    )
+    serve_p.add_argument(
+        "--tor-control-socket", default=None,
+        help="Unix socket path for the Tor ControlPort, instead of TCP (see spec §4.4)",
+    )
 
     connect_p = subparsers.add_parser("connect", help="Connect to server")
     connect_p.add_argument("ip_address")
@@ -49,14 +63,35 @@ def main():
         from cmd_chat.server.server import run_server
 
         password = resolve_password(args.password)
-        run_server(
-            host=args.ip_address,
-            port=int(args.port),
-            password=password,
-            cert_path=args.cert,
-            key_path=args.key,
-            no_tls=args.no_tls,
-        )
+
+        onion = None
+        if args.tor:
+            if args.ip_address not in LOOPBACK_HOSTS and not args.tor_allow_public_bind:
+                parser.error(
+                    f"--tor with a non-loopback bind ({args.ip_address!r}) would expose this "
+                    "room over BOTH the onion address and a plain public/LAN listener at once. "
+                    "Bind to 127.0.0.1 (recommended), or pass --tor-allow-public-bind if that "
+                    "dual exposure is deliberate (spec-tor-p2p-relay.md §4.2)."
+                )
+
+            from cmd_chat.tor.onion import EphemeralOnion
+
+            onion = EphemeralOnion(control_socket=args.tor_control_socket)
+            service = onion.start(target_port=int(args.port), virtual_port=int(args.port))
+            print(f"[tor] ephemeral onion service: {service.address}:{service.port}")
+
+        try:
+            run_server(
+                host=args.ip_address,
+                port=int(args.port),
+                password=password,
+                cert_path=args.cert,
+                key_path=args.key,
+                no_tls=args.no_tls,
+            )
+        finally:
+            if onion is not None:
+                onion.stop()
     elif args.command == "connect":
         from cmd_chat.client.client import Client
 
