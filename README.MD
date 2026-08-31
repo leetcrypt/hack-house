@@ -39,6 +39,7 @@ trust a corporation with their conversations: pairing, teaching, demos, hacking.
 - **Local-first AI agent** — `/ai start` summons an in-room AI that runs against *your own* [Ollama](https://ollama.com) (no API key, nothing leaves your machine); replies **stream token-by-token** with **in-RAM semantic recall** of the conversation for context; model-agnostic, addressed-only, end-to-end encrypted like every other client
 - **AI that acts in the sandbox** — grant an agent *drive* and address it with `/ai <name> !<task>`; it works the shared box through a bounded, host-side **tool-calling loop** (run shell, write/read files, inspecting each result before the next step) and you watch its commands land live in the shared terminal. Ungranted, it stays **advisory-only** (tells you the commands, runs nothing); destructive commands are gated behind an explicit `/ai <name> confirm`
 - **Encrypted file transfer** — `/send` → `/accept` with SHA-256 verification
+- **Tor onion hosting (optional)** — expose a room via a per-session, throwaway Tor v3 onion address instead of any inbound port (`--tor`); the key is never written to disk and the address is gone the moment the server stops. See [Tor onion hosting](#tor-onion-hosting).
 - **TLS** — self-signed by default, or bring your own cert; `--no-tls` for local/Tailscale use
 - **Themes** — seven switchable "vestments" (`crypt` default · `church` · `neon` · `blush` · `matrix` · `wraith` · `goldcrypt`), plus a live randomizer
 
@@ -53,6 +54,9 @@ trust a corporation with their conversations: pairing, teaching, demos, hacking.
 | `docs/providers.md` | Connect any model — profiles, flags, discovery, bring-your-own-provider |
 | `hh/scripts/` | Helper scripts — setup, hosting, sandbox provisioning, tests (see [Scripts](#scripts); each takes `-h`/`--help`) |
 | `hh/direnv-autostart/` | `cd` into a directory to auto-launch a session (direnv) |
+| `cmd_chat/tor/` | Ephemeral Tor v3 onion service sidecar (`--tor` on `serve`) — see [Tor onion hosting](#tor-onion-hosting) |
+| `scripts/tor-hardened-launch.sh` | Sandboxed Tor launcher (bwrap by default) for `--tor` hosting |
+| `docs/spec-tor-p2p-relay.md` | Full design + OPSEC writeup for Tor onion hosting |
 
 ## Quick start
 
@@ -411,9 +415,76 @@ depend on external video tooling — not needed to use or develop hack-house.
 - **Tailscale (recommended)** — both parties join a tailnet; traffic rides an encrypted WireGuard tunnel, no port forwarding. Connect with `--no-tls` over the trusted tunnel, or keep TLS on.
 - **LAN** — use your local IP; both devices on the same network.
 - **Public internet** — forward the port and use a real cert (`--cert`/`--key` on the server).
+- **Tor (no network access needed at all)** — see below.
 
 Share the room password out-of-band (in person, a disappearing Signal message,
 or a one-time-secret link) — never over an unencrypted channel.
+
+## Tor onion hosting
+
+No inbound port, no Tailscale, no domain — the room gets a fresh, throwaway
+`.onion` address that only exists for that one session. Good for a quick
+one-off with someone you don't want to hand a real network path to, or hosting
+from behind CGNAT/a coffee-shop network with zero setup on the router.
+
+**Requirements:** `tor` installed on the host (`sudo dnf install tor` /
+`apt install tor`); `stem` on the host (already in `requirements.txt`);
+`torsocks` on the **guest's** machine only (the host doesn't need it).
+
+### Host
+
+```bash
+# plain — talks to whatever tor ControlPort is already running (system tor,
+# or a hardened instance you started yourself — see below)
+python cmd_chat.py serve 127.0.0.1 9000 --password <pw> --no-tls --tor
+```
+```
+[tor] ephemeral onion service: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.onion:9000
+```
+
+That address is what you hand to a guest. It's minted fresh every run
+(`ADD_ONION`, key never written to disk) and destroyed the moment the server
+stops — nothing to clean up, nothing reusable across sessions.
+
+`serve --tor` **refuses to start on a non-loopback bind address by default**
+(pass `--tor-allow-public-bind` if you deliberately also want a plain public/LAN
+listener at the same time — most people don't).
+
+**Recommended: sandbox the Tor process itself.** `scripts/tor-hardened-launch.sh`
+runs `tor` inside `bwrap` (no extra dependency — already on most Linux desktops)
+with a Unix-socket Control/Socks port, cookie-only auth, and full (not
+single-hop) onion mode, so a Tor daemon bug can't see your `$HOME` or other
+processes:
+
+```bash
+scripts/tor-hardened-launch.sh
+# prints: CONTROL_SOCKET=/run/user/1000/hh-tor-XXXXXX/control.sock
+python cmd_chat.py serve 127.0.0.1 9000 --password <pw> --no-tls \
+  --tor --tor-control-socket /run/user/1000/hh-tor-XXXXXX/control.sock
+```
+
+### Guest
+
+Same client either way (Rust `hh` or `cmd_chat.py connect`) — Tor is just the
+transport, wrapped with `torsocks` so the connection routes through your local
+Tor SOCKS proxy instead of dialing out directly:
+
+```bash
+torsocks hh/target/debug/hack-house connect <onion-address> 9000 <name> --password <pw> --no-tls
+# or:
+torsocks python cmd_chat.py connect <onion-address> 9000 <name> --password <pw> --no-tls
+```
+
+Your own system `tor` needs to already be running (most Linux distros ship it
+as a `systemctl start tor` away; `torsocks` talks to it on `127.0.0.1:9050` by
+default — nothing else to configure).
+
+**Current limitation:** the guest needs the external `torsocks` wrapper for
+now — in-process SOCKS support (so `--tor` becomes a plain client flag, no
+wrapper needed) is planned but not yet landed. Full design, the OPSEC posture
+(why full onion mode not single-hop, why guard rotation is deliberately *not*
+done, DataDirectory hygiene, the bind-address footgun this guards against) and
+the roadmap live in [`docs/spec-tor-p2p-relay.md`](docs/spec-tor-p2p-relay.md).
 
 ## How it works
 
