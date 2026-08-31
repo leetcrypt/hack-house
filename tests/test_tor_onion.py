@@ -30,9 +30,9 @@ class FakeController:
             raise RuntimeError("auth failed")
         self.authenticated = True
 
-    def create_ephemeral_hidden_service(self, ports, await_publication=True, discard_key=True):
+    def create_ephemeral_hidden_service(self, ports, await_publication=True, discard_key=True, detached=False):
         assert discard_key is True, "the private key must never be persisted"
-        self.created.append({"ports": ports, "await_publication": await_publication})
+        self.created.append({"ports": ports, "await_publication": await_publication, "detached": detached})
         return FakeCreateResponse(self._next_id)
 
     def remove_ephemeral_hidden_service(self, service_id):
@@ -69,8 +69,15 @@ def test_start_creates_ephemeral_service_with_discarded_key(fake_controller):
     assert service.port == 9001
     assert service.target_port == 9001
     assert fake_controller.created == [
-        {"ports": {9001: 9001}, "await_publication": True}
+        {"ports": {9001: 9001}, "await_publication": True, "detached": False}
     ]
+
+
+def test_detached_flag_lets_the_service_outlive_the_creating_connection(fake_controller):
+    onion = EphemeralOnion()
+    onion.start(target_port=9001, virtual_port=9001, detached=True)
+
+    assert fake_controller.created[0]["detached"] is True
 
 
 def test_stop_removes_the_service_and_closes_the_controller(fake_controller):

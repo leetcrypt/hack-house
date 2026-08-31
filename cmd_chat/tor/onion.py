@@ -60,7 +60,12 @@ class EphemeralOnion:
             ) from exc
         return controller
 
-    def start(self, target_port: int, virtual_port: int = 80) -> OnionService:
+    def start(self, target_port: int, virtual_port: int = 80, detached: bool = False) -> OnionService:
+        """`detached=True` lets the service outlive this controller connection —
+        needed for a short-lived script that mints a service and then exits.
+        Without it, ADD_ONION ties the service's life to the connection that
+        created it (Tor's own default), so it vanishes the moment the process
+        holding that connection exits."""
         if self._controller is None:
             self._controller = self._connect()
 
@@ -68,6 +73,7 @@ class EphemeralOnion:
             {virtual_port: target_port},
             await_publication=True,
             discard_key=True,
+            detached=detached,
         )
         self._service = OnionService(
             address=f"{response.service_id}.onion",
