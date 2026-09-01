@@ -56,6 +56,7 @@ trust a corporation with their conversations: pairing, teaching, demos, hacking.
 | `hh/direnv-autostart/` | `cd` into a directory to auto-launch a session (direnv) |
 | `cmd_chat/tor/` | Ephemeral Tor v3 onion service sidecar (`--tor` on `serve`) — see [Tor onion hosting](#tor-onion-hosting) |
 | `scripts/tor-hardened-launch.sh` | Sandboxed Tor launcher (bwrap by default) for `--tor` hosting |
+| `scripts/tor-onion-connect.sh` | Guest-side helper: finds a checkout + client regardless of cwd, wraps `torsocks` |
 | `docs/spec-tor-p2p-relay.md` | Full design + OPSEC writeup for Tor onion hosting |
 
 ## Quick start
@@ -467,7 +468,22 @@ python cmd_chat.py serve 127.0.0.1 9000 --password <pw> --no-tls \
 
 Same client either way (Rust `hh` or `cmd_chat.py connect`) — Tor is just the
 transport, wrapped with `torsocks` so the connection routes through your local
-Tor SOCKS proxy instead of dialing out directly:
+Tor SOCKS proxy instead of dialing out directly.
+
+**Easiest: `scripts/tor-onion-connect.sh`.** The raw commands below assume
+you're sitting in a hack-house checkout root, which breaks the moment your
+shell lands somewhere else. This helper finds a checkout regardless of your
+current directory (checks `$PWD`, the script's own repo, then the usual
+`~/coding/hack-house/*` spots — override with `--repo`/`HH_REPO`), prefers the
+built Rust TUI, falls back to the Python client if that's not built, and
+wraps either in `torsocks` for you:
+
+```bash
+scripts/tor-onion-connect.sh <onion-address> 9000 <name> --password <pw>
+# works from anywhere — no need to cd into the checkout first
+```
+
+Raw form, if you'd rather not use the helper (must be run from a checkout root):
 
 ```bash
 torsocks hh/target/debug/hack-house connect <onion-address> 9000 <name> --password <pw> --no-tls
