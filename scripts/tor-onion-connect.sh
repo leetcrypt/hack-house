@@ -12,6 +12,22 @@
 # checkout on this machine works, including one behind the checkout that
 # minted the room.
 #
+# Different scope from hh/scripts/connect.sh, not a replacement for it:
+# connect.sh assumes you're already co-located with the checkout it lives in
+# (cd's relative to its own script path) and always rebuilds the Rust client.
+# This one is for a guest who may have no idea where — or whether — a
+# checkout exists on this machine at all, so it searches broadly and never
+# forces a build (falls back to the Python client instead).
+#
+# Known issue (docs/spec-tor-p2p-relay.md §6): torsocks' LD_PRELOAD
+# interception of the async websockets connect can hang instead of failing —
+# reproduced live (P0.5 finding): SRP succeeded, the WS phase hung >90s where
+# it normally takes ~13s. If this seems stuck for more than ~20s after the
+# "SRP authenticated" line, that's almost certainly it — Ctrl-C and retry
+# tends to work. No hard timeout is added here on purpose: this wraps a live
+# interactive session (TUI or chat), and killing it after a fixed deadline
+# would cut off a legitimately long one just as often as it'd catch a hang.
+#
 # Usage:
 #   tor-onion-connect.sh <onion-address> <port> <name> [--password PW] [--repo PATH]
 #
@@ -68,6 +84,9 @@ RUST_BIN="$REPO/hh/target/debug/hack-house"
 
 PW_ARGS=()
 [[ -n "$PASSWORD" ]] && PW_ARGS=(--password "$PASSWORD")
+
+echo "  (stuck for >20s after \"SRP authenticated\"? that's a known torsocks/async" \
+     "hang — Ctrl-C and retry; see this script's header)" >&2
 
 if [[ -x "$RUST_BIN" ]]; then
   echo "→ $REPO (Rust TUI: $RUST_BIN)" >&2

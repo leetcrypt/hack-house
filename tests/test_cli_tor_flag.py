@@ -130,3 +130,57 @@ def test_public_bind_without_tor_is_unaffected(monkeypatch, fake_onion):
     cmd_chat.main()  # must not raise / exit
 
     assert fake_onion.instances == []
+
+
+def test_public_bind_guard_fires_before_the_password_prompt(monkeypatch, fake_onion):
+    """A refused --tor invocation must not block on getpass first — the guard
+    check has to run before resolve_password(), not after."""
+    monkeypatch.setattr(sys, "argv", ["cmd_chat", "serve", "0.0.0.0", "9001", "--no-tls", "--tor"])
+    monkeypatch.setattr("cmd_chat.server.server.run_server", lambda **kwargs: None)
+
+    def boom_if_prompted(*a, **k):
+        raise AssertionError("getpass was called — the bind guard ran too late")
+
+    monkeypatch.setattr("getpass.getpass", boom_if_prompted)
+
+    with pytest.raises(SystemExit):
+        cmd_chat.main()
+
+
+def test_onion_is_stopped_if_start_itself_fails(monkeypatch, fake_onion):
+    """onion.start() raising (e.g. ADD_ONION rejected after a successful
+    connect) must not skip cleanup — the controller connection it already
+    opened would otherwise leak."""
+    monkeypatch.setattr(sys, "argv", ["cmd_chat", "serve", "127.0.0.1", "9001", "--password", "x", "--no-tls", "--tor"])
+    monkeypatch.setattr("cmd_chat.server.server.run_server", lambda **kwargs: None)
+
+    def boom(*a, **k):
+        raise RuntimeError("ADD_ONION rejected")
+
+    monkeypatch.setattr(FakeOnion, "start", boom)
+
+    with pytest.raises(RuntimeError, match="ADD_ONION rejected"):
+        cmd_chat.main()
+
+    assert fake_onion.instances[0].stopped is True
+
+
+def test_onion_stop_failure_does_not_mask_the_original_crash(monkeypatch, fake_onion, capsys):
+    """If run_server() crashes AND onion.stop() also raises during cleanup,
+    the ORIGINAL crash must be what propagates — not the teardown failure."""
+    monkeypatch.setattr(sys, "argv", ["cmd_chat", "serve", "127.0.0.1", "9001", "--password", "x", "--no-tls", "--tor"])
+
+    def boom(**kwargs):
+        raise RuntimeError("server exploded")
+
+    monkeypatch.setattr("cmd_chat.server.server.run_server", boom)
+
+    def stop_boom(self):
+        raise ConnectionError("tor control connection already dead")
+
+    monkeypatch.setattr(FakeOnion, "stop", stop_boom)
+
+    with pytest.raises(RuntimeError, match="server exploded"):
+        cmd_chat.main()
+
+    assert "tor control connection already dead" in capsys.readouterr().err

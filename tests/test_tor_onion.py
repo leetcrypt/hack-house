@@ -133,6 +133,24 @@ def test_failed_authentication_raises_tor_unavailable(monkeypatch):
         EphemeralOnion().start(target_port=9001, virtual_port=9001)
 
 
+def test_failed_authentication_closes_the_leaked_connection(monkeypatch):
+    """from_port()/from_socket_file() already opened a real socket by the time
+    authenticate() fails — that connection must not be leaked."""
+    controller = FakeController(auth_ok=False)
+
+    class FakeControllerModule:
+        @staticmethod
+        def from_port(port=9051):
+            return controller
+
+    monkeypatch.setattr("cmd_chat.tor.onion.Controller", FakeControllerModule)
+
+    with pytest.raises(TorUnavailableError):
+        EphemeralOnion().start(target_port=9001, virtual_port=9001)
+
+    assert controller.closed is True
+
+
 def test_control_socket_path_is_used_instead_of_a_tcp_port(monkeypatch):
     controller = FakeController()
     calls = []

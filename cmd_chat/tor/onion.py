@@ -48,6 +48,7 @@ class EphemeralOnion:
         self.stop()
 
     def _connect(self):
+        controller = None
         try:
             if self._control_socket:
                 controller = Controller.from_socket_file(self._control_socket)
@@ -55,6 +56,13 @@ class EphemeralOnion:
                 controller = Controller.from_port(port=self._control_port)
             controller.authenticate()
         except Exception as exc:
+            # from_port()/from_socket_file() already opened the socket by the
+            # time authenticate() can fail — close it rather than leak it.
+            if controller is not None:
+                try:
+                    controller.close()
+                except Exception:
+                    pass
             raise TorUnavailableError(
                 f"could not reach/authenticate to the Tor ControlPort: {exc}"
             ) from exc

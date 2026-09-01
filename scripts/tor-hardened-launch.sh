@@ -39,7 +39,7 @@ set -euo pipefail
 ENGINE="bwrap"
 DATA_DIR=""
 
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --engine) ENGINE="$2"; shift 2 ;;
     --data-dir) DATA_DIR="$2"; shift 2 ;;
@@ -57,7 +57,7 @@ command -v tor >/dev/null || { echo "tor is not installed" >&2; exit 1; }
 command -v "$ENGINE" >/dev/null || { echo "$ENGINE is not installed" >&2; exit 1; }
 
 RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp}"
-if [ -z "$DATA_DIR" ]; then
+if [[ -z "$DATA_DIR" ]]; then
   DATA_DIR="$(mktemp -d "$RUNTIME_BASE/hh-tor-XXXXXX")"
 fi
 mkdir -p "$DATA_DIR"
@@ -81,14 +81,18 @@ chmod 700 "$DATA_DIR/state"
 
 TOR_PID=""
 cleanup() {
-  [ -n "$TOR_PID" ] && kill -TERM "$TOR_PID" 2>/dev/null || true
-  if [ "$ENGINE" = podman ]; then
+  [[ -n "$TOR_PID" ]] && kill -TERM "$TOR_PID" 2>/dev/null || true
+  if [[ "$ENGINE" == podman ]]; then
     podman rm -f "hh-tor-$$" >/dev/null 2>&1 || true
   fi
+  # DataDirectory hygiene (spec §4.8): the cookie file, guard list, and cached
+  # descriptors have no reason to survive this instance — leaving them behind
+  # is exactly the accumulation-across-sessions risk that section warns about.
+  rm -rf "$DATA_DIR"
 }
 trap cleanup EXIT INT TERM
 
-if [ "$ENGINE" = bwrap ]; then
+if [[ "$ENGINE" == bwrap ]]; then
   bwrap \
     --unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup \
     --die-with-parent --new-session \
@@ -99,6 +103,13 @@ if [ "$ENGINE" = bwrap ]; then
     tor -f "$TORRC" &
   TOR_PID=$!
 else
+  # A THIRD independent hardening posture alongside hh/src/sbx.rs and
+  # cmd_chat/operator/sandbox.py's HH_SBX_HARDEN (--cap-drop/no-new-privileges
+  # match those; --network=host does NOT match their --network=none — tor
+  # needs outbound reachability to relays, the interactive sandbox doesn't).
+  # No shared source of truth between the three; a future capability-flag
+  # change needs to be made in all of them.
+  #
   # Requires an image with `tor` already installed — build one (e.g. a Debian
   # base + `apt-get install -y tor`) rather than installing at launch time;
   # this script won't do a network install on every run. Override the image
