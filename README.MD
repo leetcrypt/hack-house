@@ -39,7 +39,7 @@ trust a corporation with their conversations: pairing, teaching, demos, hacking.
 - **Local-first AI agent** — `/ai start` summons an in-room AI that runs against *your own* [Ollama](https://ollama.com) (no API key, nothing leaves your machine); replies **stream token-by-token** with **in-RAM semantic recall** of the conversation for context; model-agnostic, addressed-only, end-to-end encrypted like every other client
 - **AI that acts in the sandbox** — grant an agent *drive* and address it with `/ai <name> !<task>`; it works the shared box through a bounded, host-side **tool-calling loop** (run shell, write/read files, inspecting each result before the next step) and you watch its commands land live in the shared terminal. Ungranted, it stays **advisory-only** (tells you the commands, runs nothing); destructive commands are gated behind an explicit `/ai <name> confirm`
 - **Encrypted file transfer** — `/send` → `/accept` with SHA-256 verification
-- **Tor onion hosting (optional)** — expose a room via a per-session, throwaway Tor v3 onion address instead of any inbound port (`--tor`); the key is never written to disk and the address is gone the moment the server stops. See [Tor onion hosting](#tor-onion-hosting).
+- **Tor onion hosting (optional)** — expose a room via a per-session, throwaway Tor v3 onion address instead of any inbound port (`--tor`); the key is never written to disk and the address is gone the moment the server stops. Pair it with `web-relay` for a second onion + browser access (Orbot/Tor Browser) so a guest with no hack-house install — just a phone — can watch and chat too. See [Tor onion hosting](#tor-onion-hosting).
 - **TLS** — self-signed by default, or bring your own cert; `--no-tls` for local/Tailscale use
 - **Themes** — seven switchable "vestments" (`crypt` default · `church` · `neon` · `blush` · `matrix` · `wraith` · `goldcrypt`), plus a live randomizer
 
@@ -501,6 +501,51 @@ wrapper needed) is planned but not yet landed. Full design, the OPSEC posture
 (why full onion mode not single-hop, why guard rotation is deliberately *not*
 done, DataDirectory hygiene, the bind-address footgun this guards against) and
 the roadmap live in [`docs/spec-tor-p2p-relay.md`](docs/spec-tor-p2p-relay.md).
+
+### Browser access for mobile (optional)
+
+Everything above is terminal-only — the guest needs hack-house installed. For
+someone who doesn't (a phone with nothing but a browser), pair Tor hosting
+with **`web-relay`** (a separate, unmerged branch — `git worktree add` it
+alongside `main` if you don't have it checked out) instead of Tailscale/a
+domain: mint a *second* onion service fronting the relay's port, and hand out
+that link instead.
+
+```bash
+# 1. the room itself, same as any --tor host
+python cmd_chat.py serve 127.0.0.1 9000 --password <pw> --no-tls --tor
+
+# 2. from the web-relay worktree: the relay (loopback only — its own
+#    safety gate refuses a public bind) + a publisher that joins the room
+cd ../web-relay   # or wherever that worktree lives
+.venv/bin/python -m web-relay.relay --host 127.0.0.1 --port 8080 --no-tls &
+.venv/bin/python -m cmd_chat.web 127.0.0.1 9000 --password <pw> --no-tls \
+  --relay http://127.0.0.1:8080 --public-url http://<relay-onion-address> \
+  --label "hack-house room"
+
+# 3. mint the relay's own onion, fronting :8080 — same tor daemon/ControlPort
+#    as step 1, `detached=True` so it survives this being a one-shot script
+python - <<'PY'
+from cmd_chat.tor.onion import EphemeralOnion
+onion = EphemeralOnion()   # or control_socket=... for the hardened launcher
+service = onion.start(target_port=8080, virtual_port=80, detached=True)
+print(service.address)   # ← this is <relay-onion-address> for step 2's --public-url
+PY
+```
+
+Hand the guest `http://<relay-onion-address>/r/<slug>#k=<key>` (printed by the
+publisher). **They need Orbot or Tor Browser** — a stock Chrome/Safari cannot
+open `.onion` links at all, no matter what's scanned; there's no way around
+that, it's inherent to how onion services resolve. This is why it's presented
+as an *optional add-on* to terminal hosting, not a replacement for it: the two
+onions are independent (killing the room's tor daemon takes both down at
+once, since they share it), and nothing about the terminal path above changes.
+
+Both onions live on the **same** tor daemon/ControlPort — no second `tor`
+process needed. `hh-go onion browser` (a personal deployment script, not part
+of this repo) automates exactly this sequence if you're on a box that already
+has it, including a QR code for the share link and a guard against silently
+reusing a stale process on the relay's port.
 
 ## How it works
 
