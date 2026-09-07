@@ -808,23 +808,49 @@ pub fn prepare(
             if !mem.is_empty() {
                 run.args(["--memory", mem, "--memory-swap", mem]);
             }
-            if matches!(
+            let hardened = matches!(
                 std::env::var("HH_SBX_HARDEN").unwrap_or_default().trim().to_lowercase().as_str(),
                 "strict" | "escape" | "max"
-            ) {
+            );
+            if hardened {
                 run.args([
                     "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
                     "--tmpfs", "/tmp", "--tmpfs", "/root:rw,exec", "--network=none",
                 ]);
+            }
+            // Egress control (HH_SBX_EGRESS) — same posture ladder as the Python operator
+            // (cmd_chat/operator/egress.py). Gateway modes shell to the single-source script
+            // scripts/hh-sbx-egress.py. Skipped when hardened (already --network=none).
+            let egress = std::env::var("HH_SBX_EGRESS").unwrap_or_default().trim().to_lowercase();
+            let egress = if egress.is_empty() { "guard".to_string() } else { egress };
+            let mut egress_gw_mode: Option<String> = None;
+            if !hardened {
+                match egress.as_str() {
+                    "none" => { run.args(["--network=none"]); }
+                    "open" => {}
+                    "guard" => {
+                        if !route_tunneled() {
+                            anyhow::bail!("HH_SBX_EGRESS=guard: sandbox egress is not tunneled \
+                                (VPN/Tor down) — refusing networked launch; HH_SBX_EGRESS=open to allow");
+                        }
+                    }
+                    "local" | "scope" | "tor" => match egress_gateway_up(engine, name, &egress) {
+                        Ok(netarg) => { run.arg(netarg); egress_gw_mode = Some(egress.clone()); }
+                        Err(e) => anyhow::bail!("egress gateway ({egress}) refused: {e}"),
+                    },
+                    other => anyhow::bail!("unknown HH_SBX_EGRESS='{other}'"),
+                }
             }
             run.args([image, "sleep", "infinity"]);
             let out = run
                 .output()
                 .with_context(|| format!("{engine} run (is {engine} installed?)"))?;
             if !out.status.success() {
+                if let Some(m) = &egress_gw_mode { egress_gateway_down(engine, name); let _ = m; }
                 let err = String::from_utf8_lossy(&out.stderr);
                 anyhow::bail!("{engine} run failed: {}", err.lines().last().unwrap_or("").trim());
             }
+            if let Some(m) = egress_gw_mode { egress_postjoin(engine, name, &m); }
             Ok(())
         }
     }
@@ -834,6 +860,57 @@ pub fn prepare(
 pub const SANDBOX_LABEL: &str = "hh.sandbox";
 /// Label carrying the PID of the hack-house process that created it.
 pub const OWNER_PID_LABEL: &str = "hh.owner-pid";
+
+/// The single-source sandbox-egress gateway CLI (shared with the Python operator).
+const HH_SBX_EGRESS_SCRIPT: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/hh-sbx-egress.py");
+
+/// Is the host's default route a VPN/Tor tunnel? Mirrors egress.py's VPN_IFACE_RE.
+fn route_tunneled() -> bool {
+    let out = match Command::new("ip").args(["route", "get", "1.1.1.1"]).output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    if let Some(idx) = s.find(" dev ") {
+        let dev = s[idx + 5..].split_whitespace().next().unwrap_or("");
+        return ["proton", "wg", "tun", "tap", "tailscale", "ppp", "nordlynx", "mullvad", "ipsec"]
+            .iter()
+            .any(|p| dev.starts_with(p));
+    }
+    false
+}
+
+/// Create the egress gateway via the shared script; return the `--network=container:...`
+/// flag to add to `podman run`, or an error (fail-closed — caller must refuse the launch).
+fn egress_gateway_up(engine: &str, name: &str, mode: &str) -> Result<String> {
+    let out = Command::new("python3")
+        .args([HH_SBX_EGRESS_SCRIPT, "up", name, "--egress", mode, "--engine", engine])
+        .output()
+        .with_context(|| "running hh-sbx-egress up")?;
+    let so = String::from_utf8_lossy(&out.stdout);
+    for line in so.lines() {
+        if let Some(flag) = line.strip_prefix("NETARG=") {
+            return Ok(flag.to_string());
+        }
+    }
+    let reason = so.lines().last().unwrap_or("").trim();
+    anyhow::bail!("{}", if reason.is_empty() { "gateway up failed" } else { reason });
+}
+
+/// Sandbox-side setup after it joined the gateway netns (tor: resolver). Best-effort.
+fn egress_postjoin(engine: &str, name: &str, mode: &str) {
+    let _ = Command::new("python3")
+        .args([HH_SBX_EGRESS_SCRIPT, "postjoin", name, "--egress", mode, "--engine", engine])
+        .output();
+}
+
+/// Remove the sandbox's egress gateway (best-effort; no-op if none).
+fn egress_gateway_down(engine: &str, name: &str) {
+    let _ = Command::new("python3")
+        .args([HH_SBX_EGRESS_SCRIPT, "down", name, "--engine", engine])
+        .output();
+}
 
 /// Reclaim sandbox containers whose owning hack-house process is gone.
 ///
@@ -914,11 +991,13 @@ pub fn teardown(backend: Backend, name: &str) {
                 .status();
         }
         Backend::Docker | Backend::Podman => {
-            let _ = Command::new(engine_bin(backend))
+            let eng = engine_bin(backend);
+            let _ = Command::new(eng)
                 .args(["rm", "-f", name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
+            egress_gateway_down(eng, name);  // remove the sandbox's egress gateway, if any
         }
         Backend::Local => {}
     }

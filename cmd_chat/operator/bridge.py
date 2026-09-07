@@ -410,7 +410,9 @@ class OperatorBridge(Client):
                 return {"ok": False, "error": "no container engine (need podman or docker)"}
             image = req.get("image") or sbx.default_image(engine)
             name = req.get("name") or f"hh-op-{self.name}"
-            ok, msg = await sbx.launch_container(engine, name, image)
+            ok, msg = await sbx.launch_container(engine, name, image,
+                                                 egress=req.get("egress"),
+                                                 harden=req.get("harden"))
             if ok:
                 self._own_engine, self._own_name = engine, name
                 await self._emit("sandbox", state="own-ready", engine=engine,

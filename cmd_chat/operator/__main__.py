@@ -71,6 +71,14 @@ def _build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--engine", default=None, help="podman|docker (default: auto)")
     sb.add_argument("--image", default=None, help="container image (default per engine)")
     sb.add_argument("--name", default=None, help="container name (default: hh-op-<user>)")
+    sb.add_argument("--egress", default=None,
+                    choices=["guard", "open", "none", "local", "scope", "tor"],
+                    help="per-launch egress posture (overrides $HH_SBX_EGRESS): "
+                         "guard(default, leak-guard) | open | none | local (block LAN/host/"
+                         "tailnet pivot) | scope (+$HH_SBX_SCOPE allowlist) | tor (Tor exit)")
+    sb.add_argument("--harden", default=None, choices=["strict", "escape", "max"],
+                    help="per-launch container hardening (overrides $HH_SBX_HARDEN): "
+                         "cap-drop=ALL, no-new-privileges, read-only, network=none")
     sb.add_argument("--session", default=None)
 
     ex = sub.add_parser("exec", help="run a shell command in the sandbox")
@@ -196,6 +204,15 @@ def _build_parser() -> argparse.ArgumentParser:
     rg.add_argument("--label", default=None, help="for show: which VM")
     rg.add_argument("--repo", default=None, help="for list: filter to this origin repo")
     rg.add_argument("--json", action="store_true", help="machine-readable output")
+
+    eg = sub.add_parser("egress",
+                        help="measure the sandbox's outbound egress IP + reachability, and "
+                             "report the HH_SBX_EGRESS guard posture (no daemon/session needed)")
+    eg.add_argument("--container", action="store_true",
+                    help="also spin a throwaway container and measure the IP it actually presents "
+                         "(most faithful; makes an external request + launches a container)")
+    eg.add_argument("--engine", default=None, help="podman|docker (default: auto)")
+    eg.add_argument("--json", action="store_true", help="machine-readable output")
 
     for v in ("roster", "status", "down"):
         sub.add_parser(v).add_argument("--session", default=None)
@@ -337,7 +354,9 @@ def _run_say(args) -> int:
 def _run_sbx(args) -> int:
     resp = _client_request(args, {"op": "sbx", "action": args.action,
                                   "engine": args.engine, "image": args.image,
-                                  "name": args.name})
+                                  "name": args.name,
+                                  "egress": getattr(args, "egress", None),
+                                  "harden": getattr(args, "harden", None)})
     print(json.dumps(resp))
     return 0 if resp.get("ok") else 1
 
@@ -485,6 +504,30 @@ def _run_operate(args) -> int:
     return 0 if result.reason in ("done", "token-ceiling", "turn-cap") else 1
 
 
+def _run_egress(args) -> int:
+    """Measure sandbox egress + report the guard posture. No daemon/session needed."""
+    from . import egress as eg
+    from . import sandbox as sbx
+    engine = args.engine or (sbx.pick_engine() if args.container else None)
+    rep = eg.egress_report(engine=engine, container_probe=args.container)
+    if args.json:
+        print(json.dumps(rep, indent=2))
+        return 0
+    tun = "TUNNELED" if rep["tunneled"] else "NOT tunneled"
+    print(f"egress posture   HH_SBX_EGRESS={rep['mode']}")
+    print(f"default route    dev {rep['route_iface'] or '?'}  ({tun})")
+    print(f"host egress IP   {rep['host_public_ip'] or '(probe failed)'}")
+    if "container_public_ip" in rep:
+        match = "== host" if rep.get("container_matches_host") else "!= host (differs!)"
+        print(f"sandbox egress IP {rep['container_public_ip'] or '(probe failed)'}  ({match})")
+    print(f"tailnet Ollama   {'reachable' if rep['tailnet_ollama_reachable'] else 'UNREACHABLE'}")
+    if not rep["tunneled"]:
+        print("⚠  egress is NOT via a VPN/Tor tunnel — outbound sandbox ops would present the "
+              "host's real IP. The room relay does NOT anonymize this. Use HH_SBX_EGRESS=guard "
+              "to fail-closed, or =none for no egress.")
+    return 0
+
+
 def _run_keys(args) -> int:
     from . import sandbox as sbx
     if args.help_keys:
@@ -613,6 +656,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_watch(args)
     if verb == "web":
         return _run_web(args)
+    if verb == "egress":
+        return _run_egress(args)
     if verb in ("roster", "status", "down"):
         return _run_simple(args, verb)
     return 2

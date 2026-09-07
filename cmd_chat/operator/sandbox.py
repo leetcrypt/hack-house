@@ -82,11 +82,13 @@ def exec_prefix(engine: str | None, name: str | None) -> list[str] | None:
 
 
 async def exec_capture(argv: list[str], stdin: bytes | None = None,
-                       text: bool = True) -> tuple[str | bytes, int]:
+                       text: bool = True, timeout: float | None = None) -> tuple[str | bytes, int]:
     """Run an exec argv, capture combined stdout+stderr and the exit code,
     time-bounded. `text=True` decodes + byte-caps for display; `text=False`
     returns raw bytes uncapped (for `get`, where truncation would corrupt the
-    file). The container/VM is the blast radius; `local` is the host by choice."""
+    file). `timeout` overrides EXEC_TIMEOUT (e.g. the egress gateway's tor
+    bootstrap needs longer). The container/VM is the blast radius; `local` is the
+    host by choice."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -97,7 +99,8 @@ async def exec_capture(argv: list[str], stdin: bytes | None = None,
     except (FileNotFoundError, OSError) as e:
         return (f"[exec failed: {e}]" if text else b""), 127
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(input=stdin), timeout=EXEC_TIMEOUT)
+        out, _ = await asyncio.wait_for(proc.communicate(input=stdin),
+                                        timeout=timeout or EXEC_TIMEOUT)
     except asyncio.TimeoutError:
         proc.kill()
         return ("[command timed out]" if text else b""), 124
@@ -140,27 +143,30 @@ async def sweep_stale(engine: str) -> int:
     return swept
 
 
-def _hardening_flags() -> list[str]:
+def _hardening_flags(harden: str | None = None) -> list[str]:
     """Container isolation flags for the sandbox launch (kept argv-identical to
     hh/src/sbx.rs). A safe DoS bound (`--pids-limit`, env-tunable) is ALWAYS on —
-    it never affects normal use. `HH_SBX_HARDEN=strict` adds the full escape-
-    resistant posture (cap-drop=ALL, no-new-privileges, read-only, network=none);
-    that breaks apt/pip/git/su, so it is for EMPTY or locked-down/escape-sensitive
-    rooms only, not the general functional sandbox. See the hh-redteam skill.
+    it never affects normal use. A strict posture (cap-drop=ALL, no-new-privileges,
+    read-only, network=none) adds the full escape-resistant posture; that breaks
+    apt/pip/git/su, so it is for EMPTY or locked-down/escape-sensitive rooms only.
+    ``harden`` overrides `$HH_SBX_HARDEN` per-launch (e.g. `sbx launch --harden strict`).
     Envs: HH_SBX_PIDS (default 4096), HH_SBX_MEMORY (e.g. 8g; off if unset),
     HH_SBX_HARDEN (strict|escape|max → full posture)."""
     flags = ["--pids-limit", os.environ.get("HH_SBX_PIDS", "4096")]
     mem = os.environ.get("HH_SBX_MEMORY", "").strip()
     if mem:
         flags += ["--memory", mem, "--memory-swap", mem]
-    if os.environ.get("HH_SBX_HARDEN", "").strip().lower() in ("strict", "escape", "max"):
+    level = (harden or os.environ.get("HH_SBX_HARDEN", "")).strip().lower()
+    if level in ("strict", "escape", "max"):
         flags += ["--cap-drop=ALL", "--security-opt=no-new-privileges",
                   "--read-only", "--tmpfs", "/tmp", "--tmpfs", "/root:rw,exec",
                   "--network=none"]
     return flags
 
 
-async def launch_container(engine: str, name: str, image: str) -> tuple[bool, str]:
+async def launch_container(engine: str, name: str, image: str, *,
+                           egress: str | None = None,
+                           harden: str | None = None) -> tuple[bool, str]:
     """Start a persistent throwaway container we can exec into: reclaim any
     abandoned sandboxes, drop a stale same-name one, then `run -d --init --name
     … --hostname … -w /root <image> sleep infinity` (argv-identical to
@@ -172,19 +178,53 @@ async def launch_container(engine: str, name: str, image: str) -> tuple[bool, st
     PID 1 to reap them."""
     await sweep_stale(engine)
     await exec_capture([engine, "rm", "-f", name])  # ignore "no such container"
+
+    # Egress control (HH_SBX_EGRESS): the container egresses via the host's default
+    # route (measured: the ProtonVPN exit), NOT via any room relay. `guard` (default)
+    # refuses a networked launch when the route isn't a tunnel (leak guard); `none`
+    # forces no egress; `open` only warns. See egress.py.
+    from . import egress as eg
+    mode = eg.egress_mode(egress)
+    flags = _hardening_flags(harden)
+    advisory = ""
+    if "--network=none" not in flags:
+        if mode == "none":
+            flags = flags + ["--network=none"]
+        else:
+            allow, advisory = eg.guard_networked_launch(mode)
+            if not allow:
+                return False, advisory
+            # local/scope/tor: put the sandbox behind a sidecar egress gateway that
+            # owns the netns + filtering rules (SPIKE.md). Fail-closed: refuse the
+            # launch if the gateway can't come up (never fall back to unfiltered).
+            if mode in ("local", "scope", "tor"):
+                from . import egress_gw as egw
+                gok, gmsg, gwname = await egw.launch_gateway(engine, name, mode)
+                if not gok:
+                    return False, f"egress gateway ({mode}) refused: {gmsg}"
+                flags = flags + ["--network=container:" + gwname]
+                advisory = (advisory + "; " + gmsg) if advisory else gmsg
+
     out, rc = await exec_capture(
         [engine, "run", "-d", "--init", "--name", name, "--hostname", name,
          "--label", f"{SANDBOX_LABEL}=1",
          "--label", f"{OWNER_PID_LABEL}={os.getpid()}",
-         "-w", "/root", *_hardening_flags(), image, "sleep", "infinity"])
+         "-w", "/root", *flags, image, "sleep", "infinity"])
     if rc != 0:
         tail = (out or "").strip().splitlines()[-1:] or [""]
         return False, f"{engine} run failed (exit={rc}): {tail[0]}"
-    return True, f"launched {engine} container '{name}' from {image}"
+    if mode in ("local", "scope", "tor") and "--network=none" not in flags:
+        from . import egress_gw as egw
+        await egw.post_join(engine, name, mode)  # tor: point the sandbox resolver at tor DNSPort
+    msg = f"launched {engine} container '{name}' from {image}"
+    return True, (advisory + "; " + msg) if advisory else msg
 
 
 async def teardown_container(engine: str, name: str) -> tuple[bool, str]:
     out, rc = await exec_capture([engine, "rm", "-f", name])
+    # Remove the sandbox's egress gateway (if any) AFTER the sandbox that used its netns.
+    from . import egress_gw as egw
+    await egw.teardown_gateway(engine, name)
     if rc != 0:
         return False, f"{engine} rm failed (exit={rc}): {(out or '').strip()[:200]}"
     return True, f"removed {engine} container '{name}'"
