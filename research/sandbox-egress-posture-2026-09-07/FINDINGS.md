@@ -79,3 +79,19 @@ spike proves it once and both controls fall out of it.
 1. **Spike** enforced egress filtering for a rootless sandbox netns (this dir → `SPIKE.md`).
 2. **Internal-pivot block** mode.
 3. **Tor egress** mode (option-for-any-transport), verified with `egress --container`.
+
+## Red-team finding + fix — IPv6 pivot bypass (2026-09-07, post-ship)
+
+Adversarial test from inside a `local`-mode sandbox (no NET_ADMIN, like a room guest):
+- **IPv4 pivot correctly blocked**, but **IPv6 pivot BYPASSED** — the sandbox reached the
+  tailnet host over IPv6 (`fd7a:115c:a1e0::e537:6216`) and external IPv6. Root cause: the nft
+  rulesets used `ip daddr` (IPv4 only); the default (pasta) network hands the sandbox IPv6, so
+  a guest pivots into the tailnet/LAN over v6 — defeating the whole `local` host-safety control.
+- **Latent bug exposed:** `local`/`scope` DNS was resolving ONLY over the IPv6 resolver, because
+  the host's IPv4 resolvers (`169.254.x` pasta stub, Proton `10.x`) sit in the dropped internal
+  ranges. Blocking IPv6 broke DNS — proving DNS had been silently depending on the leak.
+- **Fix:** drop all IPv6 egress in the gateway (`meta nfproto ipv6 drop`, both local/scope and
+  tor rulesets), and point the local/scope sandbox resolver at a public IPv4 nameserver
+  (`1.1.1.1`) in postjoin. Re-verified: IPv4 internet + DNS + Ollama work; IPv4 **and** IPv6
+  pivot blocked; egress still Proton-masked. tor mode was already safe (bridge net has no IPv6).
+- **Config-tamper attempts denied** (no `ip`/`nft`, no NET_ADMIN) — the guest cannot alter rules.

@@ -59,6 +59,7 @@ _TOR_NFT = (
     "    type filter hook output priority 0; policy accept;\n"
     '    meta skuid "tor" return\n'
     '    oifname "lo" return\n'
+    "    meta nfproto ipv6 drop\n"   # tor TransPort is IPv4-only — drop all IPv6 (no leak around tor)
     "    meta l4proto != tcp drop\n"
     "  }\n"
     "}\n"
@@ -77,11 +78,16 @@ def scope_allow(scope: str | None) -> list[str]:
 def pivot_block_ruleset(allow: list[str]) -> str:
     allows = "\n".join(f"    ip daddr {a} accept" for a in allow)
     drops = ", ".join(INTERNAL_CIDRS)
+    # Drop ALL IPv6 egress: the allowlist + pivot drops are IPv4-only, and the default
+    # (pasta) network hands the sandbox IPv6 — without this a guest pivots into the
+    # tailnet/LAN over IPv6 (red-team finding 2026-09-07). Loopback IPv6 is covered by
+    # `oifname lo accept`. IPv6-only external targets are the accepted trade for the block.
     return ("table inet filt {\n  chain output {\n"
             "    type filter hook output priority 0; policy accept;\n"
             '    oifname "lo" accept\n'
             f"{allows}\n"
-            f"    ip daddr {{ {drops} }} drop\n  }}\n}}\n")
+            f"    ip daddr {{ {drops} }} drop\n"
+            "    meta nfproto ipv6 drop\n  }\n}\n")
 
 
 def _run(argv, stdin=None, timeout=90):
@@ -147,9 +153,19 @@ def cmd_up(a) -> int:
 
 
 def cmd_postjoin(a) -> int:
+    # Point the sandbox resolver at a reachable nameserver. tor: tor's DNSPort on
+    # loopback. local/scope: a PUBLIC IPv4 resolver (1.1.1.1) — the host's own
+    # resolvers (169.254.x pasta stub, Proton 10.x) sit in the dropped internal
+    # ranges, so without this DNS only resolves over IPv6, which the gateway now
+    # drops (red-team finding 2026-09-07).
     if a.egress == "tor":
-        _run([a.engine, "exec", a.sandbox, "sh", "-c",
-              "printf 'nameserver 127.0.0.1\\n' > /etc/resolv.conf"])
+        ns = "127.0.0.1"
+    elif a.egress in ("local", "scope"):
+        ns = "1.1.1.1"
+    else:
+        return 0
+    _run([a.engine, "exec", a.sandbox, "sh", "-c",
+          f"printf 'nameserver {ns}\\n' > /etc/resolv.conf"])
     return 0
 
 

@@ -48,9 +48,9 @@ async def launch_gateway(engine: str, sandbox_name: str, mode: str) -> tuple[boo
 
 
 async def post_join(engine: str, sandbox_name: str, mode: str) -> None:
-    """Sandbox-side setup after it joined the gateway netns (tor: point resolver at
-    tor's DNSPort on 127.0.0.1)."""
-    if mode != "tor":
+    """Sandbox-side setup after it joined the gateway netns — the script points the
+    resolver at a reachable nameserver (tor: tor DNSPort; local/scope: public IPv4)."""
+    if mode not in ("local", "scope", "tor"):
         return
     from .sandbox import exec_capture
     await exec_capture(_argv("postjoin", sandbox_name, mode) + ["--engine", engine])
