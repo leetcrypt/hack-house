@@ -154,6 +154,7 @@ Type to chat. Slash commands and keys:
 | `<text>` ↵ | Send an encrypted chat message |
 | `/help` · `F1` | Help overlay |
 | `/pw` | Show this room's password (local only — never broadcast) |
+| `/share` | Print a paste-ready invite block for this room (local only): the password plus every way in — the Tor onion (if hosted `--tor`) and each reachable **tailscale** / **lan** / public address, each with its `connect` command. Loopback-only rooms say so and how to make them reachable |
 | `/theme [name]` | Switch vestments, or list them |
 | `/send <user> <path>` | Offer a file (or directory) directly to one member |
 | `/sendroom <path>` | Offer a file (or directory) to the whole room |
@@ -206,6 +207,27 @@ unchanged. Tear it down with `/sbx stop` (purges the VM/container).
 [label]`, list what you've stored with `/sbx snaps`, and restore one later with
 `/sbx load <label>` — handy for resuming a half-built environment or replaying a
 demo from a known-good state.
+
+**Sandbox egress (`HH_SBX_EGRESS`).** Controls the summoned sandbox's *outbound*
+network — orthogonal to how the room is reached (a Tor onion or tailnet front
+door proxies *inbound* access; it never routes the container's egress). Set the
+env var before summoning (the operator CLI also takes a per-launch `sbx launch
+--egress <mode>`):
+
+| Mode | Outbound behaviour |
+|---|---|
+| `auto` **(default)** | Tor exit if Tor is available on this host, else `local`; and if the Tor gateway can't come up it falls back to `local`. A launch is **never refused** for egress reasons — no false-negative "won't connect". |
+| `tor` | Force all outbound through a **Tor exit** (anonymized). |
+| `local` | Block the **LAN/host/tailnet pivot**; allow internet (presents your real IP). |
+| `scope` | `local` **plus** the hosts in `$HH_SBX_SCOPE` (comma-separated allowlist). |
+| `open` | No restrictions (warn-only). |
+| `none` | No egress at all (`--network=none`). |
+| `guard` | **Fail-closed** leak-guard: refuse a networked launch unless the host's default route is a VPN/Tor tunnel. Opt-in — pick this when a dropped VPN must never leak the real IP. |
+
+Example: `export HH_SBX_EGRESS=guard` before launching, or
+`… sbx launch --egress tor`. `local`/`scope`/`tor` run the sandbox behind a
+sidecar egress gateway (nftables + Tor) so the filtering lives outside the
+sandbox's control.
 
 **Local VirtualBox VMs.** Separate from the relayed sandbox, `/sbx vms` detects a
 VirtualBox install and lists your VMs, and `/sbx gui <vm>` boots one as a full

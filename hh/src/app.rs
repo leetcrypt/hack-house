@@ -85,6 +85,12 @@ pub enum Net {
     Init {
         lines: Vec<ChatLine>,
         users: Vec<User>,
+        /// Reachable onion address ("<id>.onion:<port>") when the room is hosted
+        /// with --tor, else empty. Surfaced so `/share` can print a connect block.
+        onion: String,
+        /// Shareable (label, addr) connect addresses for the room's bind —
+        /// tailscale/lan/host. Empty for a loopback-only bind. Used by `/share`.
+        reach: Vec<(String, String)>,
     },
     Message(ChatLine),
     Roster {
@@ -292,6 +298,12 @@ pub struct App {
     pub error: Option<String>,
     /// The room password this client authenticated with (shown by `/pw`).
     pub password: String,
+    /// Reachable onion address ("<id>.onion:<port>") if the server is hosted with
+    /// --tor, else empty. Received in the init frame; used by `/share`.
+    pub onion: String,
+    /// Shareable (label, addr) connect addresses (tailscale/lan/host) for the
+    /// room's bind, from the init frame; empty for loopback-only. Used by `/share`.
+    pub reach: Vec<(String, String)>,
     /// AI agents currently generating a reply — drives the "thinking" spinner.
     pub ai_typing: std::collections::HashSet<String>,
     /// Every room member we've identified as an AI agent (via its `_ai` frames
@@ -356,6 +368,8 @@ impl App {
             reconnecting: false,
             error: None,
             password: String::new(),
+            onion: String::new(),
+            reach: Vec::new(),
             ai_typing: std::collections::HashSet::new(),
             ai_agents: std::collections::HashSet::new(),
             ai_stream: std::collections::HashMap::new(),
@@ -475,13 +489,15 @@ impl App {
 
     fn apply(&mut self, n: Net) {
         match n {
-            Net::Init { lines, users } => {
+            Net::Init { lines, users, onion, reach } => {
                 self.lines = lines;
                 self.users = users;
+                self.onion = onion;
+                self.reach = reach;
                 self.connected = true;
                 self.chat_scroll = 0;
                 self.sys(format!("joined as {} †", self.me));
-                self.sys("/sbx <docker|podman|multipass|vbox|local> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /export-signed <dir> · /pw show password · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys("/sbx <docker|podman|multipass|vbox|local> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /export-signed <dir> · /pw show password · /share invite link · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => {
                 // An agent announces itself with "<name> (ai) online …" — record
@@ -2082,6 +2098,50 @@ fn handle_command(
         } else {
             app.sys(format!("† room password: {}", app.password));
         }
+    } else if line == "/share" {
+        // Print a paste-ready invite block for THIS room (local only, never
+        // broadcast). The onion address (if the host used --tor) arrives in the
+        // init frame; the client already holds host/port/password. This block is
+        // a bearer credential — share it out-of-band, as the host banner warns.
+        let tls = if params.no_tls { " --no-tls" } else { "" };
+        let pw = if app.password.is_empty() {
+            "<none>".to_string()
+        } else {
+            app.password.clone()
+        };
+        app.sys("† share this room — out-of-band only (this block is a bearer credential):");
+        app.sys(format!("†   pass     {pw}"));
+        let mut any = false;
+        // Tor (onion) — anonymous, reachable from anywhere with tor+torsocks.
+        if !app.onion.is_empty() {
+            any = true;
+            let (oaddr, oport) = match app.onion.rsplit_once(':') {
+                Some((a, p)) => (a.to_string(), p.to_string()),
+                None => (app.onion.clone(), params.port.to_string()),
+            };
+            app.sys(format!("†   [tor]    {}", app.onion));
+            app.sys(format!(
+                "†            scripts/tor-onion-connect.sh {oaddr} {oport} <name> --password {pw}"
+            ));
+        }
+        // Tailscale / LAN / public addresses the room is bound to (from the server).
+        for (label, addr) in app.reach.clone() {
+            any = true;
+            app.sys(format!("†   [{label}] {addr}:{}", params.port));
+            app.sys(format!(
+                "†            hack-house connect {} {} <name> --password {pw}{tls}",
+                addr, params.port
+            ));
+        }
+        if !any {
+            app.sys(format!("†   room     {}:{}", params.ip, params.port));
+            app.sys(format!(
+                "†            hack-house connect {} {} <name> --password {pw}{tls}",
+                params.ip, params.port
+            ));
+            app.sys("†   note     loopback only — reachable from this host. To share, host on \
+                     your tailnet/LAN (bind 0.0.0.0) or with --tor (onion).");
+        }
     } else if let Some(rest) = line.strip_prefix("/music") {
         // Background music for the session. Plays bundled CC-BY albums or the
         // operator's imported files through an external player (ffplay/mpv/cvlc);
@@ -3312,9 +3372,9 @@ fn local_ollama_models() -> Result<Vec<String>, String> {
 /// known command family that legitimately falls through to chat (e.g. `/ai
 /// <question>`) and as the candidate set for the "did you mean" suggester.
 const KNOWN_COMMANDS: &[&str] = &[
-    "/help", "/?", "/clear", "/cls", "/pw", "/password", "/theme", "/layout", "/music", "/drive",
-    "/sendroom", "/send", "/accept", "/reject", "/sbx", "/unsudo", "/sudo", "/grant", "/revoke",
-    "/ai",
+    "/help", "/?", "/clear", "/cls", "/pw", "/password", "/share", "/theme", "/layout", "/music",
+    "/drive", "/sendroom", "/send", "/accept", "/reject", "/sbx", "/unsudo", "/sudo", "/grant",
+    "/revoke", "/ai",
 ];
 
 /// Canonical `/sbx` subcommands (backends + actions) for the subcommand-level

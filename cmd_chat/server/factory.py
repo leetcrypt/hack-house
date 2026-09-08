@@ -12,10 +12,20 @@ from .helpers import RateLimiter
 from .routes import register_routes
 
 
-def create_app(password: str = "", name: str = "cmd-chat-server") -> Sanic:
+def create_app(password: str = "", name: str = "cmd-chat-server",
+               onion: str = "", bind_host: str = "") -> Sanic:
     app = Sanic(name)
     Extend(app)
 
+    # Reachable onion address ("<id>.onion:<port>") when hosted with --tor, else
+    # "". Surfaced to clients in the init frame so the TUI `/share` can print a
+    # paste-ready connect block; the client already holds host/port/password.
+    app.ctx.onion = onion
+    # Shareable tailnet/LAN/public connect addresses for this bind, so `/share`
+    # can offer tor + tailscale + LAN links (empty for a loopback-only bind).
+    from .helpers import reach_addresses
+    app.ctx.bind_host = bind_host
+    app.ctx.reach = reach_addresses(bind_host)
     app.ctx.message_store = MessageStore()
     app.ctx.session_store = UserSessionStore()
     app.ctx.connection_manager = ConnectionManager()

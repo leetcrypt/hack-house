@@ -77,12 +77,14 @@ def main():
         password = resolve_password(args.password)
 
         onion = None
+        onion_addr = None
         try:
             if args.tor:
                 from cmd_chat.tor.onion import EphemeralOnion
 
                 onion = EphemeralOnion(control_socket=args.tor_control_socket)
                 service = onion.start(target_port=int(args.port), virtual_port=int(args.port))
+                onion_addr = f"{service.address}:{service.port}"
                 print(f"[tor] ephemeral onion service: {service.address}:{service.port}")
                 # The address is published (and printed) before run_server()
                 # below actually binds the local port — a guest who connects
@@ -99,6 +101,7 @@ def main():
                 cert_path=args.cert,
                 key_path=args.key,
                 no_tls=args.no_tls,
+                onion=onion_addr,
             )
         finally:
             if onion is not None:

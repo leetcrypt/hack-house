@@ -348,6 +348,20 @@ pub async fn reader(
                 tx.send(Net::Init {
                     lines,
                     users: parse_users(&v["users"]),
+                    onion: v["onion"].as_str().unwrap_or("").to_string(),
+                    reach: v["reach"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|r| {
+                                    Some((
+                                        r["label"].as_str()?.to_string(),
+                                        r["addr"].as_str()?.to_string(),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             }
             "message" => match decode_msg(&room, &v["data"], true) {

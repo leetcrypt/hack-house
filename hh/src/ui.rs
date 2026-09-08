@@ -482,6 +482,10 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "reconnect to the house after a drop / AFK",
                 ),
                 kv("/pw", "show this room's password (local only)"),
+                kv(
+                    "/share",
+                    "invite block for this room (local only): password + every way in — Tor onion (if --tor) and each tailscale/lan address, with connect commands",
+                ),
                 kv("/clear", "wipe your chat scrollback (local only)"),
                 kv("Ctrl-C  ·  Ctrl-Q", "quit hack-house"),
             ],
