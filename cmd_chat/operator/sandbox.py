@@ -184,7 +184,9 @@ async def launch_container(engine: str, name: str, image: str, *,
     # refuses a networked launch when the route isn't a tunnel (leak guard); `none`
     # forces no egress; `open` only warns. See egress.py.
     from . import egress as eg
-    mode = eg.egress_mode(egress)
+    raw_mode = eg.egress_mode(egress)
+    auto = raw_mode == "auto"
+    mode = eg.resolve_auto(raw_mode)  # auto → tor-if-available-else-local
     flags = _hardening_flags(harden)
     advisory = ""
     if "--network=none" not in flags:
@@ -195,11 +197,18 @@ async def launch_container(engine: str, name: str, image: str, *,
             if not allow:
                 return False, advisory
             # local/scope/tor: put the sandbox behind a sidecar egress gateway that
-            # owns the netns + filtering rules (SPIKE.md). Fail-closed: refuse the
-            # launch if the gateway can't come up (never fall back to unfiltered).
+            # owns the netns + filtering rules (SPIKE.md). Fail-closed for an EXPLICIT
+            # posture: refuse the launch if the gateway can't come up (never fall back
+            # to unfiltered). Under `auto`, a Tor gateway that can't come up instead
+            # falls back to `local` so a launch is never refused for egress reasons.
             if mode in ("local", "scope", "tor"):
                 from . import egress_gw as egw
                 gok, gmsg, gwname = await egw.launch_gateway(engine, name, mode)
+                if not gok and auto and mode == "tor":
+                    fb = "auto: Tor egress unavailable — falling back to local"
+                    mode = "local"
+                    gok, gmsg, gwname = await egw.launch_gateway(engine, name, mode)
+                    advisory = (advisory + "; " + fb) if advisory else fb
                 if not gok:
                     return False, f"egress gateway ({mode}) refused: {gmsg}"
                 flags = flags + ["--network=container:" + gwname]

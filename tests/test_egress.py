@@ -52,14 +52,25 @@ def test_is_tunneled_recognises_vpn_ifaces():
         assert not eg.is_tunneled(bad), bad
 
 
-def test_mode_default_is_guard():
-    assert _with_mode(None, eg.egress_mode) == "guard"
+def test_mode_default_is_auto():
+    # Default is `auto` (Tor-if-available-else-local), NOT the fail-closed guard —
+    # so a missing VPN can't produce a false-negative refused launch.
+    assert _with_mode(None, eg.egress_mode) == "auto"
 
 
-def test_default_untunneled_refuses_fail_closed():
-    # with no env set (default guard), a non-tunnel route is refused
-    allow, msg = _with_mode(None, lambda: eg.guard_networked_launch(_iface="wlan0"))
-    assert allow is False and msg.startswith("REFUSED")
+def test_resolve_auto_prefers_tor_when_available(monkeypatch):
+    monkeypatch.setattr(eg, "tor_available", lambda: True)
+    assert eg.resolve_auto("auto") == "tor"
+
+
+def test_resolve_auto_falls_back_to_local_without_tor(monkeypatch):
+    monkeypatch.setattr(eg, "tor_available", lambda: False)
+    assert eg.resolve_auto("auto") == "local"
+
+
+def test_resolve_auto_passes_through_explicit_modes():
+    for m in ("guard", "open", "none", "local", "scope", "tor"):
+        assert eg.resolve_auto(m) == m
 
 
 def test_guard_none_refuses():

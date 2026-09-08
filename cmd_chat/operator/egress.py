@@ -11,8 +11,9 @@ Two risks follow:
 
 This module is the small, first pair of controls for that:
   1. GUARD  — a launch-time check that the default route is a tunnel before a
-     networked sandbox is allowed (``HH_SBX_EGRESS=guard`` = fail-closed, the
-     DEFAULT; ``open`` = warn-only; ``none`` = no egress).
+     networked sandbox is allowed (``HH_SBX_EGRESS=guard`` = fail-closed, an
+     OPT-IN; the default is ``auto`` = Tor-if-available-else-local, never refused;
+     ``open`` = warn-only; ``none`` = no egress).
   2. PROBE  — an on-demand measurement of the presented egress IP + reachability
      (``python -m cmd_chat.operator egress``).
 
@@ -23,6 +24,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import socket
 import subprocess
 import urllib.request
@@ -34,18 +36,38 @@ VPN_IFACE_RE = re.compile(
 TAILNET_OLLAMA = ("100.110.98.21", 11434)
 
 
-MODES = ("guard", "open", "none", "local", "scope", "tor")
+MODES = ("auto", "guard", "open", "none", "local", "scope", "tor")
 
 
 def egress_mode(override: str | None = None) -> str:
     """Effective egress posture. A per-launch ``override`` (e.g. ``sbx launch --egress
-    local``) wins over ``$HH_SBX_EGRESS``, which defaults to **guard**.
+    local``) wins over ``$HH_SBX_EGRESS``, which defaults to **auto**.
 
-    guard (default, fail-closed) — refuse a networked sandbox unless the route is a
+    auto (default) — Tor exit if Tor is available on this host, else local; and if the
+    Tor gateway can't come up it falls back to local, so a launch is NEVER refused for
+    egress reasons (no false-negative connections). This is the reliable, share-friendly
+    default; opt into a stricter posture per-host via `$HH_SBX_EGRESS`.
+    guard (opt-in, fail-closed) — refuse a networked sandbox unless the route is a
     tunnel, so a dropped tunnel can't silently leak the real IP; open — warn-only;
     none — no egress; local — block the LAN/host/tailnet pivot (allow Ollama+internet);
     scope — local + `$HH_SBX_SCOPE` allowlist; tor — all outbound through a Tor exit."""
-    return (override or os.environ.get("HH_SBX_EGRESS") or "guard").strip().lower()
+    return (override or os.environ.get("HH_SBX_EGRESS") or "auto").strip().lower()
+
+
+def tor_available() -> bool:
+    """Whether a Tor egress gateway can plausibly be brought up on this host — used to
+    resolve the ``auto`` default toward Tor. A cheap presence check (the `tor` binary);
+    the definitive test is bringing the gateway up, and ``auto`` falls back to ``local``
+    if that fails, so a false positive here costs one fallback, never a failed launch."""
+    return shutil.which("tor") is not None
+
+
+def resolve_auto(mode: str) -> str:
+    """Map the ``auto`` default to a concrete *preferred* posture: Tor if available,
+    else local. Launch-time fallback (tor→local) still applies on top of this."""
+    if mode != "auto":
+        return mode
+    return "tor" if tor_available() else "local"
 
 
 def default_route_iface(dest: str = "1.1.1.1", _run=None) -> str | None:
@@ -74,6 +96,11 @@ def guard_networked_launch(mode: str | None = None, _iface: str | None = None) -
     mode = mode or egress_mode()
     if mode == "none":
         return False, "HH_SBX_EGRESS=none — no egress"
+    # Gateway-managed postures handle egress themselves (tor anonymizes via a Tor
+    # exit; local/scope pivot-block the LAN/host/tailnet), so the host default-route
+    # tunnel check — and its "presents the real IP" warning — does not apply to them.
+    if mode in ("local", "scope", "tor"):
+        return True, ""
     iface = _iface if _iface is not None else default_route_iface()
     if is_tunneled(iface):
         return True, ""  # egress is via a tunnel — fine

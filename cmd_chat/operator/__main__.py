@@ -72,9 +72,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--image", default=None, help="container image (default per engine)")
     sb.add_argument("--name", default=None, help="container name (default: hh-op-<user>)")
     sb.add_argument("--egress", default=None,
-                    choices=["guard", "open", "none", "local", "scope", "tor"],
+                    choices=["auto", "guard", "open", "none", "local", "scope", "tor"],
                     help="per-launch egress posture (overrides $HH_SBX_EGRESS): "
-                         "guard(default, leak-guard) | open | none | local (block LAN/host/"
+                         "auto(default, Tor-if-available-else-local, never refused) | "
+                         "guard(opt-in leak-guard) | open | none | local (block LAN/host/"
                          "tailnet pivot) | scope (+$HH_SBX_SCOPE allowlist) | tor (Tor exit)")
     sb.add_argument("--harden", default=None, choices=["strict", "escape", "max"],
                     help="per-launch container hardening (overrides $HH_SBX_HARDEN): "

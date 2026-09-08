@@ -822,10 +822,20 @@ pub fn prepare(
             // (cmd_chat/operator/egress.py). Gateway modes shell to the single-source script
             // scripts/hh-sbx-egress.py. Skipped when hardened (already --network=none).
             let egress = std::env::var("HH_SBX_EGRESS").unwrap_or_default().trim().to_lowercase();
-            let egress = if egress.is_empty() { "guard".to_string() } else { egress };
+            // Default `auto`: Tor exit if Tor is available on this host, else local — and
+            // if the Tor gateway can't come up, fall back to local. A launch is never
+            // refused for egress reasons (no false-negative connections). Stricter
+            // postures (guard/tor/none/…) stay available via HH_SBX_EGRESS.
+            let egress = if egress.is_empty() { "auto".to_string() } else { egress };
+            let auto = egress == "auto";
+            let mut mode = if auto {
+                if tor_available() { "tor".to_string() } else { "local".to_string() }
+            } else {
+                egress.clone()
+            };
             let mut egress_gw_mode: Option<String> = None;
             if !hardened {
-                match egress.as_str() {
+                match mode.as_str() {
                     "none" => { run.args(["--network=none"]); }
                     "open" => {}
                     "guard" => {
@@ -834,9 +844,20 @@ pub fn prepare(
                                 (VPN/Tor down) — refusing networked launch; HH_SBX_EGRESS=open to allow");
                         }
                     }
-                    "local" | "scope" | "tor" => match egress_gateway_up(engine, name, &egress) {
-                        Ok(netarg) => { run.arg(netarg); egress_gw_mode = Some(egress.clone()); }
-                        Err(e) => anyhow::bail!("egress gateway ({egress}) refused: {e}"),
+                    "local" | "scope" | "tor" => match egress_gateway_up(engine, name, &mode) {
+                        Ok(netarg) => { run.arg(netarg); egress_gw_mode = Some(mode.clone()); }
+                        Err(e) => {
+                            if auto && mode == "tor" {
+                                // auto: Tor gateway unavailable — fall back to local.
+                                mode = "local".to_string();
+                                match egress_gateway_up(engine, name, &mode) {
+                                    Ok(netarg) => { run.arg(netarg); egress_gw_mode = Some(mode.clone()); }
+                                    Err(e2) => anyhow::bail!("egress gateway (local fallback) refused: {e2}"),
+                                }
+                            } else {
+                                anyhow::bail!("egress gateway ({mode}) refused: {e}");
+                            }
+                        }
                     },
                     other => anyhow::bail!("unknown HH_SBX_EGRESS='{other}'"),
                 }
@@ -864,6 +885,18 @@ pub const OWNER_PID_LABEL: &str = "hh.owner-pid";
 /// The single-source sandbox-egress gateway CLI (shared with the Python operator).
 const HH_SBX_EGRESS_SCRIPT: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/hh-sbx-egress.py");
+
+/// Whether a Tor egress gateway can plausibly be brought up — used to resolve the
+/// `auto` default toward Tor. Cheap PATH probe (mirrors egress.py `tor_available`);
+/// the definitive test is bringing the gateway up, and `auto` falls back to `local`
+/// if that fails, so a false positive here costs one fallback, not a failed launch.
+fn tor_available() -> bool {
+    std::process::Command::new("sh")
+        .args(["-c", "command -v tor >/dev/null 2>&1"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
 
 /// Is the host's default route a VPN/Tor tunnel? Mirrors egress.py's VPN_IFACE_RE.
 fn route_tunneled() -> bool {
