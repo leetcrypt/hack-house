@@ -96,9 +96,25 @@ pub enum Net {
     Roster {
         users: Vec<User>,
         capacity: usize,
+        /// Room host (kick authority) username, or None if unknown/empty.
+        host: Option<String>,
     },
     Joined(String),
     Left(String),
+    /// A member was force-kicked by the host (server-enforced).
+    Kicked {
+        username: String,
+        by: String,
+    },
+    /// The room password was rotated (e.g. after a kick) — clients adopt it so
+    /// `/pw`, `/share`, and reconnect use the new secret.
+    PasswordRotated {
+        password: String,
+    },
+    /// The server refused this client's `/kick` (not host / no such member).
+    KickDenied {
+        reason: String,
+    },
     SbxStatus {
         backend: String,
         ready: bool,
@@ -304,6 +320,13 @@ pub struct App {
     /// Shareable (label, addr) connect addresses (tailscale/lan/host) for the
     /// room's bind, from the init frame; empty for loopback-only. Used by `/share`.
     pub reach: Vec<(String, String)>,
+    /// Room host (kick authority) username, from the roster; None until known.
+    /// You may `/kick` only when this equals your own name.
+    pub host: Option<String>,
+    /// Set to the new room password when a kick rotates it — the run loop then
+    /// reconnects (re-runs SRP) to re-key, since the E2E key derives from the
+    /// password. Taken (cleared) by the loop once the re-key is kicked off.
+    pub pending_rekey: Option<String>,
     /// AI agents currently generating a reply — drives the "thinking" spinner.
     pub ai_typing: std::collections::HashSet<String>,
     /// Every room member we've identified as an AI agent (via its `_ai` frames
@@ -370,6 +393,8 @@ impl App {
             password: String::new(),
             onion: String::new(),
             reach: Vec::new(),
+            host: None,
+            pending_rekey: None,
             ai_typing: std::collections::HashSet::new(),
             ai_agents: std::collections::HashSet::new(),
             ai_stream: std::collections::HashMap::new(),
@@ -507,11 +532,27 @@ impl App {
                 }
                 self.push_line(l);
             }
-            Net::Roster { users, capacity } => {
+            Net::Roster { users, capacity, host } => {
                 self.users = users;
                 self.capacity = capacity;
+                self.host = host;
             }
             Net::Joined(name) => self.sys(format!("{name} entered the house")),
+            Net::Kicked { username, by } => {
+                if let Some(p) = self.users.iter().position(|u| u.username == username) {
+                    self.users.remove(p);
+                }
+                self.ai_typing.remove(&username);
+                self.ai_agents.remove(&username);
+                self.ai_stream.remove(&username);
+                self.sys(format!("✝ {username} was kicked by {by}"));
+            }
+            Net::PasswordRotated { password } => {
+                self.password = password.clone();
+                self.pending_rekey = Some(password); // loop reconnects to re-key
+                self.sys("† room password rotated (a member was kicked) — re-keying; /share or /pw to reshare");
+            }
+            Net::KickDenied { reason } => self.err(format!("kick denied: {reason}")),
             Net::Left(uid) => {
                 if let Some(p) = self.users.iter().position(|u| u.user_id == uid) {
                     let name = self.users.remove(p).username;
@@ -1142,7 +1183,7 @@ impl Drop for TermGuard {
     }
 }
 
-pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme) -> Result<()> {
+pub async fn run(mut params: net::ConnParams, mut session: Session, mut theme: Theme) -> Result<()> {
     let (tx, mut rx) = unbounded_channel::<Net>();
     let app_tx = tx.clone();
     let write = net::open(&session, tx.clone()).await?;
@@ -1880,6 +1921,27 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                         other => app.apply(other),
                     }
                 }
+                // A kick rotated the room password: re-key by reconnecting with the
+                // new secret (the E2E key derives from the password). Gated on the
+                // socket having CLOSED (Net::Closed) so the server has already freed
+                // our old session — reconnecting before that races into "name taken".
+                // Reuses the Ctrl-R reconnect path — re-runs SRP off-thread.
+                if !app.connected && app.pending_rekey.is_some() {
+                    let newpw = app.pending_rekey.take().unwrap();
+                    params.password = newpw;
+                    if !app.reconnecting {
+                        app.reconnecting = true;
+                        let p = params.clone();
+                        let rtx = recon_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let r = net::authenticate(
+                                &p.ip, p.port, &p.user, &p.password, p.no_tls, p.insecure,
+                            )
+                            .map_err(|e| e.to_string());
+                            let _ = rtx.send(r);
+                        });
+                    }
+                }
             }
             msg = broker_rx.recv() => {
                 match msg {
@@ -2141,6 +2203,26 @@ fn handle_command(
             ));
             app.sys("†   note     loopback only — reachable from this host. To share, host on \
                      your tailnet/LAN (bind 0.0.0.0) or with --tor (onion).");
+        }
+    } else if let Some(rest) = line.strip_prefix("/kick") {
+        // Host-only force-kick: the server disconnects the member AND rotates the
+        // room password so they can't rejoin with the shared secret. The server is
+        // the authority; we also guard locally for a clear message. Sent CLEARTEXT
+        // (not room-encrypted) — it's server-directed moderation, not room content.
+        let target = rest.trim();
+        if target.is_empty() {
+            app.err("usage: /kick <user> — remove a member (host only; rotates the room password)");
+        } else if app.host.as_deref() != Some(app.me.as_str()) {
+            let who = app.host.clone().unwrap_or_else(|| "the host".to_string());
+            app.err(format!("only the room host ({who}) can /kick"));
+        } else if target == app.me {
+            app.err("you can't kick yourself");
+        } else if !app.users.iter().any(|u| u.username == target) {
+            app.err(format!("no member named ‘{target}’ in the room"));
+        } else {
+            let frame = json!({ "type": "kick", "target": target }).to_string();
+            let _ = out_tx.send(WsMsg::Text(frame));
+            app.sys(format!("† kick requested for {target} — rotating room password…"));
         }
     } else if let Some(rest) = line.strip_prefix("/music") {
         // Background music for the session. Plays bundled CC-BY albums or the
@@ -3374,7 +3456,7 @@ fn local_ollama_models() -> Result<Vec<String>, String> {
 const KNOWN_COMMANDS: &[&str] = &[
     "/help", "/?", "/clear", "/cls", "/pw", "/password", "/share", "/theme", "/layout", "/music",
     "/drive", "/sendroom", "/send", "/accept", "/reject", "/sbx", "/unsudo", "/sudo", "/grant",
-    "/revoke", "/ai",
+    "/revoke", "/kick", "/ai",
 ];
 
 /// Canonical `/sbx` subcommands (backends + actions) for the subcommand-level

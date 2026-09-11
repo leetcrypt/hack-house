@@ -38,6 +38,10 @@ def create_app(password: str = "", name: str = "cmd-chat-server",
     # the cap is data not architecture (broadcast fan-out is O(N)).
     app.ctx.max_users = int(os.environ.get("CMD_CHAT_MAX_USERS", "4"))
     app.ctx.cleanup_task = None
+    # Room host = the oldest still-present connection (the "host badge" member),
+    # the only member allowed to `/kick`. Tracked here, auto-promoted to the
+    # next-oldest when the host leaves. See `_current_host` in views.py.
+    app.ctx.host_user_id = None
 
     register_lifecycle(app)
     register_routes(app)

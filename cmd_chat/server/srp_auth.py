@@ -35,6 +35,17 @@ class SRPAuthManager:
             b"chat", self.password, hash_alg=srp.SHA256
         )
 
+    def rotate(self, password: str) -> None:
+        """Replace the room password: re-derive salt+verifier and drop in-flight
+        handshakes. Live ws sessions (already holding a ws_token) keep working;
+        only NEW joins must use the new password. Used by the host's `/kick` to
+        lock a removed member out — the old password no longer authenticates."""
+        self.password = password.encode()
+        self.sessions.clear()
+        self.salt, self.vkey = srp.create_salted_verification_key(
+            b"chat", self.password, hash_alg=srp.SHA256
+        )
+
     def _evict_stale_unverified(self) -> None:
         now = time.monotonic()
         stale = [

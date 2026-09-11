@@ -76,6 +76,53 @@ class ConnectionManager:
         if conn is not None and conn.task is not None:
             conn.task.cancel()
 
+    async def kick(self, user_id: str, code: int = 4009, reason: str = "kicked") -> bool:
+        """Force one connection closed (host `/kick`). Pop it so no further
+        broadcast reaches it, cancel its writer, and close the socket — the peer's
+        own handler loop then ends and runs its normal disconnect/remove cleanup.
+        Returns False if there was no such live connection."""
+        async with self._lock:
+            conn = self.active_connections.pop(user_id, None)
+        if conn is None:
+            return False
+        if conn.task is not None:
+            conn.task.cancel()
+        try:
+            await conn.ws.close(code=code, reason=reason)
+        except Exception:
+            pass
+        return True
+
+    async def send_to(self, user_id: str, message: str) -> None:
+        """Enqueue a frame to a single connection (e.g. a kick denial). No-op if
+        the target isn't connected."""
+        async with self._lock:
+            conn = self.active_connections.get(user_id)
+        if conn is not None:
+            self._enqueue(conn, message)
+
+    async def deliver_and_close(self, user_id: str, frames: list[str],
+                               code: int = 4009, reason: str = "kicked") -> None:
+        """Cancel the writer, send `frames` directly (no concurrent writer racing
+        the same socket), then close + drop the connection. Guarantees the frames
+        land before the close — used by `/kick` to hand remaining members the new
+        room password immediately before re-keying disconnects them."""
+        async with self._lock:
+            conn = self.active_connections.pop(user_id, None)
+        if conn is None:
+            return
+        if conn.task is not None:
+            conn.task.cancel()
+        for f in frames:
+            try:
+                await conn.ws.send(f)
+            except Exception:
+                pass
+        try:
+            await conn.ws.close(code=code, reason=reason)
+        except Exception:
+            pass
+
     @staticmethod
     def _enqueue(conn: _Conn, message: str) -> bool:
         """Non-blocking enqueue. False means the backlog is full (wedged peer)."""

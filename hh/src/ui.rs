@@ -386,6 +386,10 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                 kv("/sudo <user>", "delegate VM superuser (real sudo)"),
                 kv("/unsudo <user>", "revoke VM superuser"),
                 kv(
+                    "/kick <user>  (host only)",
+                    "force-remove a member AND rotate the room password so they can't rejoin (host = first in the room)",
+                ),
+                kv(
                     "/ai start <name> allow",
                     "shortcut: grant the agent drive at spawn",
                 ),

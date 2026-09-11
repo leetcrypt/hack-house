@@ -372,11 +372,22 @@ pub async fn reader(
             "roster" => tx.send(Net::Roster {
                 users: parse_users(&v["users"]),
                 capacity: v["capacity"].as_u64().unwrap_or(0) as usize,
+                host: v["host"].as_str().map(str::to_string),
             }),
             "user_joined" => tx.send(Net::Joined(
                 v["username"].as_str().unwrap_or("?").to_string(),
             )),
             "user_left" => tx.send(Net::Left(v["user_id"].as_str().unwrap_or("").to_string())),
+            "kicked" => tx.send(Net::Kicked {
+                username: v["username"].as_str().unwrap_or("?").to_string(),
+                by: v["by"].as_str().unwrap_or("host").to_string(),
+            }),
+            "password_rotated" => tx.send(Net::PasswordRotated {
+                password: v["password"].as_str().unwrap_or("").to_string(),
+            }),
+            "kick_denied" => tx.send(Net::KickDenied {
+                reason: v["reason"].as_str().unwrap_or("denied").to_string(),
+            }),
             _ => Ok(()),
         };
         if sent.is_err() {
