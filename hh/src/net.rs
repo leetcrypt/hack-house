@@ -1,7 +1,7 @@
 //! SRP authentication (blocking, one-shot) + async websocket transport and the
 //! reader task that decrypts/parses server frames into `Net` events.
 
-use crate::app::{CatalogItem, ChatLine, Net, User};
+use crate::app::{CatalogItem, ChatLine, Net, User, WebGuest};
 use crate::crypto;
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -194,6 +194,15 @@ fn decode_msg(room: &fernet::Fernet, m: &Value, live: bool) -> Decoded {
                     Decoded::Skip
                 };
             }
+            if t.starts_with("{\"_web\":") {
+                return if live {
+                    parse_web(&t, sender)
+                        .map(Decoded::Sbx)
+                        .unwrap_or(Decoded::Skip)
+                } else {
+                    Decoded::Skip
+                };
+            }
             (t, false)
         }
         Err(_) => ("[unreadable — wrong room password?]".to_string(), true),
@@ -315,6 +324,32 @@ fn parse_perm(text: &str) -> Option<Net> {
         owner: v["owner"].as_str().unwrap_or("").to_string(),
         drivers: list("drivers"),
         sudoers: list("sudoers"),
+    })
+}
+
+/// Parse a decrypted `{"_web":"presence",...}` frame from the web-relay publisher
+/// into a roster of display-only browser viewers. `sender` is the server-stamped
+/// publisher username (trusted) — used to clear the group when it leaves — not
+/// the frame's own `publisher` claim.
+fn parse_web(text: &str, sender: &str) -> Option<Net> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v["_web"].as_str()? != "presence" {
+        return None;
+    }
+    let guests = v["viewers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| {
+            Some(WebGuest {
+                handle: g["handle"].as_str()?.to_string(),
+                driving: g["driving"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect();
+    Some(Net::WebPresence {
+        publisher: sender.to_string(),
+        guests,
     })
 }
 
@@ -512,5 +547,40 @@ mod tests {
         // No label → reject the frame rather than pull a nameless VM.
         let bad = json!({"_sbx":"pullreq","to":"bob"}).to_string();
         assert!(parse_sbx(&bad, "alice").is_none());
+    }
+
+    // A well-formed `_web:presence` frame parses into a display-only guest roster.
+    // The publisher name comes from the server-stamped `sender`, NOT the frame's
+    // own `publisher` claim — so a spoofed publisher field can't misattribute it.
+    #[test]
+    fn parse_web_presence_happy_path() {
+        let frame = json!({
+            "_web": "presence",
+            "count": 2,
+            "publisher": "spoofed-name",
+            "viewers": [
+                { "id": "abc", "alias": "1", "handle": "web-a1b2", "driving": true },
+                { "id": "def", "alias": "2", "handle": "web-c3d4", "driving": false },
+            ],
+        })
+        .to_string();
+        match parse_web(&frame, "web-publisher") {
+            Some(Net::WebPresence { publisher, guests }) => {
+                assert_eq!(publisher, "web-publisher"); // sender, not the claim
+                assert_eq!(guests.len(), 2);
+                assert_eq!(guests[0].handle, "web-a1b2");
+                assert!(guests[0].driving);
+                assert_eq!(guests[1].handle, "web-c3d4");
+                assert!(!guests[1].driving);
+            }
+            other => panic!("expected WebPresence, got {:?}", other.is_some()),
+        }
+    }
+
+    // A non-presence `_web` frame is rejected (None), not mis-parsed.
+    #[test]
+    fn parse_web_rejects_non_presence() {
+        let frame = json!({ "_web": "something-else" }).to_string();
+        assert!(parse_web(&frame, "web-publisher").is_none());
     }
 }

@@ -24,6 +24,15 @@ srp.rfc5054_enable()
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 CHUNK_SIZE = 64 * 1024  # 64 KB
 
+# Ceiling on a single inbound websocket frame. The library defaults to 1 MiB,
+# which the server's `init` frame outgrows in any room that has streamed a
+# sandbox: it replays up to 1000 history messages at once, and a `_sbx:data`
+# message is a few KB. Past that point *every* Python member — agent, publisher,
+# CLI — is refused at the door with close 1009 and can never rejoin, which reads
+# as an agent that silently won't come back. Observed live at 4.2 MB; 16 MiB
+# leaves headroom while still bounding what a hostile server can make us buffer.
+MAX_WS_FRAME = 16 * 1024 * 1024
+
 
 def _human_size(size: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -283,6 +292,15 @@ class Client:
         ft_type = ft_data.get("_ft")
         transfer_id = ft_data.get("id")
 
+        if ft_type in ("chunk", "done"):
+            # A sender streams one addressed copy per accepter, all broadcast to
+            # the room, so keep only ours — ingesting another accepter's would
+            # interleave two streams and fail the sha256. No `to` means an
+            # untargeted stream (a sender from before addressing): still ours.
+            to = ft_data.get("to")
+            if to and to != self.username:
+                return True
+
         if ft_type == "offer":
             if sender == self.username:
                 return True  # ignore our own offer echo
@@ -505,7 +523,8 @@ class Client:
             url = f"{self.ws_url}/ws/chat?user_id={self.user_id}&ws_token={self.ws_token}"
 
             ws_ssl = self._ws_ssl_context()
-            async with websockets.connect(url, ssl=ws_ssl) as ws:
+            async with websockets.connect(url, ssl=ws_ssl,
+                                          max_size=MAX_WS_FRAME) as ws:
                 self.success("Connected to chat server")
                 self.running = True
 

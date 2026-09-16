@@ -61,6 +61,15 @@ pub struct User {
     pub username: String,
 }
 
+/// A browser viewer of the web relay, surfaced as a display-only roster guest
+/// from the publisher's `_web:presence` frame. Holds only view-only `#k` (no
+/// room socket), so it is never a real `User`.
+#[derive(Clone)]
+pub struct WebGuest {
+    pub handle: String,
+    pub driving: bool,
+}
+
 /// An in-progress incoming transfer we accepted. Chunks stream straight to a
 /// disk-backed `Sink` (created lazily on the first chunk) so a multi-GB payload
 /// never sits in RAM.
@@ -189,6 +198,12 @@ pub enum Net {
         by: String,
         to: String,
         label: String,
+    },
+    /// The web publisher's `_web:presence` frame: the roster of browser viewers
+    /// (display-only). `publisher` is the server-stamped sender, not the claim.
+    WebPresence {
+        publisher: String,
+        guests: Vec<WebGuest>,
     },
     Closed,
 }
@@ -358,6 +373,13 @@ pub struct App {
     /// and creds aren't cached). While `Some`, keystrokes feed this masked
     /// buffer instead of chat — the secret never leaves the client.
     pub sudo_prompt: Option<SudoPrompt>,
+    /// Browser viewers of the web relay, surfaced as display-only roster guests
+    /// from the publisher's `_web:presence` frame. Empty when no one is watching
+    /// or no web publisher is in the room.
+    pub web_guests: Vec<WebGuest>,
+    /// The room member (the web publisher) whose `_web:presence` we're rendering;
+    /// tracked so `web_guests` is cleared when that member leaves.
+    pub web_publisher: Option<String>,
     /// "album ▸ Track" for the music now-playing indicator, or None when no
     /// background music is playing. Mirrors the `music::Player` label so the UI
     /// never has to touch the player's process handle.
@@ -404,6 +426,8 @@ impl App {
             layout: Layout::default(),
             focused_pane: None,
             sudo_prompt: None,
+            web_guests: Vec::new(),
+            web_publisher: None,
             now_playing: None,
         }
     }
@@ -559,6 +583,11 @@ impl App {
                     self.ai_typing.remove(&name); // a departed agent isn't thinking
                     self.ai_agents.remove(&name); // …nor an AI member any more
                     self.ai_stream.remove(&name); // …nor streaming a reply
+                    // The web publisher left → its browser viewers are gone too.
+                    if self.web_publisher.as_deref() == Some(name.as_str()) {
+                        self.web_publisher = None;
+                        self.web_guests.clear();
+                    }
                     self.sys(format!("{name} left"));
                 }
             }
@@ -656,6 +685,13 @@ impl App {
                 self.owner = Some(owner).filter(|o| !o.is_empty());
                 self.drivers = new;
                 self.sudoers = sudo;
+            }
+            Net::WebPresence { publisher, guests } => {
+                // Trust the server-stamped publisher; render its browser viewers
+                // as display-only roster guests. An empty list (publisher (re)join
+                // or last viewer left) simply clears the group.
+                self.web_publisher = Some(publisher);
+                self.web_guests = guests;
             }
             Net::Ft(_) => {} // handled in the run loop (needs out channel + disk)
             Net::SendReady { .. } => {} // handled in the run loop (stages active_send)
@@ -3252,6 +3288,40 @@ fn handle_command(
             broadcast_acl(out_tx, room, app);
             app.sys(format!("revoked drive from {target}"));
         }
+    } else if let Some(rest) = line
+        .strip_prefix("/web")
+        .filter(|r| r.is_empty() || r.starts_with(' '))
+    {
+        // The `/web …` operator channel is consumed by the web publisher, which
+        // taps room chat for owner-issued commands. The TUI's job is to forward
+        // the line so the publisher can act on it — and, for an *approval*, to
+        // collapse the grant two-step: auto-ensure Gate A (the publisher holds the
+        // room driver token) before forwarding, so the owner no longer has to
+        // `/grant` the publisher as a separate step.
+        let rest = rest.trim();
+        if !app.connected {
+            app.sys("not connected — can't reach the web relay");
+        } else {
+            // Grant-collapse fires only for the approval verb, only while a
+            // sandbox is running (owner known), and only from the sandbox owner
+            // (fail closed — same rule as /grant). We grant the *tapped* publisher
+            // by its server-authenticated name; if no presence frame has arrived
+            // yet the publisher's own "drive token not held" notice is the fallback.
+            let approving = rest.split_whitespace().next() == Some("allow");
+            if approving && app.sandbox.is_some() && app.is_owner() {
+                if let Some(pubname) = app.web_publisher.clone() {
+                    if !app.drivers.contains(&pubname) {
+                        app.drivers.insert(pubname.clone());
+                        broadcast_acl(out_tx, room, app);
+                        app.sys(format!(
+                            "† auto-granted drive to {pubname} (web relay) so the approval enables typing"
+                        ));
+                    }
+                }
+            }
+            // Forward the raw `/web …` line to the room for the publisher to tap.
+            let _ = out_tx.send(WsMsg::Text(room.encrypt(line.as_bytes())));
+        }
     } else if line == "/ai stop" {
         // Reap a child that already exited (e.g. failed auth) so the message is honest.
         if agent
@@ -3456,7 +3526,7 @@ fn local_ollama_models() -> Result<Vec<String>, String> {
 const KNOWN_COMMANDS: &[&str] = &[
     "/help", "/?", "/clear", "/cls", "/pw", "/password", "/share", "/theme", "/layout", "/music",
     "/drive", "/sendroom", "/send", "/accept", "/reject", "/sbx", "/unsudo", "/sudo", "/grant",
-    "/revoke", "/kick", "/ai",
+    "/revoke", "/kick", "/ai", "/web",
 ];
 
 /// Canonical `/sbx` subcommands (backends + actions) for the subcommand-level

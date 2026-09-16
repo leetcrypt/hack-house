@@ -396,6 +396,18 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
             ],
         },
         HelpCluster {
+            title: "WEB VIEWERS (owner)",
+            items: vec![
+                kv("/web list", "web viewers currently requesting drive"),
+                kv(
+                    "/web allow <n>",
+                    "approve viewer #n to type (auto-grants the relay)",
+                ),
+                kv("/web deny <n>", "decline viewer #n's drive request"),
+                kv("/web revoke", "take web input back — return to view-only"),
+            ],
+        },
+        HelpCluster {
             title: "FILES",
             items: vec![
                 kv("/send <user> <path>", "send a file/dir directly to one member"),
@@ -877,7 +889,7 @@ fn role_badges(app: &App, name: &str, theme: &Theme) -> String {
 }
 
 fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
-    let items: Vec<ListItem> = app
+    let mut items: Vec<ListItem> = app
         .users
         .iter()
         .map(|u| {
@@ -891,6 +903,22 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
             )))
         })
         .collect();
+    // Web-relay browser viewers — a display-only group under the real members.
+    // These hold only view-only `#k` (no room socket), so they're styled apart
+    // from clergy; a `◆` marks the guest currently driving the shared shell.
+    if !app.web_guests.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!(" 🌐 web guests ({})", app.web_guests.len()),
+            Style::default().fg(theme.title),
+        ))));
+        for g in &app.web_guests {
+            let mark = if g.driving { "◆ " } else { "" };
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("   🌐 {mark}{}", g.handle),
+                Style::default().fg(theme.other),
+            ))));
+        }
+    }
     let (border_style, mark) = edit_decor(app, crate::app::Pane::Roster, theme, theme.border);
     let roster = List::new(items).block(
         Block::bordered()
