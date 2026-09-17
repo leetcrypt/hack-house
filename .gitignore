@@ -13,6 +13,10 @@ secured_console_chat.egg-info/
 
 # Secrets / keys
 *.pem
+# hh host state dir (registry.json + credentials). Global copy lives at
+# ~/.hh (symlinked to the workspace parent); this guards the code's `./.hh`
+# fallback (registry.rs) from ever being committed inside a repo.
+.hh/
 
 # Editor / OS
 .idea/

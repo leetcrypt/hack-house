@@ -12,7 +12,37 @@ calls, so you can read → think → act → read again, indefinitely.
 ```bash
 # Run from the hack-house repo. Pin the interpreter to its venv.
 HH=".venv/bin/python -m cmd_chat.operator"          # = "hh-bridge"
+# From ANY worktree / cwd (most worktrees are sparse and have no venv), use the
+# PATH launcher instead — it runs the canonical main/ operator from anywhere:
+#   hh-op up <host> <port> <name> --password <pw> --no-tls ;  hh-op read --wait
+# `hh-op` == `$HOME/coding/hack-house/main/.venv/bin/python -m cmd_chat.operator`.
 ```
+
+## 0. Find the session before assuming it is up
+
+Sessions get killed between conversations. "Join the hack house" starts with
+proving there is one, and with getting the credentials from the live stack
+rather than from memory:
+
+```bash
+tmux ls | /usr/bin/grep hh-house        # the live stack runs in this tmux session
+tmux list-windows -t hh-house           # expect server, tui, publisher (+ share/howto)
+cat /tmp/hh-session.env                 # ROOM_PASSWORD, HH_WEB_PIN, public URL
+```
+
+Take the bind address from the server window, not from habit — the launcher
+usually binds the **tailscale IP, not 127.0.0.1**:
+
+```bash
+tmux capture-pane -p -t hh-house:server | /usr/bin/grep Listening
+```
+
+If there is no `hh-house` session, **stop and report it is down.** Do not start
+one uninvited: `scripts/hh-up.sh` brings up a server, TUI, publisher and
+sandbox, and can go public.
+
+The house holds **4 slots**. Check `status`/`roster` before adding daemons; a
+recorder or a second operator each consume one.
 
 ## 1. Join (once)
 
@@ -175,6 +205,26 @@ at `100.95.180.14` (`trilluminati`), a *different, usually-offline* device.
   _srp_pure`) covers both client and server.
 - Sync the tree with tar-over-ssh, not a stale clone:
   `tar czf - cmd_chat scripts | $PHONE 'tar xzf - -C ~/hh-mobile'`.
+
+## Record the session, or it is gone
+
+Nothing persists the shared terminal. The room server's 1000-frame ring is the
+only copy that exists anywhere, and a busy PTY rolls it **in under a minute**,
+evicting chat along with it — so a snapshot taken after the fact gives you the
+last few seconds and nothing else. If the session matters, start the recorder
+when you join:
+
+```bash
+cd /home/dell/coding/hack-house/work-trees/web-relay
+nohup /home/dell/coding/hack-house/main/.venv/bin/python scripts/hh-history.py \
+  --host <host> --port <port> --name hh-recorder --follow \
+  --out ~/.local/state/hh-relay/history/live-<room> &
+```
+
+Writes `terminal.log` (ANSI-stripped), `terminal.raw`, and `events.log` — chat
+plus control frames, timestamped and attributed. Drop `--follow` for a one-shot
+snapshot of whatever the ring still holds. It joins as a member (room password,
+one house slot) and reads only what the server hands every joiner.
 
 ## Safety
 
