@@ -116,6 +116,81 @@ encryption. Added for hardware:
 - **P5** manifest-declared vocab, multi-device rooms, `hh-device` operator skill; optional
   Rust `/sbx device` ergonomic entry (`Backend::Device`, ~10 `match` arms copying `Local`).
 
+## Next build — SSH transport layer, dynamic payloads, `/sbx pager`
+
+P1 shipped hardcoded verbs over one-shot `ssh pager`. Next: make the SSH infra
+first-class, discover payloads dynamically, add file transfer, and expose the pager
+as a driveable `/sbx`. All three reuse the existing `pineapple-pager-c2` connection +
+sync infra rather than reinventing it.
+
+### A) SSH transport layer — `cmd_chat/device/adapters/ssh_conn.py`
+
+A reusable connection object for any SSH-fronted device; the pager adapter uses it
+instead of ad-hoc `ssh` argv.
+
+- **Connection multiplexing.** The `pager` alias re-runs `pp-proxy.sh` (USB→WiFi→LAN
+  auto-discovery) on *every* connect — slow, and it flaps (seen live: "pp-proxy: Pager
+  unreachable" mid-session). `~/.ssh/config` already defines `pager-usb`/`pager-wifi`
+  with `ControlMaster auto` + `ControlPersist 300`. `SshConn` opens ONE master
+  (`ssh -M -S <sock> -o ControlPersist=300 pager …`), then every `exec`/`scp` rides
+  `-S <sock>` → sub-second, one discovery per session. Master death ⇒ presence flips
+  offline and re-dials.
+- **API:** `exec(argv, timeout) -> AsyncIterator[str]` (today's `stream_exec`, over the
+  master); `push(local, remote)` / `pull(remote, local)` via `scp -o ControlPath=<sock>`;
+  `pty() -> (reader, writer)` an interactive `ssh -tt` channel for `/sbx pager` (§C);
+  `transport()` → which of USB/WiFi/LAN is live (`pp-connect status`); `health()`.
+- **Auth:** key `~/.ssh/pineapple-pager` (`IdentitiesOnly`) — NOT the `sshpass`/`gopass`
+  path `pineapple-sync.sh` uses; the key alias is non-interactive and CI-safe.
+
+### B) Dynamic payload discovery + file transfer
+
+Kill the hardcoded `payloads`/`run`. The runnable set is DISCOVERED from two sources and
+refreshed on demand — a payload pushed to the device shows up automatically.
+
+- **Device-side (installed / runnable):** `SshConn.exec` a discovery script that walks the
+  device payload roots (`/root/payloads`, pineapple module dirs), and for each emits
+  `name\tdesc` — desc parsed from the DuckyScript header (`# Title:` / `# Description:`)
+  or a sidecar `payload.json`. (Layout confirmed device-specific; the walker probes the
+  real roots at runtime rather than assuming `<dir>/payload.sh`.)
+- **Host library (available to push):** enumerate `pineapple-pager-c2/{staging,payloads}/`
+  — what `push` can send.
+- **The discovered set IS the allowlist.** `run <name>` / `push <name>` validate `<name>`
+  against the live discovered set (still ARMED for `run`); nothing outside it executes.
+  Cache with a TTL; `payloads --refresh` re-scans.
+- **New verbs:** `payloads` (dynamic list, device+host, tagged installed/available),
+  `payload info <name>`, `push <name>` (host→device, shells `pineapple-sync push`),
+  `pull [name]` (device loot→`~/loot/pineapple` + the c2 `05-loot`, shells
+  `pineapple-sync pull`), and owner-only, path-validated `get <remote>` / `put <local>
+  <remote>` for arbitrary transfer. Reuse `pineapple-sync.sh` where it already does the job
+  (`push`/`pull`/`loot`) — the adapter shells to it; net-new is only the discovery walk +
+  the room plumbing.
+
+### C) `/sbx pager` — the pager as a driveable sandbox
+
+Two levels; ship Level 1 first.
+
+- **Level 1 — Python bridge PTY-over-SSH (no Rust change).** The device bridge, on an
+  owner `@pager shell` / a `/sbx pager` summon, opens `SshConn.pty()` (`ssh -tt pager`)
+  and runs the raw-drive loops (clone of `emit_sbx` `_emit`/`_broker_recv`): stream the
+  PTY as `{"_sbx":"data"}`, accept `{"_sbx":"input"}` ONLY from `drivers`. The pager shell
+  then renders in the room's sandbox pane and is driven by the keystroke relay — the P4
+  raw-drive model, pager-specific. Ships entirely in Python.
+- **Level 2 — native `/sbx pager` in the TUI (`Backend::Device`).** Add a `Device` variant
+  to `hh/src/sbx.rs`: `command_for` returns `ssh -tt pager` (or a device-launch wrapper),
+  and the existing `Sandbox::launch` PTY machinery streams `_sbx:data` + drives via the
+  keystroke relay + `/grant`, unchanged. Container-only arms (`prepare`/`teardown`/egress)
+  copy the `Backend::Local` no-op. `/sbx pager` then works from a bare TUI with no bridge
+  running. ~10–12 `match` arms (compiler enumerates them).
+- **Safety — a raw device shell bypasses the curated allowlist, so gate it harder than the
+  persona:** owner-only summon; driver-ACL for input (inherited); an explicit device `arm`
+  for the room before a shell opens; full keystroke audit; a `disarm`/kill that closes the
+  PTY. Framing: the pager is REAL hardware, not a disposable container — treat `/sbx pager`
+  like production infra (authorized operators, scoped, RF-legal), distinct from `/sbx podman`.
+
+**Build order:** A (SshConn + multiplex) → B (dynamic discovery + push/pull/get/put) →
+C-Level-1 (bridge PTY `/sbx pager`) → C-Level-2 (native `Backend::Device`). A is the
+dependency for both B and C.
+
 ## Open items
 - `.hh-device` manifest field names (reuse `.hh-agent`'s `purpose/setup/usage/state` vs a
   dedicated schema) — decide at P0.
