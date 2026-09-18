@@ -39,7 +39,8 @@ class Verb:
     name: str
     help: str
     run: Callable[[list[str]], AsyncIterator[str]]   # async generator of output chunks
-    armed: bool = False          # requires the device to be armed first
+    armed: bool = False          # requires the device to be armed first (⇒ authorized too)
+    owner_only: bool = False     # requires an authorized operator, but no arm (device-mutating)
     min_args: int = 0
     max_args: int = 0
 
@@ -83,6 +84,11 @@ class DeviceAdapter:
     def is_armed_verb(self, verb: str) -> bool:
         v = self._verbs.get(verb)
         return bool(v and v.armed)
+
+    def is_privileged_verb(self, verb: str) -> bool:
+        """Owner-only but not arm-gated (device-mutating: push/pull/get/put)."""
+        v = self._verbs.get(verb)
+        return bool(v and (v.owner_only or v.armed))
 
     async def dispatch(self, verb: str, args: list[str]) -> AsyncIterator[str]:
         """Validate + run one verb, yielding output chunks. Arming is checked by

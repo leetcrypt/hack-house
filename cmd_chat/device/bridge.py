@@ -137,8 +137,9 @@ class DeviceBridge:
         if self._online is False:
             await self.post(f"🔴 {self.adapter.persona} is offline — command dropped.")
             return
-        if self.adapter.is_armed_verb(verb) and not self._authorized(sender):
-            await self.post(f"✋ {sender}: `{verb}` is an ARMED action — not authorized.")
+        if self.adapter.is_privileged_verb(verb) and not self._authorized(sender):
+            kind = "an ARMED" if self.adapter.is_armed_verb(verb) else "an owner-only"
+            await self.post(f"✋ {sender}: `{verb}` is {kind} action — not authorized.")
             return
 
         self.client.info(f"[device] {sender} → {self.adapter.persona} {verb} {args}")
