@@ -645,6 +645,12 @@ pub enum Backend {
     Docker,
     Podman,
     Multipass,
+    /// A physical device reached over SSH (e.g. the Pineapple Pager). No image,
+    /// no provisioning, no snapshots — `command_for` just opens `ssh -tt <alias>`
+    /// and the alias rides in the sandbox `name`. Reuses the whole PTY stream +
+    /// keystroke relay + driver-ACL unchanged; container-only steps are no-ops
+    /// (same shape as `Local`).
+    Device,
 }
 
 impl Backend {
@@ -654,6 +660,9 @@ impl Backend {
             "docker" => Some(Backend::Docker),
             "podman" => Some(Backend::Podman),
             "multipass" => Some(Backend::Multipass),
+            // A physical device over SSH. `device` takes an explicit alias
+            // positional; `pager` is sugar for the WiFi Pineapple Pager alias.
+            "device" | "pager" => Some(Backend::Device),
             _ => None,
         }
     }
@@ -663,6 +672,7 @@ impl Backend {
             Backend::Docker => "docker",
             Backend::Podman => "podman",
             Backend::Multipass => "multipass",
+            Backend::Device => "device",
         }
     }
     /// Default image/release when the user doesn't specify one.
@@ -679,6 +689,7 @@ impl Backend {
             // (no pentest metapackages pulled by default — keep first launch fast).
             Backend::Podman => "docker.io/kalilinux/kali-rolling",
             Backend::Local => "",
+            Backend::Device => "",
         }
     }
     /// The exec family a co-located agent uses to run a command *inside* this
@@ -692,6 +703,7 @@ impl Backend {
             Backend::Docker => "docker",
             Backend::Podman => "podman",
             Backend::Multipass => "multipass",
+            Backend::Device => "device",
         }
     }
 }
@@ -720,6 +732,8 @@ pub fn prepare(
 ) -> Result<()> {
     match backend {
         Backend::Local => Ok(()),
+        // A device is already up (its own OS); nothing to prepare.
+        Backend::Device => Ok(()),
         Backend::Multipass => {
             let exists = Command::new("multipass")
                 .args(["info", name])
@@ -1033,6 +1047,9 @@ pub fn teardown(backend: Backend, name: &str) {
             egress_gateway_down(eng, name);  // remove the sandbox's egress gateway, if any
         }
         Backend::Local => {}
+        // The ssh session just closes; the device stays up. The ControlMaster
+        // persists briefly (ControlPersist) and reaps itself.
+        Backend::Device => {}
     }
 }
 
@@ -1136,6 +1153,9 @@ pub fn save_state(backend: Backend, name: &str, label: &str, local: bool) -> Res
         }
         Backend::Local => {
             anyhow::bail!("the local shell has no VM state to save — launch a docker or multipass sandbox first")
+        }
+        Backend::Device => {
+            anyhow::bail!("a device has no snapshot state — pull its loot with the device bridge (@<device> pull) instead")
         }
     }
 }
@@ -1392,6 +1412,7 @@ pub fn list_snapshots(backend: Backend, name: &str) -> Result<Vec<String>> {
                 .collect())
         }
         Backend::Local => Ok(Vec::new()),
+        Backend::Device => Ok(Vec::new()),
     }
 }
 
@@ -1461,6 +1482,26 @@ fn command_for(backend: Backend, name: &str, run_user: &str) -> CommandBuilder {
                 // Login shell as the provisioned owner account (a real sudoer).
                 c.args(["exec", name, "--", "sudo", "-u", run_user, "-i"]);
             }
+            c
+        }
+        Backend::Device => {
+            // `name` IS the ssh alias (the Copy enum can't carry it). Multiplex
+            // over the same ControlMaster the Python ssh_conn opens, so a device
+            // already dialled by the bridge is reused; `-tt` forces a remote PTY
+            // even without a local tty, so the PTY loop drives it like any shell.
+            let ctl = format!("{}/.ssh/cm-hh-{}.sock",
+                std::env::var("HOME").unwrap_or_else(|_| "/root".into()), name);
+            let mut c = CommandBuilder::new("ssh");
+            c.args([
+                "-tt",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ControlMaster=auto",
+                "-o", &format!("ControlPath={ctl}"),
+                "-o", "ControlPersist=300",
+                "-o", "ConnectTimeout=12",
+                name,
+            ]);
             c
         }
     }
@@ -1618,6 +1659,9 @@ pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) 
             "root".to_string()
         }
         Backend::Local => String::new(),
+        // No unix accounts to provision on a remote device — its shell logs in
+        // as whatever the ssh alias configures. The empty run-user is correct.
+        Backend::Device => String::new(),
     }
 }
 
@@ -1644,6 +1688,7 @@ pub fn run_user_for(backend: Backend, owner: &str) -> String {
         Backend::Multipass => unix_name(owner),
         Backend::Docker | Backend::Podman => "root".to_string(),
         Backend::Local => String::new(),
+        Backend::Device => String::new(),
     }
 }
 
@@ -1684,6 +1729,9 @@ pub fn push(
             mp(name, &["sudo", "chown", "-R", &owns, &target]);
             Ok(target)
         }
+        Backend::Device => anyhow::bail!(
+            "file push over /sbx isn't supported for a device — use the device bridge (@<device> push)"
+        ),
     }
 }
 

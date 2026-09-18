@@ -546,7 +546,7 @@ impl App {
                 self.connected = true;
                 self.chat_scroll = 0;
                 self.sys(format!("joined as {} †", self.me));
-                self.sys("/sbx <docker|podman|multipass|vbox|local> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /export-signed <dir> · /pw show password · /share invite link · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys("/sbx <docker|podman|multipass|vbox|local|pager> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /export-signed <dir> · /pw show password · /share invite link · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
             }
             Net::Message(l) => {
                 // An agent announces itself with "<name> (ai) online …" — record
@@ -2547,7 +2547,7 @@ fn handle_command(
             // <backend> …`) so older muscle memory and help strings keep working.
             Some(
                 sub @ ("launch" | "docker" | "podman" | "multipass" | "local" | "vbox"
-                | "virtualbox"),
+                | "virtualbox" | "device" | "pager"),
             ) => {
                 // `--start` (alias `--start-daemon` / `-y`) opts in to booting a
                 // stopped Docker daemon; everything else is positional. The first
@@ -2607,10 +2607,21 @@ fn handle_command(
                     let backend = first
                         .and_then(sbx::Backend::parse)
                         .unwrap_or(sbx::Backend::Local);
-                    let image = pos
-                        .next()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| backend.default_image().to_string());
+                    let image = if backend == sbx::Backend::Device {
+                        // A device has no OCI image — carry its ssh alias in the
+                        // image slot instead (spawn_launch uses it as the `name`,
+                        // and command_for opens `ssh -tt <alias>`). `/sbx pager`
+                        // is sugar for alias "pager"; `/sbx device <alias>` takes
+                        // an explicit alias positional.
+                        match first {
+                            Some("device") => pos.next().unwrap_or("pager").to_string(),
+                            _ => "pager".to_string(),
+                        }
+                    } else {
+                        pos.next()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| backend.default_image().to_string())
+                    };
                     // Is this backend's binary present? Docker/Podman/Multipass can
                     // be installed on consent; Local needs nothing and vbox is
                     // handled in its own branch above. Podman is daemonless and
@@ -2676,6 +2687,8 @@ fn handle_command(
                                     "installing {} (needs sudo)… then summoning the sandbox",
                                     backend.label()
                                 ));
+                            } else if backend == sbx::Backend::Device {
+                                app.sys(format!("opening {image} shell over ssh… (/drive to type once granted)"));
                             } else {
                                 app.sys(format!(
                                     "summoning {} sandbox… (provisioning unix users; multipass boot ~30s)",
@@ -3922,7 +3935,13 @@ fn spawn_launch(
                 return;
             }
         }
-        let name = SBX_NAME.to_string();
+        // A device sandbox targets an ssh alias, carried in `image` (there's no
+        // OCI image); every other backend uses the fixed container/instance name.
+        let name = if backend == sbx::Backend::Device {
+            image.clone()
+        } else {
+            SBX_NAME.to_string()
+        };
         let prep = {
             let (n, img, pw) = (name.clone(), image.clone(), password.clone());
             tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon, pw))

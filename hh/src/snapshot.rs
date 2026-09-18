@@ -40,6 +40,7 @@ pub fn register_saved_snapshot(be: sbx::Backend, name: &str, label: &str, create
         // from. Record the pointer; reconcile leaves it (no image to probe).
         sbx::Backend::Multipass => ("snapshot".to_string(), label.to_string(), None, None),
         sbx::Backend::Local => return, // nothing persistent to index
+        sbx::Backend::Device => return, // a device has no saveable snapshot artifact
     };
     let (purpose, status, todo) = manifest
         .as_deref()
