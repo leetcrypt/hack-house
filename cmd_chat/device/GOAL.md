@@ -23,11 +23,14 @@ Branch: `feat/device-bridge` (in `main/`). Design: `docs/device-bridge.md`.
   a non-driver's keystrokes were dropped, `shell stop` ended cleanly. (done)
 - [ ] **C2 · `/sbx pager` (native `Backend::Device`)** — `hh/src/sbx.rs` variant; `/sbx pager`
   from a bare TUI streams+drives the pager shell. Verified: `cargo build` clean + live drive.
-- [ ] **D · Ergonomics** — a launcher (`hh-go device pager` or a documented one-liner) +
-  `hh-device` notes so a fresh host runs it in one step.
-- [ ] **E · Full integration test** — a real hack-house session: bridge joins, a member
-  **sends a payload from the room** and runs it (benign), and `/sbx pager` drives it. Write
-  a short PASS report at `docs/device-bridge-TESTREPORT.md`. Commit everything.
+- [x] **D · Ergonomics** — `scripts/hh-device.sh <device> <host> <port> <pw> --owner you`
+  (any room) + `hh-go device pager` (auto-joins the live onion room in a tmux window).
+  Verified: pager joins the roster in one command. (done)
+- [x] **E · Full integration test** — live consolidated run vs the real pager: discover /
+  push (send from room) / run / authz / `/sbx pager` stream+drive+ACL-gate → **ALL PASS**.
+  Report at `docs/device-bridge-TESTREPORT.md`. (done)
+- [ ] **C2 · native `/sbx pager`** (`Backend::Device` in Rust) — remaining polish; C1 gives
+  the full logic via `@pager shell` already. In progress.
 
 ## Safety envelope (autonomous run)
 - Fire ONLY benign/no-op **test** payloads (write a marker file / echo) — NEVER a real RF
