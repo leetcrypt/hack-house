@@ -18,6 +18,7 @@ Consolidated live integration run (`op` = owner, `bob` = non-owner), one room:
 | `/sbx pager` — shell stream | ✅ | `@pager shell` → live `root@pager:/mmc/root#` streamed as `_sbx:data` into the sandbox pane |
 | `/sbx pager` — drive | ✅ | a driver's `_sbx:input` ran `echo INTEG_DRIVE_OK` on the device; output returned |
 | `/sbx pager` — ACL gate | ✅ | a non-driver's keystrokes were dropped (never reached the PTY) |
+| **native `/sbx pager`** (Rust `Backend::Device`) | ✅ | typed in a bare TUI → `sandbox · device` pane shows `root@pager:/mmc/root#`; `/drive` ran `NATIVE_SBX_OK Linux mips` |
 | Launcher | ✅ | `scripts/hh-device.sh pager <host> <port> <pw> --owner op` → `pager` joins the roster |
 
 ## What was proven end-to-end
@@ -44,11 +45,11 @@ Consolidated live integration run (`op` = owner, `bob` = non-owner), one room:
 `pp-proxy` discovery per session (not per command), self-healing on a flap. `push`/`pull`
 ride the same master (scp); `/sbx pager` uses an `ssh -tt` PTY over it.
 
-## Not yet done (follow-up)
-- **C2 — native `/sbx pager` TUI command** (`Backend::Device` in `hh/src/sbx.rs`). C1
-  delivers the full `/sbx pager` *logic* via `@pager shell` today; C2 is the ergonomic
-  `/sbx pager` typed directly in a bare TUI. Tracked in `cmd_chat/device/GOAL.md`.
-- Flipper adapter (serial), interactive `hh_shim` for payload dialogs.
+## Follow-up (future phases, not blocking)
+- Flipper adapter (serial `/dev/ttyACM*`) + `radio-legal` arm gate.
+- Interactive `hh_shim` — payload DuckyScript dialogs/pickers surface in the room.
+- `hh-go device` reads a non-onion room's coords too (today it auto-joins the onion room;
+  the general case uses `scripts/hh-device.sh`).
 
 ## Reproduce
 ```bash

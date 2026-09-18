@@ -29,8 +29,16 @@ Branch: `feat/device-bridge` (in `main/`). Design: `docs/device-bridge.md`.
 - [x] **E · Full integration test** — live consolidated run vs the real pager: discover /
   push (send from room) / run / authz / `/sbx pager` stream+drive+ACL-gate → **ALL PASS**.
   Report at `docs/device-bridge-TESTREPORT.md`. (done)
-- [ ] **C2 · native `/sbx pager`** (`Backend::Device` in Rust) — remaining polish; C1 gives
-  the full logic via `@pager shell` already. In progress.
+- [x] **C2 · native `/sbx pager`** (`Backend::Device` in Rust) — `/sbx pager` in a bare TUI
+  opens `ssh -tt pager` through the sandbox machinery (same `_sbx:data`/keystroke-relay/ACL).
+  Verified live: summoned `root@pager` shell, `/drive` ran `NATIVE_SBX_OK Linux mips`;
+  cargo build clean, other backends unchanged. (done)
+
+## ✅ GOAL COMPLETE (2026-09-17) — all boxes checked.
+Send/run payloads from real hack-house sessions + `/sbx pager` (both `@pager shell` and the
+native TUI command), fully tested against the live Pineapple Pager. Commits f4fe6e1 →
+d4b06f8 → be0e599 → 33ad35c → 151bdc1 on `feat/device-bridge`. Report:
+`docs/device-bridge-TESTREPORT.md`.
 
 ## Safety envelope (autonomous run)
 - Fire ONLY benign/no-op **test** payloads (write a marker file / echo) — NEVER a real RF
