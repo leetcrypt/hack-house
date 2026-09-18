@@ -42,6 +42,9 @@ class PagerAdapter(DeviceAdapter):
     async def health(self) -> tuple[bool, str]:
         return await self.conn.health()
 
+    async def open_shell(self):
+        return await self.conn.open_pty()
+
     def register_verbs(self) -> None:
         self.verb(Verb("status", "kernel, uptime, wifi interfaces, pineapple presence",
                        self._status))

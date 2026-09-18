@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import sys
 import time
@@ -40,6 +41,8 @@ class DeviceBridge:
         self._lock = asyncio.Lock()
         self._online: bool | None = None
         self._disarm_task: asyncio.Task | None = None
+        self._pty = None                      # active ssh -tt PTY subprocess (or None)
+        self._pty_task: asyncio.Task | None = None
 
     # ── wire helpers ─────────────────────────────────────────────────────────
     async def post(self, text: str) -> None:
@@ -61,9 +64,88 @@ class DeviceBridge:
         tail = f"\n…(+{extra} more lines truncated)" if extra > 0 else ""
         await self.post(f"⌂ {header}\n{body}{tail}")
 
+    async def send_frame(self, obj: dict) -> None:
+        """Send a room control frame (starts with '{\"_' → peers treat it as _sbx/_perm,
+        not chat). Same wire shape a sandbox broker uses."""
+        if self.ws is None:
+            return
+        raw = self.client.room_fernet.encrypt(json.dumps(obj).encode()).decode()
+        async with self._lock:
+            try:
+                await self.ws.send(raw)
+            except websockets.ConnectionClosed:
+                pass
+
     # ── authz ────────────────────────────────────────────────────────────────
     def _authorized(self, sender: str) -> bool:
         return sender == self.owner or sender in self.drivers
+
+    # ── /sbx <persona> — raw device shell as an _sbx:data stream ──────────────
+    async def _broadcast_acl(self) -> None:
+        await self.send_frame({
+            "_perm": "acl", "owner": self.owner or self.adapter.persona,
+            "drivers": sorted(self.drivers),
+            "sudoers": sorted({self.owner} if self.owner else set()),
+        })
+
+    async def _open_shell(self, sender: str) -> None:
+        if self._pty is not None:
+            await self.post(f"⌂ {self.adapter.persona} shell already open — /drive to type, "
+                            f"`@{self.adapter.persona} shell stop` to close.")
+            return
+        proc = await self.adapter.open_shell()
+        if proc is None:
+            await self.post(f"✖ {self.adapter.persona} has no shell surface.")
+            return
+        self._pty = proc
+        self.drivers.add(sender)              # the summoner drives by default
+        await self.post(f"🖥  {self.adapter.persona} SHELL opened by {sender} — it renders "
+                        f"in the sandbox pane; granted members /drive to type. "
+                        f"`@{self.adapter.persona} shell stop` closes it.")
+        self._pty_task = asyncio.ensure_future(self._pty_emit())
+
+    async def _pty_emit(self) -> None:
+        proc = self._pty
+        await self.send_frame({"_sbx": "status", "state": "ready",
+                               "backend": self.adapter.persona, "rows": 24, "cols": 80})
+        await self._broadcast_acl()
+        try:
+            while proc and proc.stdout:
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+                await self.send_frame({"_sbx": "data",
+                                       "b64": base64.b64encode(chunk).decode()})
+        except (asyncio.CancelledError, Exception):
+            pass
+        finally:
+            await self.send_frame({"_sbx": "status", "state": "ended",
+                                   "backend": self.adapter.persona})
+
+    async def _close_shell(self, sender: str) -> None:
+        if self._pty is None:
+            await self.post(f"⌂ {self.adapter.persona} has no shell open.")
+            return
+        try:
+            self._pty.kill()
+        except Exception:
+            pass
+        if self._pty_task:
+            self._pty_task.cancel()
+        self._pty = None
+        await self.post(f"🖥  {self.adapter.persona} shell closed by {sender}.")
+
+    async def _pty_write(self, sender: str, data: bytes) -> None:
+        """Write approved keystrokes to the device PTY — driver-token gated."""
+        if self._pty is None or self._pty.stdin is None:
+            return
+        if sender not in self.drivers:            # THE input gate (mirrors the sandbox ACL)
+            return
+        try:
+            self._pty.stdin.write(data)
+            await self._pty.stdin.drain()
+        except Exception:
+            pass
 
     # ── presence ─────────────────────────────────────────────────────────────
     async def _presence_loop(self) -> None:
@@ -94,6 +176,8 @@ class DeviceBridge:
             tag = "  [ARMED]" if v.armed else ""
             lines.append(f"  • {v.name} — {v.help}{tag}")
         lines.append("  • arm / disarm — (authorized) enable/disable ARMED verbs")
+        lines.append(f"  • shell [stop] — (authorized) open a raw device shell in the "
+                     f"sandbox pane (/sbx {self.adapter.persona}); /drive to type")
         lines.append("  • help — this menu")
         return "\n".join(lines)
 
@@ -131,6 +215,21 @@ class DeviceBridge:
             await self.post(f"🔒 {self.adapter.persona} disarmed by {sender}.")
             return
 
+        if verb == "shell":
+            # /sbx <persona> raw-drive: owner opens a device PTY into the sandbox pane.
+            if not self._authorized(sender):
+                await self.post(f"✋ {sender}: only an authorized operator may open the "
+                                f"{self.adapter.persona} shell.")
+                return
+            if self._online is False:
+                await self.post(f"🔴 {self.adapter.persona} is offline.")
+                return
+            if args and args[0] == "stop":
+                await self._close_shell(sender)
+            else:
+                await self._open_shell(sender)
+            return
+
         # Everything else is an adapter verb. Refuse if the device is offline, and
         # re-check authorization for ARMED verbs (the adapter re-asserts arm state
         # too, as defense in depth).
@@ -164,28 +263,40 @@ class DeviceBridge:
             text = (msg.get("text") or "").strip()
             if not text or text == "[decrypt failed]" or sender == persona:
                 continue
-            # Learn the room owner / drivers from the sandbox ACL if one is broadcast.
+            # Control frames: absorb an ACL (learn owner/drivers) or route keystrokes
+            # to the device PTY when a `/sbx <persona>` shell is open.
             if text.startswith('{"_'):
-                self._maybe_absorb_acl(text)
+                await self._handle_control(sender, text)
                 continue
             for p in prefixes:
                 if text == p or text.startswith(p + " "):
                     await self._handle_command(sender, text[len(p):].strip())
                     break
 
-    def _maybe_absorb_acl(self, text: str) -> None:
+    async def _handle_control(self, sender: str, text: str) -> None:
         try:
             frame = json.loads(text)
         except json.JSONDecodeError:
             return
-        if frame.get("_perm") != "acl":
+        if frame.get("_perm") == "acl":
+            owner = frame.get("owner")
+            if owner and self.owner is None:
+                self.owner = owner
+            # Adopt an external drivers list only when WE aren't the shell broker,
+            # so a `/sbx <persona>` session stays authoritative over who may type.
+            if self._pty is None:
+                drivers = frame.get("drivers")
+                if isinstance(drivers, list):
+                    self.drivers = set(drivers)
             return
-        owner = frame.get("owner")
-        if owner and self.owner is None:
-            self.owner = owner
-        drivers = frame.get("drivers")
-        if isinstance(drivers, list):
-            self.drivers = set(drivers)
+        if frame.get("_sbx") == "input" and self._pty is not None:
+            b64 = frame.get("b64")
+            if b64:
+                try:
+                    data = base64.b64decode(b64)
+                except (ValueError, TypeError):
+                    return
+                await self._pty_write(sender, data)
 
     async def _console(self) -> None:
         """Operator stdin: grant/revoke a driver, arm/disarm, quit."""
@@ -232,6 +343,14 @@ async def _run(args) -> None:
             )
         except (websockets.ConnectionClosed, asyncio.CancelledError):
             pass
+        finally:
+            if bridge._pty is not None:
+                try:
+                    bridge._pty.kill()
+                except Exception:
+                    pass
+            if hasattr(adapter, "conn"):
+                await adapter.conn.close()
 
 
 def main() -> None:

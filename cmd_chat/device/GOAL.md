@@ -17,9 +17,10 @@ Branch: `feat/device-bridge` (in `main/`). Design: `docs/device-bridge.md`.
   `push`(owner), `pull`(owner), `run`(armed). Verified live in a room: owner sent
   `hh_test_marker` host→device and ran it (marker written, exit 0); non-owner push/arm/run
   all refused. (done)
-- [ ] **C1 · `/sbx pager` (Python bridge PTY)** — owner summon opens `ssh -tt pager` as an
-  `_sbx:data` stream, driven by `_sbx:input` from `drivers` only. Verified: room round-trip
-  drives a real command on the pager, ACL-gated.
+- [x] **C1 · `/sbx pager` (Python bridge PTY)** — `@pager shell` opens `ssh -tt pager` as an
+  `_sbx:status`+`_sbx:data` stream in the sandbox pane; `_sbx:input` routed to the PTY only
+  from `drivers`. Verified live: shell prompt streamed, a driver ran `HH_DRIVE_OK Linux mips`,
+  a non-driver's keystrokes were dropped, `shell stop` ended cleanly. (done)
 - [ ] **C2 · `/sbx pager` (native `Backend::Device`)** — `hh/src/sbx.rs` variant; `/sbx pager`
   from a bare TUI streams+drives the pager shell. Verified: `cargo build` clean + live drive.
 - [ ] **D · Ergonomics** — a launcher (`hh-go device pager` or a documented one-liner) +

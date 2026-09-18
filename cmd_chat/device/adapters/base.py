@@ -64,6 +64,12 @@ class DeviceAdapter:
         """(online, one-line detail). Cheap reachability probe — no side effects."""
         return True, "no health check implemented"
 
+    async def open_shell(self):
+        """Return an interactive PTY subprocess (stdin/stdout pipes) for raw-drive
+        (`/sbx <persona>`), or None if this device has no shell surface. SSH adapters
+        return an `ssh -tt` channel; serial adapters, the serial CLI."""
+        return None
+
     # ── framework ────────────────────────────────────────────────────────────
     def verb(self, v: Verb) -> None:
         self._verbs[v.name] = v
