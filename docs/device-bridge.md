@@ -191,6 +191,22 @@ Two levels; ship Level 1 first.
 C-Level-1 (bridge PTY `/sbx pager`) → C-Level-2 (native `Backend::Device`). A is the
 dependency for both B and C.
 
+## Connecting from any hosting mode (local / web-relay / onion)
+
+The bridge is a first-class room **member**, not a viewer — it joins the ordinary
+`cmd_chat.py serve` **loopback** room server directly (127.0.0.1:&lt;port&gt;), exactly like
+the host's own TUI. Web-relay and onion only *front* that same loopback server, so the
+device connects identically regardless of exposure. **Start the room first, then add the
+device** (`hh-go up | --relay | --public | onion | onion browser` → then `hh-go device pager`).
+
+`hh-go device [pager]` **auto-discovers** the active room across all modes: it finds the
+running `cmd_chat.py serve` process, reads the port from its cmdline, and the password from
+either the cmdline (`-p`/`--password`, e.g. onion/explicit) or the process environment
+(`CMD_CHAT_PASSWORD`, the `hh-up.sh` `--relay`/`--public` path), with the onion state file as
+a fallback. Overrides: `HH_ROOM_PORT` + `HH_ROOM_PASSWORD` (target a specific room),
+`HH_DEVICE_OWNER` (your room name; default `$USER`), `HH_DEVICE_ALIAS` (ssh alias). For a
+room on another host / explicit coords, use `scripts/hh-device.sh <device> <host> <port> <pw>`.
+
 ## Open items
 - `.hh-device` manifest field names (reuse `.hh-agent`'s `purpose/setup/usage/state` vs a
   dedicated schema) — decide at P0.
