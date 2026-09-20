@@ -75,18 +75,40 @@ class SshConn:
             yield line
 
     # ── interactive PTY (for /sbx pager raw-drive) ───────────────────────────
-    async def open_pty(self, initial: str = "") -> asyncio.subprocess.Process:
-        """Spawn `ssh -tt <alias>` with piped stdio: the REMOTE allocates a PTY
-        (forced by -tt even with no local tty), so the caller streams proc.stdout
-        as _sbx:data and writes keystrokes to proc.stdin. `initial` (if given) is
-        an already-safe command to run at open (e.g. a login banner / cd)."""
+    def open_pty(self, rows: int = 40, cols: int = 120, initial: str = ""):
+        """Run `ssh -tt <alias>` inside a REAL local PTY (not piped stdio). With a
+        genuine controlling terminal, ssh negotiates proper remote-PTY modes —
+        crucially ONLCR (NL→CR-NL), so line endings don't stagger into a diagonal
+        'staircase' — and a real, resizable window size. Returns (proc, master_fd):
+        read/write the non-blocking master_fd, resize via `set_winsize`."""
+        import fcntl
+        import os
+        import pty
+        import struct
+        import subprocess
+        import termios
+
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         argv = self.ssh_argv([initial] if initial else [], tty=True)
-        return await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        proc = subprocess.Popen(
+            argv, stdin=slave, stdout=slave, stderr=slave,
+            start_new_session=True, close_fds=True)   # slave becomes the ctty
+        os.close(slave)
+        fl = fcntl.fcntl(master, fcntl.F_GETFL)
+        fcntl.fcntl(master, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        return proc, master
+
+    @staticmethod
+    def set_winsize(master_fd: int, rows: int, cols: int) -> None:
+        import fcntl
+        import struct
+        import termios
+        try:
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", max(1, rows), max(1, cols), 0, 0))
+        except OSError:
+            pass
 
     # ── health / transport ───────────────────────────────────────────────────
     async def health(self) -> tuple[bool, str]:

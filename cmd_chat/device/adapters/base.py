@@ -64,10 +64,10 @@ class DeviceAdapter:
         """(online, one-line detail). Cheap reachability probe — no side effects."""
         return True, "no health check implemented"
 
-    async def open_shell(self):
-        """Return an interactive PTY subprocess (stdin/stdout pipes) for raw-drive
+    async def open_shell(self, rows: int = 40, cols: int = 120):
+        """Return (proc, master_fd) — an interactive PTY for raw-drive
         (`/sbx <persona>`), or None if this device has no shell surface. SSH adapters
-        return an `ssh -tt` channel; serial adapters, the serial CLI."""
+        return an `ssh -tt` channel in a real PTY; serial adapters, the serial CLI."""
         return None
 
     # ── framework ────────────────────────────────────────────────────────────

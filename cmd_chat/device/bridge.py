@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 import sys
 import time
 
@@ -23,6 +24,7 @@ import websockets
 from cmd_chat.client.client import MAX_WS_FRAME, Client
 
 from .adapters.pager import PagerAdapter
+from .adapters.ssh_conn import SshConn
 
 ADAPTERS = {"pager": PagerAdapter}
 
@@ -42,7 +44,10 @@ class DeviceBridge:
         self._online: bool | None = None
         self._disarm_task: asyncio.Task | None = None
         self._pty = None                      # active ssh -tt PTY subprocess (or None)
+        self._pty_fd: int | None = None       # its controlling-PTY master fd
         self._pty_task: asyncio.Task | None = None
+        self._pty_q: asyncio.Queue = asyncio.Queue()
+        self._rows, self._cols = 40, 120      # advertised shell dims (TUI resizes us)
 
     # ── wire helpers ─────────────────────────────────────────────────────────
     async def post(self, text: str) -> None:
@@ -99,58 +104,84 @@ class DeviceBridge:
             await self.post(f"⌂ {self.adapter.persona} shell already open — /drive to type, "
                             f"`@{self.adapter.persona} shell stop` to close.")
             return
-        proc = await self.adapter.open_shell()
-        if proc is None:
+        result = await self.adapter.open_shell(rows=self._rows, cols=self._cols)
+        if result is None:
             await self.post(f"✖ {self.adapter.persona} has no shell surface.")
             return
-        self._pty = proc
+        proc, fd = result
+        self._pty, self._pty_fd = proc, fd
         self.drivers.add(sender)              # the summoner drives by default
         await self.post(f"🖥  {self.adapter.persona} SHELL opened by {sender} — it renders "
                         f"in the sandbox pane; granted members /drive to type. "
                         f"`@{self.adapter.persona} shell stop` closes it.")
-        self._pty_task = asyncio.ensure_future(self._pty_emit())
-
-    async def _pty_emit(self) -> None:
-        proc = self._pty
+        # A fd reader fills a queue; a pump task sends _sbx:data in ORDER (so the
+        # PTY byte stream never reorders across event-loop turns).
+        asyncio.get_event_loop().add_reader(fd, self._on_pty_readable)
+        self._pty_task = asyncio.ensure_future(self._pty_pump())
         await self.send_frame({"_sbx": "status", "state": "ready",
-                               "backend": self.adapter.persona, "rows": 24, "cols": 80})
+                               "backend": self.adapter.persona,
+                               "rows": self._rows, "cols": self._cols})
         await self._broadcast_acl()
+
+    def _on_pty_readable(self) -> None:
         try:
-            while proc and proc.stdout:
-                chunk = await proc.stdout.read(4096)
-                if not chunk:
-                    break
+            data = os.read(self._pty_fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            data = b""
+        if not data:                          # EOF — the remote shell exited
+            asyncio.ensure_future(self._close_shell("shell exited"))
+            return
+        self._pty_q.put_nowait(data)
+
+    async def _pty_pump(self) -> None:
+        try:
+            while True:
+                data = await self._pty_q.get()
                 await self.send_frame({"_sbx": "data",
-                                       "b64": base64.b64encode(chunk).decode()})
-        except (asyncio.CancelledError, Exception):
+                                       "b64": base64.b64encode(data).decode()})
+        except asyncio.CancelledError:
             pass
-        finally:
-            await self.send_frame({"_sbx": "status", "state": "ended",
-                                   "backend": self.adapter.persona})
 
     async def _close_shell(self, sender: str) -> None:
         if self._pty is None:
             await self.post(f"⌂ {self.adapter.persona} has no shell open.")
             return
+        fd = self._pty_fd
+        if fd is not None:
+            try:
+                asyncio.get_event_loop().remove_reader(fd)
+            except Exception:
+                pass
+        if self._pty_task:
+            self._pty_task.cancel()
         try:
             self._pty.kill()
         except Exception:
             pass
-        if self._pty_task:
-            self._pty_task.cancel()
-        self._pty = None
-        await self.post(f"🖥  {self.adapter.persona} shell closed by {sender}.")
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._pty, self._pty_fd = None, None
+        await self.send_frame({"_sbx": "status", "state": "ended",
+                               "backend": self.adapter.persona})
+        await self.post(f"🖥  {self.adapter.persona} shell closed ({sender}).")
+
+    def _pty_resize(self, rows: int, cols: int) -> None:
+        self._rows, self._cols = max(1, rows), max(1, cols)
+        if self._pty_fd is not None:
+            SshConn.set_winsize(self._pty_fd, self._rows, self._cols)
 
     async def _pty_write(self, sender: str, data: bytes) -> None:
         """Write approved keystrokes to the device PTY — driver-token gated."""
-        if self._pty is None or self._pty.stdin is None:
-            return
-        if sender not in self.drivers:            # THE input gate (mirrors the sandbox ACL)
+        if self._pty_fd is None or sender not in self.drivers:
             return
         try:
-            self._pty.stdin.write(data)
-            await self._pty.stdin.drain()
-        except Exception:
+            os.write(self._pty_fd, data)
+        except OSError:
             pass
 
     # ── presence ─────────────────────────────────────────────────────────────
@@ -303,6 +334,14 @@ class DeviceBridge:
                 except (ValueError, TypeError):
                     return
                 await self._pty_write(sender, data)
+            return
+        if frame.get("_sbx") == "resize" and self._pty_fd is not None:
+            # The driving TUI advertises its real sandbox-pane dims — mirror them to
+            # the device PTY (SIGWINCH) so the shell reflows to the same width and
+            # nothing wraps/staggers. Any member's resize is harmless (dims only).
+            r, c = frame.get("rows"), frame.get("cols")
+            if isinstance(r, int) and isinstance(c, int):
+                self._pty_resize(r, c)
 
     async def _console(self) -> None:
         """Operator stdin: grant/revoke a driver, arm/disarm, quit."""
