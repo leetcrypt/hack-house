@@ -279,10 +279,24 @@ class DeviceBridge:
             return
 
         self.client.info(f"[device] {sender} → {self.adapter.persona} {verb} {args}")
+        # Immediate ack for verbs that reach out to the device (so the room isn't
+        # silent while a payload runs / a scan completes), then the result block.
+        if verb in ("run", "scan", "push", "pull"):
+            gerund = {"run": "launching payload", "scan": "scanning",
+                      "push": "pushing", "pull": "pulling loot"}[verb]
+            await self.post(f"⏳ {self.adapter.persona}: {gerund} "
+                            f"{' '.join(args)}".rstrip() + " …")
         out: list[str] = []
         async for line in self.adapter.dispatch(verb, args):
             out.append(line)
-        await self.post_block(f"{self.adapter.persona} {verb} {' '.join(args)}".rstrip(), out)
+        header = f"{self.adapter.persona} {verb} {' '.join(args)}".rstrip()
+        if verb == "run":
+            ok = any("exited (code 0)" in ln for ln in out)
+            timed = any("timed out" in ln for ln in out)
+            tag = "✓ finished" if ok else ("⏱ still running (long payload)" if timed
+                                           else "◁ done")
+            header = f"{tag} — {header}"
+        await self.post_block(header, out)
 
     # ── loops ────────────────────────────────────────────────────────────────
     async def _chat_recv(self) -> None:

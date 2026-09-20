@@ -30,6 +30,28 @@ LOCAL_LOOT = os.path.expanduser("~/loot/pineapple")
 _TITLE = re.compile(r"^#\s*Title:\s*(.+)$", re.I | re.M)
 _DESC = re.compile(r"^#\s*Description:\s*(.+)$", re.I | re.M)
 
+# Hak5 Pineapple payloads call framework functions (LOG/LED/PROMPT/CONFIRMATION_DIALOG
+# /LIST_PICKER/…) that a bare `sh` doesn't define — so they error out or hang, and the
+# operator sees nothing. This POSIX-sh shim defines them so a payload actually RUNS under
+# the bridge: human-facing messages go to stderr (streamed to the room, but NOT captured
+# by a payload's `x=$(CONFIRMATION_DIALOG …)`), and each input picker returns a sensible
+# default on stdout (auto-answered; interactive room-prompts are a later enhancement).
+HH_SHIM = r"""
+LOG(){ echo "  · $*" >&2; }
+LED(){ :; }
+ALERT(){ echo "  ! $*" >&2; }
+START_SPINNER(){ :; }
+STOP_SPINNER(){ :; }
+BATTERY_PERCENT(){ cat /sys/class/power_supply/*/capacity 2>/dev/null | head -1 || echo 100; }
+PROMPT(){ echo "  i $*" >&2; }
+CONFIRMATION_DIALOG(){ echo "  ? $* -> [auto-YES]" >&2; echo 1; }
+LIST_PICKER(){ _t="$1"; shift; echo "  ? $_t -> [auto: $1]" >&2; echo "$1"; }
+NUMBER_PICKER(){ echo "  ? $1 -> [auto: ${4:-0}]" >&2; echo "${4:-0}"; }
+TEXT_PICKER(){ echo "  ? $1 -> [auto: ${2:-}]" >&2; echo "${2:-}"; }
+QUACK(){ :; }
+export HH_SHIM=1
+"""
+
 
 class PagerAdapter(DeviceAdapter):
     KIND = "WiFi Pineapple Pager"
@@ -215,10 +237,23 @@ class PagerAdapter(DeviceAdapter):
             yield (f"{name!r} is not installed on the device — `push {name}` first."
                    if v else f"no payload named {name!r}.")
             return
-        # name validated; resolve its payload.sh on the device and execute.
+        # Source the framework shim, then run the payload IN it so LOG/LED/PROMPT/…
+        # resolve; stream everything (2>&1) so the operator sees progress + errors +
+        # the exit code. `name` is token-validated → safe to single-quote.
         script = (
-            f"p=$(find /root/payloads -maxdepth 5 -type d -name '{name}' 2>/dev/null | head -1); "
-            f"[ -n \"$p\" ] && [ -f \"$p/payload.sh\" ] || {{ echo 'not found on device'; exit 3; }}; "
-            f"echo \"# running $p/payload.sh\"; sh \"$p/payload.sh\" 2>&1; echo \"# exit $?\"")
-        async for line in self.conn.exec([script], timeout=120):
+            HH_SHIM
+            + f"n='{name}'\n"
+            "p=$(find /root/payloads /pineapple/payloads -maxdepth 5 -type d -name \"$n\" 2>/dev/null | head -1)\n"
+            "[ -n \"$p\" ] && [ -f \"$p/payload.sh\" ] || { echo \"no payload '$n' on device\"; exit 3; }\n"
+            "echo \"> launching $p/payload.sh\"\n"
+            "cd \"$p\" 2>/dev/null\n"
+            ". \"$p/payload.sh\" 2>&1\n"
+            "echo \"< payload '$n' exited (code $?)\"\n"
+        )
+        emitted = 0
+        async for line in self.conn.exec([script], timeout=90):
+            emitted += 1
             yield line
+        if emitted <= 1:
+            yield (f"(no output — '{name}' may run silently or spawn a background task; "
+                   f"check `loot`. Long-running payloads keep running on the device.)")
