@@ -82,10 +82,16 @@ class DeviceBridge:
 
     # ── /sbx <persona> — raw device shell as an _sbx:data stream ──────────────
     async def _broadcast_acl(self) -> None:
+        # The acl `owner` MUST equal the bridge's own room username (the server-stamped
+        # sender) — a hardened TUI's parse_perm drops any acl whose owner != sender as a
+        # forgery. The BRIDGE is the sandbox owner (it owns the device shell); it grants
+        # drive to members via `drivers`. (Human command-authz — arm/push/shell — is a
+        # separate concept, self.owner, used only for the @persona verb gating.)
+        me = self.adapter.persona
         await self.send_frame({
-            "_perm": "acl", "owner": self.owner or self.adapter.persona,
+            "_perm": "acl", "owner": me,
             "drivers": sorted(self.drivers),
-            "sudoers": sorted({self.owner} if self.owner else set()),
+            "sudoers": sorted(self.drivers | {me}),
         })
 
     async def _open_shell(self, sender: str) -> None:
