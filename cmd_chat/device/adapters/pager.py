@@ -37,7 +37,8 @@ _DESC = re.compile(r"^#\s*Description:\s*(.+)$", re.I | re.M)
 # by a payload's `x=$(CONFIRMATION_DIALOG …)`), and each input picker returns a sensible
 # default on stdout (auto-answered; interactive room-prompts are a later enhancement).
 HH_SHIM = r"""
-LOG(){ echo "  · $*" >&2; }
+TITLE(){ echo "  == $* ==" >&2; }
+LOG(){ echo "  . $*" >&2; }
 LED(){ :; }
 ALERT(){ echo "  ! $*" >&2; }
 START_SPINNER(){ :; }
@@ -82,8 +83,10 @@ class PagerAdapter(DeviceAdapter):
                        self._push, owner_only=True, min_args=1, max_args=1))
         self.verb(Verb("pull", "pull loot from the device to the operator",
                        self._pull, owner_only=True, max_args=1))
-        self.verb(Verb("run", "run an installed payload (transmits/executes)",
+        self.verb(Verb("run", "launch an installed payload (transmits/executes)",
                        self._run, armed=True, min_args=1, max_args=1))
+        self.verb(Verb("stop", "halt a running payload: stop <name> (or all)",
+                       self._stop, owner_only=True, max_args=1))
 
     # ── discovery ────────────────────────────────────────────────────────────
     def _host_catalog(self) -> dict[str, dict]:
@@ -237,23 +240,39 @@ class PagerAdapter(DeviceAdapter):
             yield (f"{name!r} is not installed on the device — `push {name}` first."
                    if v else f"no payload named {name!r}.")
             return
-        # Source the framework shim, then run the payload IN it so LOG/LED/PROMPT/…
-        # resolve; stream everything (2>&1) so the operator sees progress + errors +
-        # the exit code. `name` is token-validated → safe to single-quote.
+        import base64 as _b64
+        shim_b64 = _b64.b64encode(HH_SHIM.encode()).decode()
+        # Launch DETACHED (setsid) so a long-running/monitor payload persists and NEVER
+        # blocks the bridge; capture output to a log, tail it for a bounded window, then
+        # report completed vs still-running. The shim is deployed via base64 (no quoting
+        # hazards). `name` is token-validated → safe to single-quote.
         script = (
-            HH_SHIM
-            + f"n='{name}'\n"
+            f"n='{name}'\n"
             "p=$(find /root/payloads /pineapple/payloads -maxdepth 5 -type d -name \"$n\" 2>/dev/null | head -1)\n"
             "[ -n \"$p\" ] && [ -f \"$p/payload.sh\" ] || { echo \"no payload '$n' on device\"; exit 3; }\n"
-            "echo \"> launching $p/payload.sh\"\n"
-            "cd \"$p\" 2>/dev/null\n"
-            ". \"$p/payload.sh\" 2>&1\n"
-            "echo \"< payload '$n' exited (code $?)\"\n"
+            f"echo '{shim_b64}' | base64 -d > /tmp/hh_shim.sh 2>/dev/null\n"
+            "log=/tmp/hh_run_$n.log; pidf=/tmp/hh_run_$n.pid; : > \"$log\"\n"
+            "setsid sh -c '. /tmp/hh_shim.sh; cd \"$0\" 2>/dev/null; . \"$0/payload.sh\"; "
+            "echo \"< exited (code $?)\"' \"$p\" >\"$log\" 2>&1 &\n"
+            "pid=$!; echo $pid > \"$pidf\"\n"
+            "echo \"> launched $p (pid $pid)\"\n"
+            "i=0; while [ $i -lt 22 ]; do kill -0 $pid 2>/dev/null || break; sleep 1; i=$((i+1)); done\n"
+            "cat \"$log\"\n"
+            "if kill -0 $pid 2>/dev/null; then echo \"@@RUNNING pid=$pid@@\"; "
+            "else echo \"@@DONE@@\"; rm -f \"$pidf\"; fi\n"
         )
-        emitted = 0
-        async for line in self.conn.exec([script], timeout=90):
-            emitted += 1
+        async for line in self.conn.exec([script], timeout=40):
             yield line
-        if emitted <= 1:
-            yield (f"(no output — '{name}' may run silently or spawn a background task; "
-                   f"check `loot`. Long-running payloads keep running on the device.)")
+
+    async def _stop(self, args: list[str]) -> AsyncIterator[str]:
+        # Halt a running payload (or all): kill the detached session (negative pid =
+        # process group from setsid), then clean up the pid file.
+        target = args[0] if args else "*"
+        script = (
+            f"any=0; for f in /tmp/hh_run_{target}.pid; do [ -f \"$f\" ] || continue; any=1; "
+            "pid=$(cat \"$f\"); nm=$(basename \"$f\" .pid | sed 's/^hh_run_//'); "
+            "kill -- -\"$pid\" 2>/dev/null || kill \"$pid\" 2>/dev/null; "
+            "echo \"stopped $nm (pid $pid)\"; rm -f \"$f\"; done; "
+            "[ $any = 0 ] && echo 'no running payloads'; :")
+        async for line in self.conn.exec([script]):
+            yield line

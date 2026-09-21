@@ -218,6 +218,17 @@ class DeviceBridge:
         lines.append("  • help — this menu")
         return "\n".join(lines)
 
+    async def _run_command(self, sender: str, rest: str) -> None:
+        """Command task wrapper — never let a command exception die silently."""
+        try:
+            await self._handle_command(sender, rest)
+        except Exception as e:      # noqa: BLE001 — surface any failure to the room
+            self.client.error(f"[device] command error: {e}")
+            try:
+                await self.post(f"✖ {self.adapter.persona}: command failed — {e}")
+            except Exception:
+                pass
+
     async def _handle_command(self, sender: str, rest: str) -> None:
         parts = rest.split()
         if not parts:
@@ -281,9 +292,9 @@ class DeviceBridge:
         self.client.info(f"[device] {sender} → {self.adapter.persona} {verb} {args}")
         # Immediate ack for verbs that reach out to the device (so the room isn't
         # silent while a payload runs / a scan completes), then the result block.
-        if verb in ("run", "scan", "push", "pull"):
-            gerund = {"run": "launching payload", "scan": "scanning",
-                      "push": "pushing", "pull": "pulling loot"}[verb]
+        if verb in ("run", "scan", "push", "pull", "stop"):
+            gerund = {"run": "launching payload", "scan": "scanning", "push": "pushing",
+                      "pull": "pulling loot", "stop": "stopping"}[verb]
             await self.post(f"⏳ {self.adapter.persona}: {gerund} "
                             f"{' '.join(args)}".rstrip() + " …")
         out: list[str] = []
@@ -291,10 +302,20 @@ class DeviceBridge:
             out.append(line)
         header = f"{self.adapter.persona} {verb} {' '.join(args)}".rstrip()
         if verb == "run":
-            ok = any("exited (code 0)" in ln for ln in out)
-            timed = any("timed out" in ln for ln in out)
-            tag = "✓ finished" if ok else ("⏱ still running (long payload)" if timed
-                                           else "◁ done")
+            running = next((ln for ln in out if "@@RUNNING" in ln), None)
+            done = any("@@DONE@@" in ln for ln in out)
+            out = [ln for ln in out if "@@RUNNING" not in ln and "@@DONE@@" not in ln]
+            if running:
+                pid = running.split("pid=")[-1].rstrip("@ ").strip()
+                tag = (f"▶ RUNNING in background (pid {pid}) — "
+                       f"`@{self.adapter.persona} stop {args[0]}` to halt · "
+                       f"`@{self.adapter.persona} loot` for results")
+            elif done and any("exited (code 0)" in ln for ln in out):
+                tag = "✓ COMPLETED (exit 0)"
+            elif done:
+                tag = "✖ FINISHED (non-zero exit)"
+            else:
+                tag = "◁ done"
             header = f"{tag} — {header}"
         await self.post_block(header, out)
 
@@ -321,7 +342,9 @@ class DeviceBridge:
                 continue
             for p in prefixes:
                 if text == p or text.startswith(p + " "):
-                    await self._handle_command(sender, text[len(p):].strip())
+                    # Run as a task so a long-running payload never blocks the chat loop
+                    # — the bridge stays responsive to `help`/`stop`/other commands.
+                    asyncio.ensure_future(self._run_command(sender, text[len(p):].strip()))
                     break
 
     async def _handle_control(self, sender: str, text: str) -> None:
