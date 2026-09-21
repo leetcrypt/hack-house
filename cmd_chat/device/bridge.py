@@ -28,7 +28,7 @@ from .adapters.ssh_conn import SshConn
 
 ADAPTERS = {"pager": PagerAdapter}
 
-MAX_OUT_LINES = 40          # cap a single command's chat reply
+MAX_OUT_LINES = 60          # cap a single command's chat reply
 ARM_TTL = 120.0            # seconds an armed device stays armed before auto-disarm
 PRESENCE_INTERVAL = 45.0   # seconds between health probes
 

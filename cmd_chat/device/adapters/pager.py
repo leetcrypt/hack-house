@@ -75,7 +75,7 @@ class PagerAdapter(DeviceAdapter):
                        self._scan, max_args=1))
         self.verb(Verb("clients", "associated wifi clients (read-only)", self._clients))
         self.verb(Verb("loot", "list captured loot on the device", self._loot))
-        self.verb(Verb("payloads", "list payloads (installed + host library); "
+        self.verb(Verb("payloads", "list payloads (columnar); 'payloads <text>' filters, "
                        "'payloads refresh' rescans", self._payloads, max_args=1))
         self.verb(Verb("info", "show a payload's details", self._info,
                        min_args=1, max_args=1))
@@ -170,21 +170,44 @@ class PagerAdapter(DeviceAdapter):
 
     # ── payload verbs ────────────────────────────────────────────────────────
     async def _payloads(self, args: list[str]) -> AsyncIterator[str]:
-        if args and args[0] == "refresh":
-            await self.refresh()
-            yield "(rescanned)"
+        # `payloads` — full list; `payloads refresh` — rescan; `payloads <text>` — filter.
+        flt = ""
+        if args:
+            if args[0] == "refresh":
+                await self.refresh()
+            else:
+                flt = args[0].lower()
         cat = await self._catalog_ready()
         if not cat:
             yield "no payloads discovered (host library missing + device empty)"
             return
-        installed = sorted(n for n, v in cat.items() if v["source"] in ("device", "both"))
-        avail = sorted(n for n, v in cat.items() if v["source"] == "host")
-        yield f"# installed on device ({len(installed)}) — run with `run <name>`:"
-        for n in installed[:40]:
-            yield f"  ● {n}"
-        yield f"# available to push ({len(avail)}) — send with `push <name>`:"
-        for n in avail[:40]:
-            yield f"  ○ {n} — {cat[n]['title']}"
+
+        def sel(sources: tuple) -> list[str]:
+            names = sorted(n for n, v in cat.items() if v["source"] in sources)
+            return [n for n in names if not flt or flt in n.lower()]
+
+        def columns(names: list[str], marker: str, per: int = 3, w: int = 28):
+            # each cell gets a built-in 2-space trailer, so a long name that overruns
+            # its column still keeps a gap before the next marker (no abutting).
+            for i in range(0, len(names), per):
+                cells = [f"{marker} {n}  ".ljust(w) for n in names[i:i + per]]
+                yield "  " + "".join(cells).rstrip()
+
+        installed = sel(("device", "both"))
+        avail = sel(("host",))
+        tag = f" matching '{flt}'" if flt else ""
+        if installed:
+            yield f"# installed on device ({len(installed)}{tag}) — `run <name>`:"
+            for ln in columns(installed, "●"):
+                yield ln
+        if avail:
+            yield f"# available to push ({len(avail)}{tag}) — `push <name>`:"
+            for ln in columns(avail, "○"):
+                yield ln
+        if not installed and not avail:
+            yield f"(no payloads{tag})"
+        elif not flt:
+            yield "tip: filter with `payloads <text>` · details with `info <name>`"
 
     async def _info(self, args: list[str]) -> AsyncIterator[str]:
         cat = await self._catalog_ready()
