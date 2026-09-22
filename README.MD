@@ -35,7 +35,9 @@ trust a corporation with their conversations: pairing, teaching, demos, hacking.
 - **Shared sandbox** — summon a disposable `local` / `docker` / `podman` / `multipass` box the whole room can watch and drive. Docker defaults to **Parrot OS Security** (`parrotsec/core`) and Podman to **Kali** (`kalilinux/kali-rolling`) — pentest distros out of the box; Podman is rootless & daemonless, so **no sudo** to launch
 - **Snapshot save/load** — freeze a sandbox to a named snapshot and restore it later (`/sbx save` · `/sbx load` · `/sbx snaps`)
 - **Local VirtualBox VMs** — `/sbx vms` detects VirtualBox and lists your VMs; `/sbx gui <vm>` opens a desktop VM locally for the room to gather around — per-user consent gate, with automatic resolution of VT-x conflicts (Docker Desktop / multipass)
-- **Real permissions** — the host grants/revokes *drive* (keyboard) and *sudo* (VM superuser) per user; **stacking roster badges** show exactly who holds what, both in the clergy panel and inline on every chat message
+- **Physical device bridge** — bring a real device into the room as a first-class, driveable member with `/sbx pager` (WiFi Pineapple Pager over SSH; `/sbx device <alias>` for others). It joins like a headless member and reuses the same `_sbx`/ACL control plane, so *drive* and the shared-terminal view work exactly as they do for a container
+- **Browser guests over Tor** — a phone with only a browser (no hack-house install) can watch, chat, and request drive: the in-tree web relay + Tor publisher front the room behind a second throwaway onion. Fully merged into `main` (see [Browser access](#browser-access-for-mobile-optional))
+- **Real permissions** — the host grants/revokes *drive* (keyboard) and *sudo* (VM superuser) per user; **stacking roster badges** show exactly who holds what, both in the clergy panel and inline on every chat message; the host can `/kick` a member (which also rotates the room password)
 - **Local-first AI agent** — `/ai start` summons an in-room AI that runs against *your own* [Ollama](https://ollama.com) (no API key, nothing leaves your machine); replies **stream token-by-token** with **in-RAM semantic recall** of the conversation for context; model-agnostic, addressed-only, end-to-end encrypted like every other client
 - **AI that acts in the sandbox** — grant an agent *drive* and address it with `/ai <name> !<task>`; it works the shared box through a bounded, host-side **tool-calling loop** (run shell, write/read files, inspecting each result before the next step) and you watch its commands land live in the shared terminal. Ungranted, it stays **advisory-only** (tells you the commands, runs nothing); destructive commands are gated behind an explicit `/ai <name> confirm`
 - **Encrypted file transfer** — `/send` → `/accept` with SHA-256 verification
@@ -50,6 +52,8 @@ trust a corporation with their conversations: pairing, teaching, demos, hacking.
 | `hh/` | The Rust `ratatui` client (the flagship) |
 | `cmd_chat/`, `cmd_chat.py` | The Python (Sanic) server + legacy Python client |
 | `cmd_chat/agent/` | The model-agnostic AI agent bridge (joins a room as an encrypted client) |
+| `cmd_chat/web/`, `web-relay/` | Browser-guest support: the room→browser publisher (`cmd_chat.web`) + the loopback web relay it fronts (see [Browser access](#browser-access-for-mobile-optional)) |
+| `cmd_chat/device/` | Physical-device bridge — joins a real device (`/sbx pager`) as a driveable room member (see [The physical device bridge](#the-physical-device-bridge)) |
 | `models.toml` | Named provider profiles for `/ai start <profile>` (see `docs/providers.md`) |
 | `docs/providers.md` | Connect any model — profiles, flags, discovery, bring-your-own-provider |
 | `hh/scripts/` | Helper scripts — setup, hosting, sandbox provisioning, tests (see [Scripts](#scripts); each takes `-h`/`--help`) |
@@ -62,7 +66,7 @@ trust a corporation with their conversations: pairing, teaching, demos, hacking.
 ## Quick start
 
 ```bash
-git clone https://git.churchofmalware.org/trilltechnician/hack-house.git
+git clone https://github.com/leetcrypt/hack-house.git
 cd hack-house
 ```
 
@@ -160,7 +164,7 @@ Type to chat. Slash commands and keys:
 | `/sendroom <path>` | Offer a file (or directory) to the whole room |
 | `/accept` · `/reject` | Respond to a pending file offer |
 | `/clear` | Wipe your chat scrollback (local only) |
-| `/ai start [model\|profile] [allow]` | Summon a local AI agent (default `ollama/qwen2.5:3b`; a bare name is a `models.toml` profile). `allow` auto-grants it sandbox drive at spawn |
+| `/ai start [model\|profile] [allow]` | Summon a local AI agent (default `ollama/qwen2.5:3b`; a bare name is a `models.toml` profile). `allow` auto-grants it sandbox drive at spawn. **Owner or a granted driver only** — the agent runs against *that caller's* own Ollama and joins the room, so summoning is a privileged action (`/ai list`/`/ai models` stay open to everyone) |
 | `/ai stop` | Dismiss the agent you summoned |
 | `/ai <question>` | Ask the agent (`/ai <name> <question>` if several present) |
 | `/ai <name> !<task>` | Have a *granted* agent act in the shared sandbox (advisory-only if it has no drive) |
@@ -168,6 +172,7 @@ Type to chat. Slash commands and keys:
 | `/ai list` | List the agents present (or hint to `/ai start` if none) |
 | `/ai models` | Models the active agent can serve — or, with no agent, your local Ollama tags |
 | `/sbx <local\|docker\|podman\|multipass> [image] [install]` | Summon the shared sandbox — the backend leads (`/sbx launch …` still works). Docker → **Parrot OS** (`parrotsec/core`), Podman → **Kali** (`kalilinux/kali-rolling`, rootless, no sudo). `install` fetches a missing backend; `docker --start` boots a stopped daemon |
+| `/sbx pager` · `/sbx device <alias>` | Bring a **physical device** into the room as a driveable member (WiFi Pineapple Pager over SSH; `pager` is sugar for the `pager` alias). See [The physical device bridge](#the-physical-device-bridge) |
 | `/sbx stop` | Tear down the sandbox you host |
 | `/sbx save [label]` · `/sbx load <label>` · `/sbx snaps` | Snapshot the sandbox, restore one, or list snapshots |
 | `/sbx vms` | Detect VirtualBox and list local VMs |
@@ -176,6 +181,7 @@ Type to chat. Slash commands and keys:
 | `/drive` · `F2` | Take the shared shell (`Esc` releases) |
 | `/grant <user>` · `/revoke <user>` | Owner: delegate/withdraw drive |
 | `/sudo <user>` · `/unsudo <user>` | Owner: delegate/withdraw VM superuser |
+| `/kick <user>` | Host only: force-disconnect a member **and rotate the room password** so the shared secret can't rejoin them |
 | `Ctrl+C` · `Ctrl+Q` | Quit gracefully |
 | `Ctrl+C` (while driving) | Interrupt the running command |
 | `Ctrl+R` | Reconnect after a drop |
@@ -196,6 +202,7 @@ server only ever sees ciphertext (same trust model as chat).
 | `docker` | container | **Parrot OS Security** (`parrotsec/core`) by default — swap `parrotsec/security` per-launch for the full pentest set; `/sbx docker --start` boots the daemon (or run `hh/scripts/ensure-docker.sh`) |
 | `podman` | container | **Kali rolling** (`kalilinux/kali-rolling`) by default — **rootless & daemonless, no sudo to launch** (add `kali-linux-headless` for the toolset); `hh/scripts/ensure-podman.sh` installs it |
 | `multipass` | full VM | `24.04` by default; strongest isolation, ~30 s to boot, the choice for real use |
+| `pager` / `device` | physical device | not a sandbox — bridges a **real device** (WiFi Pineapple Pager) into the room over SSH as a driveable member. See [The physical device bridge](#the-physical-device-bridge) |
 
 The backend leads the command — `/sbx podman`, `/sbx docker`, `/sbx multipass`,
 `/sbx local` (the older `/sbx launch <backend>` still works). Override the image
@@ -236,6 +243,24 @@ first if it's missing). It's not owner-gated — the per-user confirmation gate
 *is* the permission, so everyone opens their own copy. If a hardware hypervisor
 (Docker Desktop, multipass) is holding VT-x, hack-house detects the conflict and
 offers to stop it so the VM can boot.
+
+### The physical device bridge
+
+`/sbx pager` bridges a **real device** into the room the same way the web
+publisher bridges a browser: a headless member (`cmd_chat/device/`) joins,
+shells into the device over SSH, and exposes its I/O as the room's shared
+terminal — reusing the exact `_sbx`/ACL control plane, so *drive* grants and the
+watch-by-default view behave identically to a container. `/sbx pager` is sugar
+for the `pager` SSH alias; `/sbx device <alias>` bridges any other configured
+device. First supported device is the **WiFi Pineapple Pager** (reachable over
+USB `172.16.52.1` / WiFi `172.16.42.1`); a member drives it with the same
+`/drive` (`F2`) it uses for any sandbox. Run the bridge by hand for a device on
+another host:
+
+```bash
+.venv/bin/python -m cmd_chat.device <server_ip> <port> \
+    --device pager --alias pager --password <room-pw> --no-tls
+```
 
 ### Driving the shell
 
@@ -284,6 +309,12 @@ Summon an AI participant with `/ai start` — it joins the room as a normal
 encrypted client (same SRP + room key as everyone else) and answers when you
 address it with `/ai <question>`. `/ai stop` dismisses it (it's also cleaned up
 when you quit). Pick a model at summon time with `/ai start <model>`.
+
+**Summoning is privileged.** `/ai start` runs the agent against the *caller's
+own* Ollama and seats it in the room, so it's limited to the **owner or a
+granted driver** — anyone else is told to ask the host for `/grant`. Discovery
+stays open to everyone: `/ai list` and `/ai models` show each caller *their own*
+local models, so members can advertise what they'd bring before being granted.
 
 - **Runs on *your* machine.** The default provider is [Ollama](https://ollama.com)
   — a local model (default `qwen2.5:3b`), no API key, nothing leaves your host.
@@ -433,7 +464,40 @@ depend on external video tooling — not needed to use or develop hack-house.
 | `THEME` | `scripts/lets-hack.sh` | Vestments for every pane (`church` · `neon` · `crypt`) |
 | `HH_SESSION` · `HH_USER` | direnv autostart | tmux session name / your in-session name |
 
+## Hosting modes
+
+A room is one server process (`cmd_chat.py serve <bind> <port>` — or the
+friendlier `hh/scripts/host-room.sh` / `host-house.sh` wrappers). What changes
+between "modes" is **the bind address and the front door** — how guests reach
+that process. The encryption is identical in every mode (SRP + client-side
+Fernet; the server only ever relays ciphertext), so the choice is purely about
+*reachability and exposure*, not trust.
+
+| Mode | How you host | Who can reach it | Guest needs | Exposure |
+|---|---|---|---|---|
+| **Loopback / local** | `serve 127.0.0.1 <port> --no-tls` (or `lets-hack.sh`) | only this machine | nothing | none — dev/testing, or the base for a Tor front door |
+| **LAN** | `serve 0.0.0.0 <port>` (`host-room.sh`) | anyone on the same network | your LAN IP + a client | your IP is visible on the LAN; no router setup |
+| **Tailscale** *(recommended)* | `serve 0.0.0.0 <port> --no-tls`, hand out your tailnet IP | anyone on your tailnet | tailnet access + a client | WireGuard-encrypted, **no port-forward**, no public exposure |
+| **Public internet** | `serve 0.0.0.0 <port> --cert … --key …`, forward the port | anyone with the address | a client | your real IP + an open port are public — use a real TLS cert |
+| **Tor onion** | `serve 127.0.0.1 <port> --no-tls --tor` | anyone with Tor | a client wrapped in `torsocks` | **no inbound port, host IP hidden**, throwaway `.onion`, works behind CGNAT — see [Tor onion hosting](#tor-onion-hosting) |
+| **Tor + browser (web relay)** | `--tor` **plus** the web relay + `cmd_chat.web` publisher, fronted by a second onion | a phone with just a browser | **Orbot / Tor Browser** (no install) | same as Tor, and the only mode a **non-hack-house guest** can join — see [Browser access](#browser-access-for-mobile-optional) |
+
+Notes that trip people up:
+
+- **`--tls` vs reachability are separate.** `--no-tls` is fine on Tailscale/Tor
+  (the tunnel/onion already encrypts the transport); use a real cert only when
+  you bind a plain public port. The room payload is end-to-end encrypted either way.
+- **Inbound reach ≠ sandbox egress.** The mode above controls how guests reach
+  *the room*; it never routes the summoned sandbox's **outbound** traffic — that's
+  `HH_SBX_EGRESS` ([Sandbox egress](#the-shared-sandbox)), an orthogonal knob.
+- **One-command deploy.** `hh-go` (a personal wrapper, not part of this repo)
+  chains the Tor/relay/public modes above — stack, QR "scan-me" pane, PIN-gated
+  public front door, `hh-go onion browser` — in the correct order; the raw
+  commands in each section below are what it automates.
+
 ## Securing your connection
+
+Mechanics for the modes above — pick per how you're reaching each other:
 
 - **Tailscale (recommended)** — both parties join a tailnet; traffic rides an encrypted WireGuard tunnel, no port forwarding. Connect with `--no-tls` over the trusted tunnel, or keep TLS on.
 - **LAN** — use your local IP; both devices on the same network.
@@ -528,19 +592,18 @@ the roadmap live in [`docs/spec-tor-p2p-relay.md`](docs/spec-tor-p2p-relay.md).
 
 Everything above is terminal-only — the guest needs hack-house installed. For
 someone who doesn't (a phone with nothing but a browser), pair Tor hosting
-with **`web-relay`** (a separate, unmerged branch — `git worktree add` it
-alongside `main` if you don't have it checked out) instead of Tailscale/a
-domain: mint a *second* onion service fronting the relay's port, and hand out
-that link instead.
+with the **web relay** — now shipped **in `main`** (`web-relay/` + the
+`cmd_chat.web` publisher), no separate branch or worktree to check out. Mint a
+*second* onion service fronting the relay's port and hand out that link instead
+of a Tailscale/domain front door.
 
 ```bash
 # 1. the room itself, same as any --tor host
 python cmd_chat.py serve 127.0.0.1 9000 --password <pw> --no-tls --tor
 
-# 2. from the web-relay worktree: the relay (loopback only — its own
-#    safety gate refuses a public bind) + a publisher that joins the room
-cd ../web-relay   # or wherever that worktree lives
-.venv/bin/python -m web-relay.relay --host 127.0.0.1 --port 8080 --no-tls &
+# 2. the relay (loopback only — its own safety gate refuses a public bind)
+#    + a publisher that joins the room, both from this checkout
+( cd web-relay && ../.venv/bin/python -m relay --host 127.0.0.1 --port 8080 --no-tls & )
 .venv/bin/python -m cmd_chat.web 127.0.0.1 9000 --password <pw> --no-tls \
   --relay http://127.0.0.1:8080 --public-url http://<relay-onion-address> \
   --label "hack-house room"
