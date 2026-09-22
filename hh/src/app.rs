@@ -3370,7 +3370,13 @@ fn handle_command(
         {
             *agent = None;
         }
-        if agent.is_some() {
+        if !app.is_owner() && !app.can_drive() {
+            // Summoning an agent joins a new member that (with `allow`) can drive
+            // the shared sandbox — a privileged action. Only the room owner or a
+            // granted driver may do it; everyone else is told to ask for /grant.
+            // `/ai list` stays open so any member can still see their own models.
+            app.sys("/ai start needs drive permission — ask the host to /grant you first");
+        } else if agent.is_some() {
             app.sys("an AI agent is already running from this client — /ai stop first");
         } else {
             // Trailing flag words (any order): `allow` auto-grants the agent
@@ -4031,7 +4037,12 @@ fn spawn_agent(
     } else {
         std::path::PathBuf::from(std::env::var("HH_AI_PYTHON").unwrap_or_else(|_| "python3".into()))
     };
-    let log_path = std::env::temp_dir().join(format!("hh-agent-{name}.log"));
+    // Model tags can carry '/' and ':' (e.g. "huihui_ai/nemotron:8b"); left in a
+    // filename the '/' reads as a nonexistent subdir, so File::create below fails
+    // with "No such file or directory". Flatten separators for the log path only —
+    // the roster/--name keeps the real tag.
+    let safe_name = name.replace(['/', ':'], "-");
+    let log_path = std::env::temp_dir().join(format!("hh-agent-{safe_name}.log"));
     let log = std::fs::File::create(&log_path)
         .map_err(|e| format!("agent log {}: {e}", log_path.display()))?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
