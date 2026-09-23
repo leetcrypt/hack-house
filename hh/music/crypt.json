@@ -1,0 +1,12 @@
+{
+  "name": "crypt",
+  "about": "Dark ambient for the small hours — occult dread, deep focus.",
+  "license": "CC BY 4.0 — Kevin MacLeod (incompetech.com)",
+  "tracks": [
+    { "title": "Ossuary 5 - Rest", "artist": "Kevin MacLeod", "src": "crypt/01-ossuary-5-rest.mp3", "secs": 235 },
+    { "title": "Ghostpocalypse - Crossing the Threshold", "artist": "Kevin MacLeod", "src": "crypt/02-ghostpocalypse-crossing-the-threshold.mp3", "secs": 108 },
+    { "title": "Crypto", "artist": "Kevin MacLeod", "src": "crypt/03-crypto.mp3", "secs": 204 },
+    { "title": "Killers", "artist": "Kevin MacLeod", "src": "crypt/04-killers.mp3", "secs": 305 },
+    { "title": "Hitman", "artist": "Kevin MacLeod", "src": "crypt/05-hitman.mp3", "secs": 200 }
+  ]
+}

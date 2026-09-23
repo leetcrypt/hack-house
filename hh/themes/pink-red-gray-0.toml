@@ -1,0 +1,13 @@
+name = "pink-red-gray-0"
+border = "#815F73"
+title = "#DF1A2D"
+accent = "#DF1A2D"
+dim = "#A67C95"
+me = "#FCDCDF"
+other = "#D198BA"
+system = "#BB7BA1"
+input = "#FCDCDF"
+roster_me = "#DF1A2D"
+bg = "#622B4C"
+roster_width = 22
+sigil = "†"

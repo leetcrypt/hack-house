@@ -12,10 +12,20 @@ from .helpers import RateLimiter
 from .routes import register_routes
 
 
-def create_app(password: str = "", name: str = "cmd-chat-server") -> Sanic:
+def create_app(password: str = "", name: str = "cmd-chat-server",
+               onion: str = "", bind_host: str = "") -> Sanic:
     app = Sanic(name)
     Extend(app)
 
+    # Reachable onion address ("<id>.onion:<port>") when hosted with --tor, else
+    # "". Surfaced to clients in the init frame so the TUI `/share` can print a
+    # paste-ready connect block; the client already holds host/port/password.
+    app.ctx.onion = onion
+    # Shareable tailnet/LAN/public connect addresses for this bind, so `/share`
+    # can offer tor + tailscale + LAN links (empty for a loopback-only bind).
+    from .helpers import reach_addresses
+    app.ctx.bind_host = bind_host
+    app.ctx.reach = reach_addresses(bind_host)
     app.ctx.message_store = MessageStore()
     app.ctx.session_store = UserSessionStore()
     app.ctx.connection_manager = ConnectionManager()
@@ -28,6 +38,10 @@ def create_app(password: str = "", name: str = "cmd-chat-server") -> Sanic:
     # the cap is data not architecture (broadcast fan-out is O(N)).
     app.ctx.max_users = int(os.environ.get("CMD_CHAT_MAX_USERS", "4"))
     app.ctx.cleanup_task = None
+    # Room host = the oldest still-present connection (the "host badge" member),
+    # the only member allowed to `/kick`. Tracked here, auto-promoted to the
+    # next-oldest when the host leaves. See `_current_host` in views.py.
+    app.ctx.host_user_id = None
 
     register_lifecycle(app)
     register_routes(app)
@@ -49,7 +63,14 @@ def register_lifecycle(app: Sanic) -> None:
 
 
 async def cleanup_stale_sessions(app: Sanic) -> None:
-    while True:
-        with suppress(asyncio.CancelledError):
+    # `suppress` wraps the loop, never a single iteration. Inside it, the
+    # CancelledError raised in `asyncio.sleep` was swallowed and the loop went
+    # straight back to sleeping — so `task.cancel()` in teardown could never
+    # land, `await cleanup_task` blocked forever, and the worker hung at
+    # "Stopping worker" instead of exiting. SIGTERM therefore did nothing: the
+    # server could only be SIGKILLed, which is how test servers came to survive
+    # for weeks on a developer box.
+    with suppress(asyncio.CancelledError):
+        while True:
             await asyncio.sleep(300)
             app.ctx.session_store.cleanup_stale()

@@ -122,7 +122,7 @@ sleep 2
 ok "recording → $CAST"
 
 # ---- 3. both parties join (alice = owner-side, bob = guest/client) ----------
-asay "echo '⛧ alice — host'"; bsay "echo '⛧ bob — guest'"
+asay "echo '† alice — host'"; bsay "echo '† bob — guest'"
 sleep 0.8
 asay "$BIN connect 127.0.0.1 $PORT alice --password '$PW' --no-tls"
 await_for 'alice|roster|hack-house|owner' 20 && ok "alice joined" || fail "alice never joined"

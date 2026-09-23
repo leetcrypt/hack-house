@@ -8,8 +8,12 @@ mod app;
 mod crypto;
 mod ft;
 mod layout;
+mod music;
 mod net;
+mod persona;
+mod registry;
 mod sbx;
+mod snapshot;
 mod theme;
 mod ui;
 
@@ -74,6 +78,44 @@ enum Cmd {
         no_tls: bool,
         #[arg(long, default_value_t = false)]
         insecure: bool,
+    },
+    /// Headless snapshot ops on the VM library — the save/publish surface the
+    /// interactive `/sbx` grammar exposes, usable by an autonomous `/loop` runner
+    /// without a TUI. Writes byte-identical registry entries to the in-room path.
+    Sbx {
+        #[command(subcommand)]
+        action: SbxCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SbxCmd {
+    /// Commit the running sandbox to a snapshot and index it in the VM registry,
+    /// caching the container's `.hh-agent` manifest summary. Mirrors `/sbx save`.
+    Save {
+        /// Snapshot label (image tag / registry key).
+        label: String,
+        /// Also export a portable `hh-snapshots/hh-snap-<label>.tar` immediately.
+        #[arg(long, default_value_t = false)]
+        local: bool,
+        /// Running container name to commit + read the manifest from.
+        #[arg(long, default_value = "hack-house")]
+        name: String,
+        /// Sandbox backend: docker | podman | multipass | local.
+        #[arg(long, default_value = "podman")]
+        backend: String,
+        /// Origin tag recorded on the entry's `created_by`.
+        #[arg(long, default_value = "operator")]
+        created_by: String,
+    },
+    /// Mark a saved snapshot shareable, exporting a portable artifact if needed,
+    /// so peers can `/sbx pull` it from the library. Mirrors `/sbx publish`.
+    Publish {
+        /// Label of an already-saved snapshot (see `Sbx Save`).
+        label: String,
+        /// Skill tags for catalog filtering (repeatable: `--tag recon --tag kali`).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
 }
 
@@ -163,6 +205,34 @@ fn main() -> Result<()> {
             no_tls,
             insecure,
         } => handshake(&ip, port, &user, &password, no_tls, insecure),
+        Cmd::Sbx { action } => sbx_cmd(action),
+    }
+}
+
+/// Headless `hack-house sbx …` — the save/publish library surface for the
+/// autonomous `/loop` runner. Delegates to the same `snapshot`/`sbx`/`registry`
+/// code the interactive TUI uses, so there's exactly one canonical entry shape.
+fn sbx_cmd(action: SbxCmd) -> Result<()> {
+    match action {
+        SbxCmd::Save {
+            label,
+            local,
+            name,
+            backend,
+            created_by,
+        } => {
+            let be = sbx::Backend::parse(&backend)
+                .with_context(|| format!("unknown backend '{backend}'"))?;
+            let desc = sbx::save_state(be, &name, &label, local)?;
+            snapshot::register_saved_snapshot(be, &name, &label, &created_by);
+            println!("{desc}");
+            Ok(())
+        }
+        SbxCmd::Publish { label, tags } => {
+            let line = snapshot::publish_snapshot(&label, &tags)?;
+            println!("{line}");
+            Ok(())
+        }
     }
 }
 

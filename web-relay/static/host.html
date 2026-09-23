@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- The #t host-token fragment must never leak in a Referer (spec §7). -->
+  <meta name="referrer" content="no-referrer" />
+  <title>hack-house · host console</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0e14; --panel: #0d1119; --line: #1c2230; --ink: #c8d0e0;
+      --dim: #6b7488; --accent: #7fb0ff; --green: #79d98a; --amber: #e0b877;
+      --red: #e0777f;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      min-height: 100vh; }
+    header { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+      padding: .6rem .9rem; border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #10151f, #0b0e14); font-size: 13px; }
+    #label { font-weight: 600; }
+    #label::before { content: "⌂ "; color: var(--green); }
+    .tag { padding: .12rem .55rem; border-radius: 999px; font-size: 11px;
+      background: #1c2230; color: #8b95a7; white-space: nowrap; }
+    #status { margin-left: auto; color: var(--dim); font-size: 12px; }
+    main { max-width: 720px; margin: 0 auto; padding: 1rem .9rem 3rem; }
+
+    /* Gate A banner — explains why an approved viewer may not be driving yet. */
+    #gateA { border: 1px solid var(--line); border-radius: 10px; padding: .7rem .9rem;
+      margin-bottom: 1rem; font-size: 13px; line-height: 1.45; background: var(--panel); }
+    #gateA.held { border-color: #1f3a24; }
+    #gateA.missing { border-color: #3a301c; }
+    #gateA b { color: var(--ink); }
+    #gateA .k { font-weight: 600; }
+    #gateA.held .k { color: var(--green); }
+    #gateA.missing .k { color: var(--amber); }
+    code { background: #0b0f18; border: 1px solid #2a3547; border-radius: 5px;
+      padding: .05rem .35rem; color: var(--accent); }
+
+    h2 { font-size: 12px; letter-spacing: .3px; text-transform: uppercase;
+      color: var(--dim); margin: 0 0 .5rem; }
+    #viewers { display: flex; flex-direction: column; gap: .5rem; }
+    .row { display: flex; align-items: center; gap: .6rem; padding: .6rem .75rem;
+      border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+    .row.req { border-color: #3a301c; }
+    .row.drv { border-color: #1f3a24; }
+    .vid { font-size: 13px; }
+    .chip { font-size: 11px; padding: .1rem .5rem; border-radius: 999px;
+      background: #1c2230; color: #8b95a7; }
+    .chip.req { background: #322815; color: var(--amber); }
+    .chip.appr { background: #24303f; color: var(--accent); }
+    .chip.drv { background: #1f3a24; color: var(--green); }
+    .row .actions { margin-left: auto; display: flex; gap: .4rem; }
+    button { font: inherit; font-size: 12px; cursor: pointer; padding: .3rem .8rem;
+      border-radius: 8px; border: 1px solid #2a3547; background: #141a26; color: var(--ink); }
+    button.approve { border-color: #285238; background: #16301f; color: var(--green); }
+    button.revoke { border-color: #4a2530; background: #2c161b; color: var(--red); }
+    button:hover { filter: brightness(1.2); }
+    .empty { color: var(--dim); font-style: italic; font-size: 13px; }
+
+    /* toast for drive-request notifications */
+    #toasts { position: fixed; right: .8rem; bottom: .8rem; display: flex;
+      flex-direction: column; gap: .5rem; z-index: 10; }
+    .toast { background: #16301f; border: 1px solid #285238; color: var(--green);
+      padding: .6rem .8rem; border-radius: 10px; font-size: 13px; max-width: 300px;
+      box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+    .toast b { color: var(--ink); }
+  </style>
+</head>
+<body>
+  <header>
+    <span id="label">host console</span>
+    <span class="tag" id="gateTag">drive token …</span>
+    <span id="status">connecting…</span>
+  </header>
+  <main>
+    <div id="gateA" class="missing">
+      <span class="k">checking…</span>
+    </div>
+    <h2>viewers</h2>
+    <div id="viewers"><div class="empty">no viewers connected</div></div>
+  </main>
+  <div id="toasts"></div>
+
+  <script>
+  (function () {
+    "use strict";
+    const slug = location.pathname.split("/").filter(Boolean).pop();
+    const token = new URLSearchParams(location.hash.slice(1)).get("t");
+    const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
+    // The token is NOT in this URL. It used to be, which meant the host-token —
+    // the credential that approves PTY drive — was written into browser history
+    // and into every access log between here and the relay, six lines under a
+    // comment saying it must never leak. WIRE_PROTO 6: send it in frame one.
+    const wsUrl = `${wsScheme}//${location.host}/host/${slug}/ws`;
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (t) => { $("status").textContent = t; };
+
+    // Live state, merged from relay roster + publisher gate events.
+    let viewers = [];        // viewer_ids currently connected
+    let pending = new Set(); // viewer_ids requesting drive
+    let approved = null;     // Gate B: operator-approved viewer_id
+    let driver = null;       // effective driver (Gate A AND B)
+    let granted = false;     // Gate A: publisher holds the room driver token
+    let sock = null;
+
+    if ("Notification" in window && Notification.permission === "default") {
+      try { Notification.requestPermission(); } catch (e) {}
+    }
+
+    function toast(vid) {
+      const t = document.createElement("div");
+      t.className = "toast";
+      // Composed, not concatenated into innerHTML: `vid` comes off the wire and
+      // this page holds the host token. The viewer roster below already builds
+      // its rows with textContent — this was the one call that did not.
+      const label = document.createElement("b");
+      label.textContent = "drive requested";
+      t.append("🔔 ", label, document.createElement("br"),
+               vid + " — approve below");
+      $("toasts").appendChild(t);
+      setTimeout(() => t.remove(), 8000);
+      if ("Notification" in window && Notification.permission === "granted") {
+        try { new Notification("Drive requested", { body: vid + " wants to type in the terminal" }); }
+        catch (e) {}
+      }
+    }
+
+    function renderGate() {
+      const g = $("gateA"), tag = $("gateTag");
+      if (granted) {
+        g.className = "held";
+        g.innerHTML = '<span class="k">✓ room drive token held</span> — approving a '
+          + 'viewer lets them type immediately.';
+        tag.textContent = "drive token: held";
+        tag.style.color = "var(--green)";
+      } else {
+        g.className = "missing";
+        g.innerHTML = '<span class="k">⚠ room drive token NOT held</span> — you can '
+          + 'approve a viewer here, but their typing stays blocked until the room '
+          + 'owner grants drive to <b>web-publisher</b> in the hack-house TUI '
+          + '(<code>/grant web-publisher</code>). This is the sandbox ACL — the '
+          + 'console cannot bypass it.';
+        tag.textContent = "drive token: not held";
+        tag.style.color = "var(--amber)";
+      }
+    }
+
+    function statusOf(vid) {
+      if (vid === driver) return { cls: "drv", label: "driving" };
+      if (vid === approved) return granted
+        ? { cls: "drv", label: "driving" }
+        : { cls: "appr", label: "approved · waiting for room token" };
+      if (pending.has(vid)) return { cls: "req", label: "requesting drive" };
+      return { cls: "", label: "viewing" };
+    }
+
+    function render() {
+      renderGate();
+      // union of connected viewers + any pending/approved/driver id
+      const ids = new Set(viewers);
+      pending.forEach((v) => ids.add(v));
+      if (approved) ids.add(approved);
+      if (driver) ids.add(driver);
+      const box = $("viewers");
+      box.innerHTML = "";
+      if (ids.size === 0) {
+        box.innerHTML = '<div class="empty">no viewers connected</div>';
+        return;
+      }
+      [...ids].sort().forEach((vid) => {
+        const st = statusOf(vid);
+        const row = document.createElement("div");
+        row.className = "row" + (st.cls === "req" ? " req" : st.cls === "drv" ? " drv" : "");
+        const idEl = document.createElement("span");
+        idEl.className = "vid"; idEl.textContent = vid;
+        const chip = document.createElement("span");
+        chip.className = "chip " + st.cls; chip.textContent = st.label;
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        if (vid === approved || vid === driver) {
+          const b = document.createElement("button");
+          b.className = "revoke"; b.textContent = "Revoke";
+          b.onclick = () => send({ type: "revoke" });
+          actions.appendChild(b);
+        } else {
+          const b = document.createElement("button");
+          b.className = "approve";
+          b.textContent = pending.has(vid) ? "Approve drive" : "Grant drive";
+          b.onclick = () => send({ type: "allow", viewer_id: vid });
+          actions.appendChild(b);
+        }
+        row.appendChild(idEl); row.appendChild(chip); row.appendChild(actions);
+        box.appendChild(row);
+      });
+    }
+
+    function send(obj) {
+      if (sock && sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify(obj));
+    }
+
+    function connect() {
+      const ws = new WebSocket(wsUrl);
+      sock = ws;
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: "auth", token: token || "" }));
+        setStatus("connected");
+      };
+      ws.onclose = (ev) => {
+        sock = null;
+        if (ev.code === 4401) { setStatus("unauthorized — bad or missing #t host token"); return; }
+        setStatus("disconnected — retrying…");
+        setTimeout(connect, 1500);
+      };
+      ws.onerror = () => setStatus("connection error");
+      ws.onmessage = (ev) => {
+        let m; try { m = JSON.parse(ev.data); } catch { return; }
+        if (m.type === "roster") {
+          if (Array.isArray(m.viewers)) viewers = m.viewers;
+          if ("driver" in m) driver = m.driver || null;
+          if (m.label) { $("label").textContent = m.label; document.title = "host · " + m.label; }
+          render();
+        } else if (m.type === "host_event") {
+          if (m.kind === "state") {
+            granted = !!m.granted;
+            approved = m.approved || null;
+            driver = m.driver || null;
+            pending = new Set(m.pending || []);
+            render();
+          } else if (m.kind === "request") {
+            if (m.viewer_id) { pending.add(m.viewer_id); toast(m.viewer_id); render(); }
+          }
+        } else if (m.type === "end") {
+          setStatus("room ended");
+        }
+      };
+    }
+
+    if (!token) {
+      setStatus("missing #t host token — cannot authenticate");
+      $("gateA").innerHTML = '<span class="k">no host token</span> — open the host '
+        + 'console link from the publisher banner (it includes <code>#t=…</code>).';
+    } else {
+      connect();
+    }
+  })();
+  </script>
+</body>
+</html>

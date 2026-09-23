@@ -31,8 +31,8 @@ import argparse
 import sys
 
 from .bridge import AgentBridge
-from .profiles import load_profiles, provider_from_profile
-from .providers import OllamaEmbedder, make_provider, preflight
+from cmd_chat.ai.profiles import load_profiles, provider_from_profile
+from cmd_chat.ai.providers import OllamaEmbedder, make_provider, preflight
 
 
 def _build_provider(args, ap):
@@ -51,6 +51,8 @@ def _build_provider(args, ap):
             args.system = prof["system"]
         if args.context_window == 12 and prof.get("context_window"):
             args.context_window = int(prof["context_window"])
+        if args.harness is None and prof.get("harness"):
+            args.harness = prof["harness"]
         return provider
 
     opts: dict = {}
@@ -72,8 +74,11 @@ def _apply_ollama_tuning(provider, args) -> None:
         provider.num_predict = args.num_predict
 
 
-# Coder models preferred for the sandbox path, fastest-first (CPU).
-_CODER_MODELS = ("qwen2.5-coder:1.5b", "qwen2.5-coder:3b", "qwen2.5-coder")
+# Coder models preferred for the sandbox `!task` path, accuracy-first. The 3b
+# build roughly doubles the ground-truth pass rate over 1.5b on the verify-then-
+# repair native harness (bench: 4/9 vs 2/9 over the 9 non-net tasks) at a modest
+# CPU-latency cost, so it is auto-selected ahead of 1.5b when present.
+_CODER_MODELS = ("qwen2.5-coder:3b", "qwen2.5-coder", "qwen2.5-coder:1.5b")
 
 
 def _build_code_provider(provider, args):
@@ -121,6 +126,12 @@ def main() -> None:
                     help="Ollama CPU threads (default: Ollama's own ≈ physical cores; benchmark 4/6/8)")
     ap.add_argument("--num-predict", type=int, default=None,
                     help="Ollama max reply tokens (default 512)")
+    ap.add_argument("--harness", choices=["native", "simple"], default=None,
+                    help="sandbox !task harness: native (bounded host-side Ollama "
+                         "tool-calling loop; default) or simple (one-shot injector). "
+                         "native degrades to simple if the model has no tool support.")
+    ap.add_argument("--max-turns", type=int, default=5,
+                    help="max turns for the native tool-calling loop (default %(default)s)")
     ap.add_argument("--system", default=None, help="override the system prompt")
     ap.add_argument("--context-window", type=int, default=12,
                     help="max prior messages fed to the model per reply")
@@ -193,7 +204,8 @@ def main() -> None:
         password=args.password, insecure=args.insecure, no_tls=args.no_tls,
         system_prompt=args.system, context_window=args.context_window,
         token_budget=args.token_budget, embedder=embedder, rag_top_k=args.rag_top_k,
-        code_provider=code_provider,
+        code_provider=code_provider, harness=args.harness or "native",
+        max_turns=args.max_turns,
     )
     try:
         bridge.run()

@@ -12,20 +12,34 @@
 #   ./ensure-vbox.sh --yes     # install without prompting (used by --install)
 #   ./ensure-vbox.sh --check   # test only; exit 0 if present, 1 if missing
 #   ./ensure-vbox.sh --plan    # show the install/download plan; change nothing
+#   ./ensure-vbox.sh --stdin-pass  # read a sudo password from stdin (sudo -S)
 set -uo pipefail
 
 ASSUME_YES=0
 CHECK_ONLY=0
 PLAN_ONLY=0
+STDIN_PASS=0
 for arg in "$@"; do
     case "$arg" in
         -y|--yes)         ASSUME_YES=1 ;;
         --check)          CHECK_ONLY=1 ;;
         --plan|--dry-run) PLAN_ONLY=1 ;;
+        # A sudo password is waiting on stdin (the hack-house TUI feeds it). Use
+        # `sudo -S` so escalation reads that, never the controlling tty.
+        --stdin-pass)     STDIN_PASS=1 ;;
         -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "✖ unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
+
+# How to escalate (mirrors ensure-docker.sh):
+#   * --stdin-pass: a password is on stdin → `sudo -S -p ''` (reads stdin, never
+#     the tty; a raw-mode TUI would corrupt a tty prompt). First sudo caches it.
+#   * --yes alone: `sudo -n` — fails fast if creds aren't cached, never hangs.
+#   * interactive shell: plain `sudo` (a real terminal can prompt normally).
+SUDO="sudo"
+[[ $ASSUME_YES -eq 1 ]] && SUDO="sudo -n"
+[[ $STDIN_PASS -eq 1 ]] && SUDO="sudo -S -p ''"
 
 # HH_VBOX_FORCE_MISSING=1 lets a demo exercise the missing→install path without
 # actually uninstalling anything (the probe is the single source of truth).
@@ -88,7 +102,9 @@ if [[ -z "$install_cmd" ]]; then
     echo "✖ don't know how to install VirtualBox here — get it from https://www.virtualbox.org/wiki/Downloads" >&2
     exit 1
 fi
-[[ $need_sudo -eq 1 ]] && install_cmd="sudo $install_cmd"
+[[ $need_sudo -eq 1 ]] && install_cmd="$SUDO $install_cmd"
+# The plan path is only ever run interactively (the TUI never asks for --plan), so
+# a plain `sudo` tty prompt is fine there.
 [[ $plan_sudo -eq 1 ]] && plan_cmd="sudo $plan_cmd"
 
 # Secure Boot needs the vboxdrv kernel module signed/enrolled (MOK) or it won't

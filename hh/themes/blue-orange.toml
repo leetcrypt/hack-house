@@ -1,0 +1,13 @@
+name = "blue-orange"
+border = "#425C68"
+title = "#FB8047"
+accent = "#FB8047"
+dim = "#5F7883"
+me = "#ECD0C4"
+other = "#91C2D9"
+system = "#80A9BC"
+input = "#ECD0C4"
+roster_me = "#FB8047"
+bg = "#344E5B"
+roster_width = 22
+sigil = "✟"

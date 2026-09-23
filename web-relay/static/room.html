@@ -1,0 +1,1836 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Fragment hygiene (spec §7): keep the slug / #k fragment out of any onward
+       Referer. The relay also sends this as a header; the meta is belt-and-braces. -->
+  <meta name="referrer" content="no-referrer" />
+  <title>hack-house · web view</title>
+  <!-- SRI-pinned (hardening): a compromised CDN copy can't be swapped for JS that
+       exfiltrates the #k fragment. Matches the QR encoder's pinning below. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"
+        integrity="sha384-LJcOxlx9IMbNXDqJ2axpfEQKkAYbFjJfhXexLfiRJhjDU81mzgkiQq8rkV0j6dVh"
+        crossorigin="anonymous" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0e14; --bg2: #0e1320; --panel: #0d1119; --line: #1c2230;
+      --ink: #c8d0e0; --dim: #6b7488; --accent: #7fb0ff; --green: #79d98a;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0; background: var(--bg); color: var(--ink);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+
+    /* ── title bar ─────────────────────────────────────────────── */
+    header {
+      display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+      padding: .5rem .8rem; border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #10151f, #0b0e14); font-size: 13px;
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #2a3547;
+           box-shadow: 16px 0 0 #2a3547, 32px 0 0 #2a3547; margin-right: 30px; }
+    #label { font-weight: 600; letter-spacing: .2px; }
+    #label::before { content: "⌂ "; color: var(--green); }
+    .badge { padding: .12rem .5rem; border-radius: 999px; font-size: 11px;
+             background: #1c2230; color: #8b95a7; white-space: nowrap; }
+    .badge.ro { background: #24303f; color: var(--accent); }
+    .badge.driving { background: #1f3a24; color: var(--green); }
+    #drive { font: inherit; font-size: 11px; cursor: pointer; padding: .18rem .6rem;
+             border-radius: 999px; border: 1px solid #2a3547; background: #141a26;
+             color: var(--ink); }
+    #drive:hover { background: #1c2434; }
+    #status { margin-left: auto; color: var(--dim); font-size: 12px; }
+    #status::before { content: "● "; color: var(--green); }
+
+    /* ── main split: terminal stage + chat rail ────────────────── */
+    main { flex: 1; display: flex; min-height: 0; }
+    #stage {
+      flex: 1; min-width: 0; overflow: auto; position: relative;
+      background: radial-gradient(120% 100% at 0 0, #0e1422, var(--bg));
+      padding: .5rem;
+    }
+    /* the xterm root is scaled as a whole to fit the viewport — the remote 80×24
+       grid stays authoritative (we never resize the shared PTY), we just shrink
+       the pixels so the full line ("clear", not "ear") is always on screen. */
+    #termwrap { transform-origin: top left; will-change: transform; }
+    /* fitScale() shrinks the grid, and with it xterm's scrollbar — on a phone
+       there is effectively no visible way back down after scrolling up. Anchored
+       to #stage (position: relative), whose height fitScale pins to the visible
+       grid, so it sits over the bottom-right of the terminal and nowhere else. */
+    #tolive { position: absolute; right: .6rem; bottom: .6rem; z-index: 5;
+      font: inherit; font-size: 12px; cursor: pointer;
+      padding: .3rem .7rem; border-radius: 999px; border: 1px solid #2a3547;
+      background: rgba(20, 26, 38, .92); color: var(--ink); }
+    #tolive[hidden] { display: none; }
+    /* momentum scrolling for the history on iOS */
+    .xterm-viewport { -webkit-overflow-scrolling: touch; }
+
+    aside#chat {
+      width: 300px; flex: none; display: flex; flex-direction: column;
+      border-left: 1px solid var(--line); background: var(--panel); min-height: 0;
+    }
+    #chat h2 { margin: 0; padding: .5rem .75rem; font-size: 12px; letter-spacing: .3px;
+               text-transform: uppercase; color: var(--dim);
+               border-bottom: 1px solid var(--line);
+               display: flex; align-items: center; gap: .5rem; }
+    #chatname { margin-left: auto; text-transform: none; letter-spacing: 0;
+               font: inherit; font-size: 12px; color: var(--ink); width: 7.5rem;
+               background: #0b0f18; border: 1px solid #2a3547; border-radius: 6px;
+               padding: .2rem .45rem; }
+    /* explicit "commit name" button — mobile keyboards don't reliably fire the
+       input's `change` event, so the name never pushed; this button always does. */
+    #namesetbtn { font: inherit; font-size: 11px; cursor: pointer; margin-left: .3rem;
+               border-radius: 6px; border: 1px solid #285238; background: #16301f;
+               color: var(--green); padding: .2rem .55rem; }
+    #namesetbtn:active { background: #1d3d28; }
+    #chatlog { flex: 1; overflow: auto; padding: .5rem .75rem; font-size: 13px;
+               display: flex; flex-direction: column; gap: .4rem; }
+    #chatlog .sys { color: var(--dim); font-size: 12px; line-height: 1.4; }
+    #chatlog .msg { line-height: 1.35; }
+    #chatlog .who { color: var(--accent); }
+    #chatform { display: flex; gap: .4rem; padding: .5rem; border-top: 1px solid var(--line); }
+    #chatform input { flex: 1; font: inherit; font-size: 13px; color: var(--ink);
+      background: #0b0f18; border: 1px solid #2a3547; border-radius: 6px; padding: .35rem .5rem; }
+    #chatform input:disabled { opacity: .5; }
+    #chatform button { font: inherit; font-size: 12px; border-radius: 6px;
+      border: 1px solid #2a3547; background: #141a26; color: var(--ink); padding: 0 .7rem; }
+    #chattoggle { display: none; }
+    #helpbtn, #sharebtn, #qrbtn { font: inherit; font-size: 11px; cursor: pointer;
+      padding: .18rem .6rem; border-radius: 999px; border: 1px solid #2a3547;
+      background: #141a26; color: var(--ink); }
+    #helpbtn:hover, #sharebtn:hover, #qrbtn:hover { background: #1c2434; }
+    #sharebtn { border-color: #285238; background: #16301f; color: var(--green); }
+
+    /* ── share / QR sheet: re-share the current link. This browser already holds
+         the #k read-key, so re-sharing leaks nothing new; the QR is encoded
+         locally (createDataURL) — the key never touches a third-party service. ── */
+    #qrsheet { position: fixed; inset: 0; z-index: 25; display: none;
+      background: rgba(4,6,11,.72); backdrop-filter: blur(2px);
+      align-items: center; justify-content: center; padding: 1rem; }
+    #qrsheet.open { display: flex; }
+    #qrsheet .panel { background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; max-width: 380px; width: 100%; box-shadow: 0 12px 48px rgba(0,0,0,.6); }
+    #qrsheet .head { border-bottom: 1px solid var(--line); padding: .7rem .9rem;
+      display: flex; align-items: center; gap: .5rem; }
+    #qrsheet .head b { font-size: 14px; }
+    #qrsheet .head #closeqr { margin-left: auto; }
+    #qrsheet .body { padding: 1rem .9rem 1.1rem; text-align: center; }
+    #qrimg { width: 232px; height: 232px; image-rendering: pixelated; background: #fff;
+      border-radius: 10px; padding: 10px; }
+    #qrhint { color: var(--dim); font-size: 12px; margin: .7rem 0 .5rem; }
+    #qrurl { display: block; word-break: break-all; font-size: 11px; color: var(--accent);
+      background: #0b0f18; border: 1px solid #2a3547; border-radius: 6px; padding: .4rem .5rem; }
+    #qrcopy { margin-top: .6rem; }
+
+    /* ── display-name sheet: user-chosen handle on room entry (chat-only; the
+         name rides INSIDE the E2E payload, the relay never sees it). ── */
+    #namesheet { position: fixed; inset: 0; z-index: 26; display: none;
+      background: rgba(4,6,11,.72); backdrop-filter: blur(2px);
+      align-items: center; justify-content: center; padding: 1rem; }
+    #namesheet.open { display: flex; }
+    #namesheet .panel { background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; max-width: 360px; width: 100%; box-shadow: 0 12px 48px rgba(0,0,0,.6); }
+    #namesheet .head { border-bottom: 1px solid var(--line); padding: .7rem .9rem; }
+    #namesheet .head b { font-size: 14px; }
+    #namesheet .body { padding: 1rem .9rem 1.1rem; }
+    #namesheet p { color: var(--dim); font-size: 12px; margin: 0 0 .7rem; line-height: 1.45; }
+    #nameform { display: flex; gap: .5rem; }
+    #nameinput { flex: 1; font: inherit; font-size: 14px; color: var(--ink);
+      background: #0b0f18; border: 1px solid #2a3547; border-radius: 8px; padding: .45rem .6rem; }
+    #nameform button { font: inherit; font-size: 13px; border-radius: 8px; cursor: pointer;
+      border: 1px solid #285238; background: #16301f; color: var(--green); padding: 0 .9rem; }
+    #forgetline { margin: .7rem 0 0; font-size: 11px; }
+
+    /* ── incoming-file sheet: a room member is sending a file to the web
+         viewers. Browsers are receive-only; the publisher proxies + re-encrypts
+         the bytes under K_web. The popup surfaces the sender-supplied (or
+         auto-detected) description so the recipient can gauge trust. ── */
+    #filesheet { position: fixed; inset: 0; z-index: 27; display: none;
+      background: rgba(4,6,11,.72); backdrop-filter: blur(2px);
+      align-items: center; justify-content: center; padding: 1rem; }
+    #filesheet.open { display: flex; }
+    #filesheet .panel { background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; max-width: 380px; width: 100%; box-shadow: 0 12px 48px rgba(0,0,0,.6); }
+    #filesheet .head { border-bottom: 1px solid var(--line); padding: .7rem .9rem; }
+    #filesheet .head b { font-size: 14px; }
+    #filesheet .body { padding: 1rem .9rem 1.1rem; }
+    #filemeta { display: flex; flex-direction: column; gap: .35rem; margin-bottom: .6rem; }
+    .frow { display: flex; gap: .6rem; font-size: 13px; align-items: baseline; }
+    .fk { color: var(--dim); width: 3.2rem; flex: none; text-transform: uppercase;
+      font-size: 10px; letter-spacing: .04em; padding-top: .15rem; }
+    .fv { color: var(--ink); word-break: break-word; flex: 1; }
+    #filedesc { color: var(--accent); }
+    .filesha { color: var(--dim); font-size: 10px; word-break: break-all; margin: 0 0 .6rem;
+      font-family: ui-monospace, Menlo, monospace; }
+    .filewarn { color: var(--dim); font-size: 11px; line-height: 1.45; margin: 0 0 .8rem; }
+    .filebtns { display: flex; gap: .5rem; justify-content: flex-end; }
+    .filebtns button { font: inherit; font-size: 13px; border-radius: 8px; cursor: pointer; padding: .4rem .9rem; }
+    .btn-decline { border: 1px solid #3a2530; background: #241318; color: #e6a0a0; }
+    .btn-accept { border: 1px solid #285238; background: #16301f; color: var(--green); }
+
+    /* transient toast for "copied" feedback */
+    #toast { position: fixed; left: 50%; bottom: 1.2rem; transform: translateX(-50%);
+      background: #16301f; border: 1px solid #285238; color: var(--green);
+      padding: .5rem .9rem; border-radius: 10px; font-size: 13px; z-index: 30;
+      opacity: 0; pointer-events: none; transition: opacity .2s; box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+    #toast.show { opacity: 1; }
+
+    /* terminal column wraps the scaled stage + the driver toolbar underneath it */
+    #termcol { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+
+    /* ── driver toolbar: reliable line input + quick keys ───────────
+       Mobile browsers don't reliably deliver keystrokes into xterm's hidden
+       textarea, so `clear`/commands never reached the PTY. This visible bar sends
+       the SAME encrypted `in` frames directly — works on any on-screen keyboard. */
+    #toolbar { border-top: 1px solid var(--line); background: var(--panel);
+      padding: .4rem .5rem; display: flex; flex-direction: column; gap: .4rem; }
+    #keys { display: flex; flex-wrap: wrap; gap: .35rem; }
+    #keys button { font: inherit; font-size: 12px; cursor: pointer; padding: .28rem .6rem;
+      border-radius: 8px; border: 1px solid #2a3547; background: #141a26; color: var(--ink); }
+    #keys button:hover { background: #1c2434; }
+    #keys button:disabled, #cmdform input:disabled, #cmdform button:disabled { opacity: .45; cursor: default; }
+    #cmdform { display: flex; gap: .4rem; }
+    #cmdform input { flex: 1; font: inherit; font-size: 14px; color: var(--ink);
+      background: #0b0f18; border: 1px solid #2a3547; border-radius: 8px; padding: .4rem .6rem; }
+    #cmdform button { font: inherit; font-size: 13px; border-radius: 8px;
+      border: 1px solid #285238; background: #16301f; color: var(--green); padding: 0 .9rem; }
+
+    /* ── help / command-catalogue sheet (metadata-only overlay) ──── */
+    #cmdsheet { position: fixed; inset: 0; z-index: 20; display: none;
+      background: rgba(4,6,11,.72); backdrop-filter: blur(2px);
+      align-items: center; justify-content: center; padding: 1rem; }
+    #cmdsheet.open { display: flex; }
+    #cmdsheet .panel { background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; max-width: 620px; width: 100%; max-height: 84vh; overflow: auto;
+      box-shadow: 0 12px 48px rgba(0,0,0,.6); }
+    #cmdsheet .head { position: sticky; top: 0; background: linear-gradient(180deg,#10151f,#0d1119);
+      border-bottom: 1px solid var(--line); padding: .7rem .9rem; display: flex; align-items: center;
+      gap: .5rem; }
+    #cmdsheet .head b { font-size: 14px; }
+    #cmdsheet .head #closesheet { margin-left: auto; }
+    #cmdsheet .body { padding: .8rem .9rem 1rem; font-size: 13px; line-height: 1.5; }
+    #cmdsheet h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .3px;
+      color: var(--dim); margin: 1rem 0 .5rem; }
+    #cmdsheet h3:first-child { margin-top: 0; }
+    #cmdsheet .note { color: var(--dim); font-size: 12px; margin: .3rem 0 .6rem; }
+    #cmdsheet .cmd { display: flex; align-items: baseline; gap: .5rem; padding: .3rem .4rem;
+      border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+    #cmdsheet .cmd:hover { background: #141a26; border-color: #2a3547; }
+    #cmdsheet .cmd code { flex: none; min-width: 9.5rem; }
+    #cmdsheet .cmd .desc { color: var(--dim); font-size: 12px; }
+    #cmdsheet code { background: #0b0f18; border: 1px solid #2a3547; border-radius: 5px;
+      padding: .05rem .35rem; color: var(--accent); font-size: 12px; }
+
+    /* ── mobile: phone-like stacked layout ─────────────────────── */
+    @media (max-width: 820px) {
+      main { flex-direction: column; }
+      #termcol { flex: 1 1 auto; }
+      #stage { flex: 1 1 auto; }
+      #cmdsheet .cmd code { min-width: 7.5rem; }
+      aside#chat { width: auto; flex: none; border-left: none;
+                   border-top: 1px solid var(--line); max-height: 38vh; }
+      aside#chat.collapsed { max-height: 0; overflow: hidden; border-top: none; }
+      #chattoggle { display: inline-block; font: inherit; font-size: 11px; cursor: pointer;
+        padding: .18rem .6rem; border-radius: 999px; border: 1px solid #2a3547;
+        background: #141a26; color: var(--ink); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="dot"></span>
+    <span id="label">hack-house room</span>
+    <span class="badge ro" id="mode">view-only</span>
+    <button id="drive" hidden>Request drive</button>
+    <span class="badge" id="viewers">— viewers</span>
+    <button id="sharebtn" hidden>share</button>
+    <button id="qrbtn" hidden>QR</button>
+    <button id="helpbtn">help ⌘</button>
+    <button id="chattoggle">chat</button>
+    <span id="status">connecting…</span>
+  </header>
+  <main>
+    <div id="termcol">
+      <div id="stage">
+        <div id="termwrap"></div>
+        <!-- Way back to the live tail. Hidden until you are actually scrolled up. -->
+        <button id="tolive" type="button" hidden>▼ live</button>
+      </div>
+      <!-- Driver toolbar: reliable keystroke path for touch devices. Enabled only
+           while this browser actually holds drive; otherwise it hints to request it. -->
+      <div id="toolbar">
+        <div id="keys">
+          <button data-key="tab" title="Tab">Tab</button>
+          <button data-key="esc" title="Escape">Esc</button>
+          <button data-key="ctrlc" title="Ctrl-C (interrupt)">^C</button>
+          <button data-key="up" title="Up arrow">↑</button>
+          <button data-key="down" title="Down arrow">↓</button>
+          <button data-key="clear" title="Clear the screen">clear</button>
+          <button data-key="enter" title="Enter">⏎ Enter</button>
+          <!-- Clipboard. `copy` reads what this browser already decrypted, so it
+               works for view-only guests too; `paste` is input and is gated with
+               the rest of the toolbar. -->
+          <button id="copybtn" title="Copy the selection, or the visible screen">copy</button>
+          <button id="pastebtn" title="Paste the clipboard into the terminal — needs drive" disabled>paste</button>
+        </div>
+        <form id="cmdform" autocomplete="off">
+          <input id="cmdinput" placeholder="request drive to type a command…"
+                 autocomplete="off" autocapitalize="off" autocorrect="off"
+                 spellcheck="false" maxlength="2000" disabled />
+          <button type="submit" disabled>run ⏎</button>
+        </form>
+      </div>
+    </div>
+    <aside id="chat">
+      <h2>room chat <input id="chatname" placeholder="your name" maxlength="24" /><button
+          id="namesetbtn" type="button" title="update your display name in the room">set</button></h2>
+      <div id="chatlog">
+        <div class="sys">End-to-end encrypted chat. What you send posts into the
+          live room; messages from the room appear here. Type <b>/send</b> (or tap
+          📎) to offer a file to the host — they have to accept it in their
+          terminal before anything leaves this device.</div>
+      </div>
+      <form id="chatform" autocomplete="off">
+        <!-- The picker is hidden and driven by the paperclip / `/send`. On mobile
+             this same input surfaces the camera and photo library for free. -->
+        <input id="filepick" type="file" hidden />
+        <button type="button" id="attach" title="send a file to the host (they must accept)">📎</button>
+        <button type="button" id="savevm" title="save the live VM's current state to your machine (the host must approve)">💾 VM</button>
+        <input id="chatinput" placeholder="message the room…  ( /send )" autocomplete="off" maxlength="2000" />
+        <button type="submit">send</button>
+      </form>
+    </aside>
+  </main>
+
+  <!-- help / command-catalogue overlay (metadata-only; no egress) -->
+  <div id="cmdsheet" aria-hidden="true">
+    <div class="panel">
+      <div class="head">
+        <b>hack-house · commands</b>
+        <button id="closesheet" class="badge" style="cursor:pointer">close ✕</button>
+      </div>
+      <div class="body">
+        <p class="note">Everything listed here works from this browser. hack-house's
+          other slash commands belong to the native TUI and are deliberately not
+          reachable from a share link, so they are not listed — typing one here just
+          posts it to the room as chat.</p>
+        <h3>chat commands — tap to load into the chat box</h3>
+        <div id="chatcmds"></div>
+        <p class="note">Anything else you type in the chat box is sent to the room as
+          an ordinary message. Asking the agent a question is just chat, but
+          <code>/ai !…</code> and <code>/ai confirm</code> make it <i>act</i> in the
+          sandbox, so they need the same <b>drive</b> approval as typing does —
+          without it they are refused rather than posted.</p>
+        <h3>quick shell actions — tap to load into the command bar</h3>
+        <p class="note">These need <b>drive</b>. The command bar and quick-keys under
+          the terminal send keystrokes reliably from any phone keyboard — that is what
+          makes <code>clear</code> and shell commands work on mobile, where the raw
+          terminal often can't capture typing.</p>
+        <div id="shellcmds"></div>
+        <h3>buttons, not commands</h3>
+        <div id="uicmds"></div>
+        <p class="note">The room <b>owner</b> must run <code>/grant web-publisher</code>
+          in the native TUI before your keystrokes reach the shell — that's the drive
+          ACL, and the web deliberately can't bypass it.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Share / QR sheet — re-share THIS link (slug + #k). The QR is rendered from
+       location.href locally; the key is never sent to any QR/image service. -->
+  <div id="qrsheet" aria-hidden="true">
+    <div class="panel">
+      <div class="head">
+        <b>invite to this room</b>
+        <button id="closeqr" class="badge" style="cursor:pointer">close ✕</button>
+      </div>
+      <div class="body">
+        <img id="qrimg" alt="room QR code" />
+        <p id="qrhint">Scan to open the same view-only room. Anyone with this link
+          (slug&nbsp;+&nbsp;<b>#k</b>) can read the terminal — treat it like a password.</p>
+        <code id="qrurl"></code>
+        <button id="qrcopy" class="badge" style="cursor:pointer">copy link</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Display-name prompt (first entry). The chosen handle is chat-only: it is
+       carried inside the E2E chat payload, so the relay never learns who is who. -->
+  <div id="namesheet" aria-hidden="true">
+    <div class="panel">
+      <div class="head"><b>choose a display name</b></div>
+      <div class="body">
+        <p>This name appears on your chat messages in the room. It stays end-to-end
+           encrypted — the relay never sees it. You can change it anytime in the
+           chat panel.</p>
+        <form id="nameform" autocomplete="off">
+          <input id="nameinput" maxlength="24" placeholder="your name"
+                 autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
+          <button type="submit">Join</button>
+        </form>
+        <p id="forgetline">Stored on this device for this room only. On a shared
+           machine, type <b>/forget</b> in chat to erase it again.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Incoming-file prompt. A room member is sending a file to the web viewers.
+       Browsers are RECEIVE-ONLY: accepting streams the file (publisher-proxied,
+       re-encrypted under #k) into memory, verifies its SHA-256 against the
+       sender's offer, then downloads it. The description helps establish trust. -->
+  <div id="filesheet" aria-hidden="true">
+    <div class="panel">
+      <div class="head"><b>incoming file</b></div>
+      <div class="body">
+        <div id="filemeta">
+          <div class="frow"><span class="fk">name</span><span id="filename" class="fv"></span></div>
+          <div class="frow"><span class="fk">size</span><span id="filesize" class="fv"></span></div>
+          <div class="frow"><span class="fk">from</span><span id="filefrom" class="fv"></span></div>
+          <div class="frow"><span class="fk">what</span><span id="filedesc" class="fv"></span></div>
+        </div>
+        <p id="filesha" class="filesha"></p>
+        <p class="filewarn">Only accept files from senders you trust. The transfer
+          is end-to-end encrypted and verified against the sender's checksum, but
+          its <b>contents</b> are not scanned — treat it like any download.</p>
+        <div class="filebtns">
+          <button id="filedecline" type="button" class="btn-decline">Decline</button>
+          <button id="fileaccept" type="button" class="btn-accept">Accept &amp; download</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"
+          integrity="sha384-/nfmYPUzWMS6v2atn8hbljz7NE0EI1iGx34lJaNzyVjWGDzMv+ciUZUeJpKA3Glc"
+          crossorigin="anonymous"></script>
+  <script>
+  (function () {
+    "use strict";
+
+    // slug from /r/<slug>; the #k fragment (P1 key) is read but never sent anywhere.
+    const slug = location.pathname.split("/").filter(Boolean).pop();
+    const _frag = new URLSearchParams(location.hash.slice(1));
+    const fragKey = _frag.get("k"); // P1 seam
+    // PIN KDF parameters travel in the fragment beside the key, NOT from the relay.
+    // The relay used to disclose these to any unauthenticated caller that opened
+    // /sub; it no longer knows them at all. Absent for a room without a PIN.
+    const fragPinSalt = _frag.get("s");
+    const fragPinIter = parseInt(_frag.get("i") || "0", 10);
+
+    // Persistent pseudonymous browser identity (P0 drive-wedge fix). Sent in `hello`
+    // so a flapping mobile socket reclaims the SAME server viewer_id across a
+    // reconnect — keeping the drive approval / roster stable instead of desyncing.
+    // Opaque and per-tab (sessionStorage), it survives a page reload but asserts no
+    // privilege — the publisher's ACL + approval remain the only drive gate (spec §7).
+    // B8: the fallback used to be Date.now() + Math.random(), which Safari private
+    // mode actually reaches. The relay hands back the same viewer_id for a known
+    // client_id, so a guessable one inherits whatever that viewer was approved for.
+    // getRandomValues is always present in a secure context; if it is not, this page
+    // has no crypto at all and nothing below would work anyway.
+    const randHex = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)))
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+    let clientId = "";
+    try {
+      clientId = sessionStorage.getItem("hh_cid_" + slug) || "";
+      if (!clientId) {
+        clientId = "c_" + ((crypto.randomUUID && crypto.randomUUID()) || randHex(16));
+        sessionStorage.setItem("hh_cid_" + slug, clientId);
+      }
+    } catch (e) {
+      clientId = "c_" + randHex(16);
+    }
+
+    // B2 — the identity that actually decides drive. `viewer_id` is minted by the
+    // RELAY, so a hostile relay could relabel an unapproved viewer's keystroke frame
+    // as the approved driver's and reach the PTY without holding any key. `vsid` is
+    // minted HERE and travels only inside the ciphertext, so the relay never learns
+    // it and cannot forge one; the publisher pins it at approval time.
+    //
+    // Kept in sessionStorage next to client_id and for the same reason: the relay
+    // reissues the same viewer_id across a reload, so the identity paired with it
+    // has to survive too or a reload silently loses drive.
+    let vsid;
+    try {
+      const stored = sessionStorage.getItem("hh_vsid_" + slug);
+      if (stored && /^[0-9a-f]{32}$/.test(stored)) {
+        vsid = new Uint8Array(stored.match(/../g).map((h) => parseInt(h, 16)));
+      } else {
+        vsid = crypto.getRandomValues(new Uint8Array(16));
+        sessionStorage.setItem("hh_vsid_" + slug,
+          Array.from(vsid).map((b) => b.toString(16).padStart(2, "0")).join(""));
+      }
+    } catch (e) {
+      vsid = crypto.getRandomValues(new Uint8Array(16));
+    }
+    // Monotonic per-frame counter so the publisher can drop a replayed `in` frame —
+    // the relay can hold any frame and re-send it later. Seeded from the clock so it
+    // keeps rising across a reload without persisting a counter on every keystroke;
+    // restarting at 0 would look exactly like a replay and lock out the keyboard.
+    let inCtr = Date.now();
+    const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${wsScheme}//${location.host}/sub/${slug}`;
+
+    const term = new Terminal({
+      convertEol: false, cursorBlink: false,
+      // History depth. A single build or log dump blows past a few hundred lines,
+      // and a guest who scrolls up to read what happened should reach the start of
+      // the session rather than a wall. Cost is roughly a kilobyte per line, so
+      // this is bounded rather than infinite.
+      scrollback: 10000,
+      // Default is one line per wheel notch, which on a long transcript means
+      // scrolling for a minute to get anywhere; on a phone the grid is scaled
+      // down by fitScale(), which makes a drag cover even less. Both of these are
+      // multipliers on that.
+      scrollSensitivity: 5, fastScrollSensitivity: 15,
+      fontFamily: "ui-monospace, Menlo, monospace", fontSize: 14,
+      theme: { background: "#0b0e14" },
+    });
+    term.open(document.getElementById("termwrap"));
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (t) => { $("status").textContent = t; };
+
+    // Scale the terminal as a whole so the remote's authoritative 80×24 grid
+    // always fits the viewport width — fixes mobile clipping ("ear" → "clear")
+    // and makes `clear` visibly reset, WITHOUT resizing the shared remote PTY.
+    let fitPending = false;
+    function fitScale() {
+      const wrap = $("termwrap"), stage = $("stage");
+      if (!wrap || !stage) return;
+      wrap.style.transform = "none";
+      const natW = wrap.offsetWidth, natH = wrap.offsetHeight;
+      if (!natW || !natH) return;
+      const availW = stage.clientWidth - 8;   // minus stage padding
+      const scale = Math.min(1, availW / natW);
+      wrap.style.transform = "scale(" + scale + ")";
+      // transform doesn't shrink layout box, so pin stage height to scaled size
+      stage.style.height = Math.ceil(natH * scale) + "px";
+    }
+    function scheduleFit() {
+      if (fitPending) return;
+      fitPending = true;
+      requestAnimationFrame(() => { fitPending = false; fitScale(); });
+    }
+    window.addEventListener("resize", scheduleFit);
+    window.addEventListener("orientationchange", scheduleFit);
+
+    // ── touch devices: keep keystrokes off xterm's hidden textarea ────────
+    // An on-screen keyboard types into that textarea through an IME composition. The
+    // composing word is only a LOCAL preview, and committing it — space or enter —
+    // clears the preview; the commit itself frequently never surfaces as xterm
+    // `onData`, so nothing is sent and the PTY never echoes it back. What the user
+    // sees is "my text disappeared when I hit space". The command bar below sends the
+    // same encrypted `in` frames with no IME in the path, so on a coarse pointer we
+    // route typing there and never raise a keyboard over the grid.
+    const touchInput = !!(window.matchMedia && matchMedia("(pointer: coarse)").matches);
+    if (touchInput) {
+      if (term.textarea) term.textarea.inputMode = "none";  // tap the grid, no keyboard
+      $("stage").addEventListener("click", () => {
+        const inp = $("cmdinput");
+        if (!inp.disabled) inp.focus();
+      });
+    }
+
+    // ── scrollback: a visible way back to the live tail ──────────────────
+    // xterm keeps the history, but fitScale() scales the grid — and xterm's
+    // scrollbar with it — so on a phone there is no usable handle and no obvious
+    // way back down once you have scrolled up to read something. This is that way
+    // back, and it doubles as the indicator that you are *not* looking at live
+    // output, which is otherwise easy to miss on a quiet terminal.
+    function atLiveTail() {
+      const b = term.buffer.active;
+      return b.viewportY >= b.baseY;
+    }
+    function updateLiveBtn() { $("tolive").hidden = atLiveTail(); }
+    term.onScroll(updateLiveBtn);
+    $("tolive").addEventListener("click", () => {
+      term.scrollToBottom();
+      updateLiveBtn();
+    });
+
+    // mobile chat drawer toggle (metadata-only panel; no egress change)
+    $("chattoggle").addEventListener("click", () => {
+      const opening = $("chat").classList.contains("collapsed");
+      $("chat").classList.toggle("collapsed");
+      scheduleFit();
+      if (opening) maybePromptName();  // first-visit name prompt lives with chat, not room entry
+    });
+
+    // standard base64 → bytes.
+    function b64ToBytes(b64) {
+      const bin = atob(b64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    // bytes → standard base64 (for chat ct/nonce on the JSON wire).
+    function bytesToB64(bytes) {
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin);
+    }
+    // base64url (unpadded) → bytes — the #k key encoding.
+    function b64urlToBytes(s) {
+      s = s.replace(/-/g, "+").replace(/_/g, "/");
+      while (s.length % 4) s += "=";
+      return b64ToBytes(s);
+    }
+
+    // The E2E key lives ONLY in the #fragment (spec §7); no #k → nothing renders.
+    // What we keep is not `#k` but four HKDF sub-keys of it, one per channel —
+    // see `deriveKeys` and `cmd_chat/web/webkdf.py`, which must agree exactly.
+    let keys = null;   // {out, in, chat, file}
+    // P2 drive state: my server-assigned viewer_id, the current driver's id, and
+    // the live subscribe socket (so the drive button / keystrokes can send).
+    let myViewerId = null, driverId = null, sock = null;
+    // Set when the server tells us the room is over (an `end` frame). Without it
+    // `onclose` cannot tell a deliberate ending from a dropped network, so the
+    // page would retry forever against a room that is gone.
+    let ended = false;
+    // Access PIN (defence-in-depth), wire proto 8: we PROVE knowledge of the PIN by
+    // signing a nonce the relay mints, rather than sending it a value it compares
+    // against a stored copy. The relay holds only the Ed25519 public key, so there
+    // is nothing in it to steal and replay — under v7 the stored digest *was* the
+    // credential. The #k fragment still gates *reading*; the PIN gates *opening*.
+    //
+    // The signing key is derived from the PIN and never leaves this page; what
+    // crosses the wire is one signature over one single-use nonce.
+    let roomPinKey = null;       // CryptoKey (Ed25519 private), never the PIN
+    // Ed25519 seeds are raw 32 bytes, but WebCrypto only imports them PKCS8-wrapped.
+    // This is the fixed DER prefix for a Curve25519 private key (OID 1.3.101.112);
+    // the seed is appended verbatim. Must match the publisher's
+    // Ed25519PrivateKey.from_private_bytes(seed).
+    const ED25519_PKCS8_PREFIX = hexToBytes("302e020100300506032b657004220420");
+    async function derivePinKey(pin, salt, iter) {
+      const enc = new TextEncoder();
+      const base = await crypto.subtle.importKey(
+        "raw", enc.encode(pin), { name: "PBKDF2" }, false, ["deriveBits"]);
+      const seed = new Uint8Array(await crypto.subtle.deriveBits(
+        { name: "PBKDF2", salt: hexToBytes(salt), iterations: iter, hash: "SHA-256" },
+        base, 256));
+      const pkcs8 = new Uint8Array(ED25519_PKCS8_PREFIX.length + seed.length);
+      pkcs8.set(ED25519_PKCS8_PREFIX, 0);
+      pkcs8.set(seed, ED25519_PKCS8_PREFIX.length);
+      return crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false,
+                                     ["sign"]);
+    }
+    async function signPinNonce(key, nonceHex) {
+      return bytesToHex(new Uint8Array(
+        await crypto.subtle.sign({ name: "Ed25519" }, key, hexToBytes(nonceHex))));
+    }
+    function hexToBytes(h) {
+      const out = new Uint8Array(h.length >> 1);
+      for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
+      return out;
+    }
+    function bytesToHex(b) {
+      return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    }
+    // `#k` is a master secret and encrypts nothing itself. Each channel gets its
+    // own AES-256 key by HKDF-SHA256 with a distinct `info` label, so a nonce that
+    // repeats across two channels is not a catastrophe and a framing bug in one
+    // channel is not a framing bug in all four. Mirrored EXACTLY in
+    // `cmd_chat/web/webkdf.py` — empty salt, `hh/<channel>` info, 32-byte output.
+    const CHANNELS = ["out", "in", "chat", "file"];
+    async function deriveKeys() {
+      if (!fragKey) return false;
+      try {
+        const raw = b64urlToBytes(fragKey);
+        // A short `#k` used to be silently accepted, which meant the page could be
+        // running AES-128 while every doc on the project promised AES-256. Refuse.
+        if (raw.length < 32) return false;
+        const master = await crypto.subtle.importKey(
+          "raw", raw, "HKDF", false, ["deriveKey"]);
+        const enc = new TextEncoder();
+        const derived = {};
+        for (const c of CHANNELS) {
+          derived[c] = await crypto.subtle.deriveKey(
+            { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(0),
+              info: enc.encode("hh/" + c) },
+            master, { name: "AES-GCM", length: 256 }, false,
+            ["decrypt", "encrypt"]);
+        }
+        keys = derived;
+        return true;
+      } catch (e) { return false; }
+    }
+
+    // Additional authenticated data — the routing metadata the RELAY controls,
+    // folded into the AEAD tag. GCM authenticates it without encrypting it, so it
+    // costs nothing on the wire and turns every relay-side edit into a decrypt
+    // failure: renumbering a frame to push `lastSeq` past the rest of the
+    // transcript, passing an `out` off as a `snapshot`, or replaying a frame from
+    // another room all stop working. Mirrored EXACTLY in publisher.py::_aad — the
+    // two must agree byte for byte or nothing decrypts.
+    const aadEnc = new TextEncoder();
+    const aadFor = (kind, seq) => aadEnc.encode(`hh1|${slug}|${kind}|${seq || 0}`);
+
+    // AES-256-GCM decrypt raw nonce/ct byte arrays → PTY bytes. Throws (caller
+    // skips) on any auth failure — a wrong/absent key, or a tampered header,
+    // renders nothing.
+    // `aad` omitted means this frame type is not bound yet — currently the chat and
+    // file paths. Only the transcript (`out`/`snapshot`) and the keystroke path
+    // (`in`) are bound, because those are the ones where relay-side relabelling buys
+    // an attacker something: reaching the PTY, or censoring what the viewer sees.
+    async function decryptRaw(chan, nonceBytes, ctBytes, aad) {
+      const params = { name: "AES-GCM", iv: nonceBytes };
+      if (aad) params.additionalData = aad;
+      const pt = await crypto.subtle.decrypt(params, keys[chan], ctBytes);
+      return new Uint8Array(pt);
+    }
+    // JSON+base64 frame path (sync/resume/ring): decode base64 then decrypt.
+    // `chan` picks the sub-key; `kind` is the AAD label, and the two differ for
+    // `snapshot`, which is transcript content and so rides the `out` key.
+    async function decodeFrame(frame, chan, kind) {
+      return decryptRaw(chan, b64ToBytes(frame.nonce), b64ToBytes(frame.ct),
+                        kind ? aadFor(kind, frame.seq) : null);
+    }
+    // AES-256-GCM encrypt one keystroke burst under the `in` sub-key. Fresh 12-byte
+    // nonce per frame; the relay only ever sees ciphertext (spec §6). The plaintext
+    // is prefixed with vsid(16) || ctr(6 BE) so the publisher learns who really
+    // sent it and can drop a replay — neither field is visible to the relay.
+    //
+    // B7: GCM ciphertext is plaintext+16, so an unpadded frame handed the relay the
+    // exact byte length of every burst — including one character at a time into a
+    // `sudo` prompt. The payload is therefore zero-padded to a 64-byte bucket and
+    // its true length carried in a 2-byte field, so ordinary typing is a stream of
+    // identical-sized frames. Must match publisher.py::_IN_HDR / _IN_BUCKET.
+    const IN_BUCKET = 64, IN_HDR = 24;
+    async function encodeInputRaw(bytes) {
+      inCtr = Math.max(inCtr + 1, Date.now());
+      const n = Math.min(bytes.length, 65535);
+      const total = Math.ceil((IN_HDR + n) / IN_BUCKET) * IN_BUCKET;
+      const pt = new Uint8Array(total);   // zero-filled: the tail IS the padding
+      pt.set(vsid, 0);
+      let c = inCtr;
+      for (let i = 5; i >= 0; i--) { pt[16 + i] = c % 256; c = Math.floor(c / 256); }
+      pt[22] = (n >> 8) & 255; pt[23] = n & 255;
+      pt.set(bytes.subarray(0, n), IN_HDR);
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const ct = await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce, additionalData: aadFor("in", 0) }, keys["in"], pt);
+      return { ctArr: new Uint8Array(ct), nonceArr: nonce };
+    }
+
+    const encoder = new TextEncoder();
+    const amDriving = () => myViewerId && driverId && myViewerId === driverId;
+
+    // Reflect drive state in the badge + button. Read-only is the resting state.
+    function updateMode() {
+      const mode = $("mode"), drive = $("drive");
+      const driving = amDriving();
+      if (driving) {
+        requested = false;
+        mode.textContent = "driving"; mode.className = "badge driving";
+        drive.hidden = false; drive.textContent = "Release drive";
+      } else if (requested && !driverId) {
+        mode.className = "badge ro";
+        mode.textContent = "requested — waiting for approval + room grant";
+        drive.hidden = false; drive.textContent = "Requested…";
+      } else {
+        mode.className = "badge ro";
+        mode.textContent = driverId ? "view-only (other driving)" : "view-only";
+        drive.hidden = false;
+        drive.textContent = driverId ? "Drive busy" : "Request drive";
+      }
+      toolbarEnabled(driving);  // command bar / quick keys only usable while driving
+    }
+
+    // Local "I've asked" flag so tapping the button gives immediate feedback even
+    // though approval (Gate B) + the room drive-grant (Gate A) happen out-of-band
+    // and we don't become `driver` until BOTH land. Cleared once we drive, release,
+    // or the socket drops.
+    let requested = false;
+    $("drive").addEventListener("click", () => {
+      if (!sock || sock.readyState !== WebSocket.OPEN) return;
+      if (amDriving()) { requested = false; sock.send(JSON.stringify({ type: "release-drive" })); }
+      else if (!driverId) {
+        requested = true;
+        // Re-announce first. The sync-time announce is lost if the publisher was not
+        // attached to the relay yet (the relay does not queue `in` frames), and the
+        // publisher refuses to approve a label it holds no vsid for — so without
+        // this the operator sees "that viewer has not identified itself".
+        announceVsid();
+        sock.send(JSON.stringify({ type: "request-drive" }));
+        updateMode();
+      }
+    });
+
+    // Keystrokes: encrypt under #k and send as a compact BINARY `in` frame
+    // (0x03 | nonce(12) | ct) — but only while we actually hold drive. Otherwise
+    // dropped client-side (the publisher's ACL is the real gate; this just avoids
+    // noise). The relay can never read them. (JSON `in` remains a server-side
+    // fallback for non-binary clients.)
+    // Single keystroke egress path: encrypt raw bytes under #k and send the compact
+    // binary `in` frame (0x03 | nonce(12) | ct). Shared by xterm's own capture AND
+    // the touch toolbar/command bar below — so mobile input is as reliable as a
+    // physical keyboard. Dropped client-side unless we hold drive (the publisher's
+    // ACL is the real gate; this just avoids noise). The relay can never read it.
+    async function sendInputFrame(bytes) {
+      if (!keys || !sock || sock.readyState !== WebSocket.OPEN) return;
+      const { ctArr, nonceArr } = await encodeInputRaw(bytes);
+      const buf = new Uint8Array(1 + 12 + ctArr.length);
+      buf[0] = 0x03; buf.set(nonceArr, 1); buf.set(ctArr, 13);
+      sock.send(buf);
+    }
+    // B7 (second half): bucketing hid the *length* of a burst; this blunts its
+    // *timing*. Keystrokes are held for up to 30 ms and sent as one frame, so the
+    // relay sees a frame roughly every 30 ms during typing rather than one frame
+    // per key with inter-key gaps — and inter-key gaps are what published
+    // keystroke-timing attacks recover passwords from. 30 ms is under the ~100 ms
+    // where echo starts to feel laggy, and above a fast typist's inter-key gap, so
+    // most bursts merge.
+    //
+    // RESIDUAL, stated plainly: this hides gaps *within* a burst, not the fact that
+    // typing is happening at all, nor when it starts and stops. Only constant-rate
+    // cover traffic closes that, which is out of scope — see SECURITY.md.
+    const IN_COALESCE_MS = 30;
+    let inPending = [], inTimer = null;
+    function flushInput() {
+      inTimer = null;
+      if (!inPending.length) return;
+      let n = 0;
+      for (const b of inPending) n += b.length;
+      const merged = new Uint8Array(n);
+      let o = 0;
+      for (const b of inPending) { merged.set(b, o); o += b.length; }
+      inPending = [];
+      sendInputFrame(merged);
+    }
+    function sendInputBytes(bytes) {
+      if (!amDriving() || !bytes.length) return;
+      inPending.push(bytes);
+      if (inTimer === null) inTimer = setTimeout(flushInput, IN_COALESCE_MS);
+    }
+    // An `in` frame with an EMPTY payload: no keystrokes, just this page telling the
+    // publisher which vsid belongs to its viewer_id. Sent on every connect, before
+    // any approval could happen, so the operator always has a real identity to pin —
+    // the publisher refuses to approve a label it has no vsid for, which is what
+    // stops a hostile relay choosing who gets approved.
+    const announceVsid = () => sendInputFrame(new Uint8Array(0));
+    const sendInputStr = (s) => sendInputBytes(encoder.encode(s));
+
+    // xterm's own capture (physical keyboards / desktop) funnels through the same path.
+    term.onData((data) => { sendInputStr(data); });
+
+    // ── driver toolbar (spec §6 input path; touch-reliable) ──────────────
+    // Common control keys mobile keyboards hide, sent as raw terminal bytes.
+    const KEY_BYTES = { tab: "\t", esc: "\x1b", ctrlc: "\x03", up: "\x1b[A", down: "\x1b[B", enter: "\r" };
+    function toolbarEnabled(on) {
+      // Only the key-sending buttons; `copy` is not an input path and stays live
+      // for view-only guests.
+      $("keys").querySelectorAll("button[data-key]").forEach((b) => { b.disabled = !on; });
+      $("pastebtn").disabled = !on;
+      $("cmdinput").disabled = !on;
+      $("cmdform").querySelector("button").disabled = !on;
+      $("cmdinput").placeholder = on
+        ? "type a command, then run ⏎ …"
+        : "request drive to type a command…";
+    }
+    $("keys").addEventListener("click", (e) => {
+      const btn = e.target.closest("button");
+      if (!btn || btn.disabled) return;
+      const k = btn.dataset.key;
+      if (k === "clear") { sendInputStr("\x15clear\r"); return; }  // ^U wipes any partial line first
+      const seq = KEY_BYTES[k];
+      if (seq) sendInputStr(seq);
+    });
+    $("cmdform").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const inp = $("cmdinput");
+      const line = inp.value;
+      sendInputStr((line || "") + "\r");  // empty line = a bare Enter
+      inp.value = "";
+      inp.focus();
+    });
+
+    // ── help / command catalogue ─────────────────────────────────────────
+    // Only what a *browser guest* can actually do. A guest is a bearer-link
+    // holder, not a room member, so most of hh's slash commands are out of reach
+    // by design: everything the chat form does not handle itself is encrypted and
+    // posted to the room as a chat message. The publisher then prefixes it with
+    // `<handle>: `, which is exactly what stops guest text from ever being read as
+    // a control frame. So listing e.g. `/grant` here would be a lie — it would
+    // just appear in the room as chat.
+    //
+    // File transfer is not listed at all: `/send` and `/cancel` still work as
+    // verbs for anyone with the muscle memory, but both have a button right where
+    // they are needed (📎 and the cancel on the upload's own status line), so
+    // teaching a command for them is noise.
+    //
+    // Two lists, two destinations: CHAT_CMDS load into the chat box, SHELL_CMDS
+    // into the command bar (which needs drive). UI_ACTIONS are not typed at all.
+    const CHAT_CMDS = [
+      ["/ai <question>", "ask the room's AI agent"],
+      ["/ai <name> <question>", "ask one agent by name, when several are in the room"],
+      ["/ai list", "list agents in the room and the models available"],
+      ["/ai models", "list the model profiles the host has configured"],
+      ["/ai !<task>", "have the agent DO it in the sandbox — needs drive"],
+      ["/ai confirm", "approve a step the agent held back as destructive — needs drive"],
+      ["/forget", "erase your name and this device's room identity, then reload"],
+    ];
+    const SHELL_CMDS = [
+      ["clear", "clear the screen"],
+      ["ls -la", "list files, detailed"],
+      ["pwd", "print working directory"],
+      ["whoami", "current user"],
+    ];
+    const UI_ACTIONS = [
+      ["Request drive", "in the header — ask the host to let you type"],
+      ["📎", "next to the chat box — offer a file to the host"],
+      ["cancel", "on the upload's own status line — stop it mid-transfer"],
+      ["Accept & download", "appears when the host sends you a file"],
+      ["name", "in the header — the display name shown on your messages"],
+      ["share · QR", "re-share this link; the key never leaves your browser"],
+      ["copy", "under the terminal — copy the selection, or the whole screen"],
+      ["paste", "under the terminal — paste into the shell; needs drive"],
+    ];
+    // `into` is the input a tap should populate, or null for a reference-only row.
+    function mkCmdRow([code, desc], into) {
+      const row = document.createElement("div");
+      row.className = "cmd";
+      const c = document.createElement("code"); c.textContent = code;
+      const d = document.createElement("span"); d.className = "desc"; d.textContent = desc;
+      row.appendChild(c); row.appendChild(d);
+      if (!into) {
+        row.style.cursor = "default";
+      } else {
+        row.addEventListener("click", () => {
+          const inp = $(into);
+          // Placeholders are for the reader, not the shell — drop them and leave
+          // the caret where the guest types, rather than sending `<question>`.
+          // A separator only where one belongs: `/ai !<task>` becomes `/ai !`,
+          // and the agent reads the task as everything straight after the bang.
+          const stem = code.replace(/\s*<[^>]*>/g, "");
+          inp.value = (stem === code || stem.endsWith("!")) ? stem : stem + " ";
+          closeSheet();
+          if (!inp.disabled) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+        });
+      }
+      return row;
+    }
+    CHAT_CMDS.forEach((c) => $("chatcmds").appendChild(mkCmdRow(c, "chatinput")));
+    SHELL_CMDS.forEach((c) => $("shellcmds").appendChild(mkCmdRow(c, "cmdinput")));
+    UI_ACTIONS.forEach((c) => $("uicmds").appendChild(mkCmdRow(c, null)));
+
+    function openSheet() { $("cmdsheet").classList.add("open"); }
+    function closeSheet() { $("cmdsheet").classList.remove("open"); }
+    $("helpbtn").addEventListener("click", openSheet);
+    $("closesheet").addEventListener("click", closeSheet);
+    $("cmdsheet").addEventListener("click", (e) => { if (e.target === $("cmdsheet")) closeSheet(); });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        closeSheet();
+        $("qrsheet").classList.remove("open");
+        $("namesheet").classList.remove("open");
+      }
+    });
+
+    // ── invite / share (options 1 + 2) ──────────────────────────────────
+    // This browser already holds the #k read-key (it's decrypting the terminal),
+    // so re-sharing location.href leaks nothing new. The link IS the credential:
+    // slug + #k grants read access, so share it only over trusted channels.
+    let toastT = null;
+    function flash(msg) {
+      const t = $("toast"); t.textContent = msg; t.classList.add("show");
+      clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 1600);
+    }
+    // navigator.clipboard needs a secure context; a room served over plain http on
+    // a tailnet or a LAN IP is not one, so the legacy textarea path is the norm
+    // here, not an exotic fallback.
+    async function writeClipboard(text, okMsg) {
+      try { await navigator.clipboard.writeText(text); flash(okMsg); return; }
+      catch (e) { /* fall through to legacy path (non-secure context) */ }
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+      ta.remove();
+      flash(ok ? okMsg : "copy failed — select the text and copy it yourself");
+    }
+    async function copyLink() { await writeClipboard(location.href, "link copied"); }
+    async function shareLink() {
+      const url = location.href;
+      if (navigator.share) {                       // native share sheet on mobile
+        try { await navigator.share({ title: "hack-house room",
+              text: "Join my hack-house terminal (view-only)", url }); return; }
+        catch (e) { if (e && e.name === "AbortError") return; }  // user dismissed
+      }
+      copyLink();                                  // desktop / no Web Share → clipboard
+    }
+
+    // ── terminal clipboard: copy out (anyone) / paste in (drivers only) ──
+    // Copying is a read of what this browser has *already* decrypted, so it needs
+    // nothing from the room. Pasting is INPUT and goes through sendInputStr, the
+    // same path as every keystroke — so a view-only guest's paste is refused
+    // exactly like their typing is. There is deliberately no second route to the
+    // PTY: the driver-token ACL stays the only gate.
+
+    // What `copy` grabs: the selection if there is one, else the whole visible
+    // screen. On a phone there is never a selection — fitScale() puts a CSS
+    // transform over the grid and the hidden textarea is inputMode="none" — so
+    // "the screen" is what makes the button useful there at all.
+    function screenText() {
+      const buf = term.buffer.active;
+      const rows = [];
+      for (let i = 0; i < term.rows; i++) {
+        const line = buf.getLine(buf.viewportY + i);
+        rows.push(line ? line.translateToString(true) : "");
+      }
+      while (rows.length && !rows[rows.length - 1]) rows.pop();  // drop trailing blanks
+      return rows.join("\n");
+    }
+    async function copyTerminal() {
+      const sel = term.getSelection();
+      const text = sel || screenText();
+      if (!text) { flash("nothing to copy"); return; }
+      await writeClipboard(text, sel ? "selection copied" : "screen copied");
+    }
+
+    // A paste containing a line break RUNS as soon as it lands. That is the classic
+    // paste-hijack: text copied from a web page carries a trailing newline, or a
+    // second command hidden past the visible one, and it executes in a terminal the
+    // whole room is watching before anyone can read it. So anything that would
+    // submit is confirmed first, with the line count and a preview.
+    const PASTE_MAX = 4096;
+    function pasteIntoTerminal(text) {
+      if (!text) return;
+      if (!amDriving()) { flash("you need drive to paste"); return; }
+      if (text.length > PASTE_MAX) {
+        flash("paste too large (" + text.length + " chars, max " + PASTE_MAX + ")");
+        return;
+      }
+      const norm = text.replace(/\r\n?/g, "\n");
+      if (norm.includes("\n")) {
+        const lines = norm.split("\n").filter((l) => l.trim());
+        const preview = lines.slice(0, 3).join("\n") + (lines.length > 3 ? "\n…" : "");
+        const ok = confirm(
+          "This paste runs " + lines.length + " line(s) in the shared terminal " +
+          "immediately:\n\n" + preview + "\n\nEveryone in the room sees the result. Send it?");
+        if (!ok) { flash("paste cancelled"); return; }
+      }
+      sendInputStr(norm.replace(/\n/g, "\r"));  // terminals want CR, not LF
+    }
+    async function pasteFromClipboard() {
+      if (!amDriving()) { flash("you need drive to paste"); return; }
+      let text = "";
+      try { text = await navigator.clipboard.readText(); }
+      catch (e) {
+        // Firefox implements no readText for pages at all, and Safari refuses it
+        // outside a gesture it trusts. An ordinary paste into the command bar
+        // needs no permission, so send them there rather than failing flat.
+        flash("your browser blocks clipboard reads — paste into the command bar");
+        const inp = $("cmdinput"); if (!inp.disabled) inp.focus();
+        return;
+      }
+      if (!text) { flash("clipboard is empty"); return; }
+      pasteIntoTerminal(text);
+    }
+    // Desktop Ctrl-V / ⌘V lands on xterm's hidden textarea, which would hand the
+    // text straight to onData unchecked. Take it first so one confirm covers both
+    // routes in.
+    if (term.textarea) {
+      term.textarea.addEventListener("paste", (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const cd = e.clipboardData || window.clipboardData;
+        pasteIntoTerminal(cd ? cd.getData("text") : "");
+      }, true);
+    }
+    $("copybtn").addEventListener("click", copyTerminal);
+    $("pastebtn").addEventListener("click", pasteFromClipboard);
+
+    // Lazy-load a pinned, SRI-checked QR encoder ONLY when asked. The URL is
+    // encoded locally (createDataURL) — it never reaches any QR/image service.
+    let qrLibP = null;
+    function loadQRLib() {
+      if (window.qrcode) return Promise.resolve();
+      if (qrLibP) return qrLibP;
+      qrLibP = new Promise((res, rej) => {
+        const s = document.createElement("script");
+        s.src = "https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js";
+        s.integrity = "sha384-8FWZA6BGMXhsfO+BLtrJK0We6gg5o1JyO8xQm6peWDEUs17ACA5ziE/NIAkl9z2k";
+        s.crossOrigin = "anonymous";
+        s.onload = res; s.onerror = () => rej(new Error("qr lib load failed"));
+        document.head.appendChild(s);
+      });
+      return qrLibP;
+    }
+    async function openQR() {
+      const url = location.href;
+      $("qrurl").textContent = url;
+      $("qrsheet").classList.add("open");
+      try {
+        await loadQRLib();
+        const qr = qrcode(0, "M");                  // 0 = auto-size, medium ECC
+        qr.addData(url); qr.make();
+        $("qrimg").src = qr.createDataURL(6, 2);
+      } catch (e) {
+        $("qrimg").removeAttribute("src");
+        $("qrhint").textContent = "couldn't load the QR renderer (offline?) — use “copy link”.";
+      }
+    }
+
+    if (fragKey) { $("sharebtn").hidden = false; $("qrbtn").hidden = false; }  // no key → nothing to share
+    $("sharebtn").addEventListener("click", shareLink);
+    $("qrbtn").addEventListener("click", openQR);
+    $("qrcopy").addEventListener("click", copyLink);
+    $("closeqr").addEventListener("click", () => $("qrsheet").classList.remove("open"));
+    $("qrsheet").addEventListener("click", (e) => { if (e.target === $("qrsheet")) $("qrsheet").classList.remove("open"); });
+
+    // ── chat (spec §6): read+send, E2E under the same #k ─────────────────
+    // A viewer handle, persisted locally. It is carried INSIDE the encrypted
+    // payload — the relay never sees who is chatting.
+    // Keyed PER ROOM, and per-room only. There used to be a global `hh_name` kept
+    // as a "last used" prefill hint, which defeated the per-room keying it sat
+    // next to: the same handle was offered to every room on this origin, so two
+    // unrelated hosts could correlate the same guest from the name alone. A
+    // convenience is not worth a cross-room identifier. Legacy copies are deleted
+    // on sight rather than left behind on people's devices.
+    const nameKey = "hh_name_" + slug;
+    let myName = "", storedName = false;
+    try {
+      localStorage.removeItem("hh_name");
+      const s = localStorage.getItem(nameKey);
+      if (s) { myName = s; storedName = true; }
+    } catch (e) {}
+    if (!myName) myName = "guest-" + Math.random().toString(36).slice(2, 6);
+    $("chatname").value = myName;
+    // Announce the chosen name into the room roster, E2E under #k. Opt-in
+    // de-anonymisation: until this fires the host sees the derived `web-xxxx`
+    // pseudonym. The relay only tags it with our viewer_id — the name rides
+    // inside the ciphertext, so the relay never learns it.
+    async function sendName() {
+      if (!keys || !sock || sock.readyState !== WebSocket.OPEN) return;
+      const pt = encoder.encode(JSON.stringify({ name: myName }));
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const ct = new Uint8Array(await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce }, keys["chat"], pt));
+      sock.send(JSON.stringify({
+        type: "name", ct: bytesToB64(ct), nonce: bytesToB64(nonce),
+      }));
+    }
+    // #chatname is the single source of truth for later changes.
+    $("chatname").addEventListener("change", () => {
+      myName = ($("chatname").value || "").trim().slice(0, 24) || "guest";
+      storedName = true;
+      try { localStorage.setItem(nameKey, myName); } catch (e) {}
+      sendName();
+    });
+    // Explicit commit — mobile keyboards often never fire the input's `change`
+    // event (no blur, "done" doesn't count), so the name silently never pushed.
+    // The button always commits + re-announces, and blurs to drop the keyboard.
+    $("namesetbtn").addEventListener("click", () => {
+      commitName($("chatname").value);
+      try { $("chatname").blur(); } catch (e) {}
+      flash("name set to “" + myName + "”");
+    });
+
+    // First-run display-name prompt: shown once (no stored name) so the user
+    // chooses/confirms their handle before chatting. Persisted to localStorage;
+    // the name never leaves the E2E payload, so the relay stays blind to it.
+    function commitName(v) {
+      myName = (v || "").trim().slice(0, 24) || myName || "guest";
+      storedName = true;
+      $("chatname").value = myName;
+      // Per-room key only — see `nameKey` above for why there is no global one.
+      try { localStorage.setItem(nameKey, myName); } catch (e) {}
+      sendName();
+    }
+
+    // "Forget me on this device" — everything this page has ever persisted, in one
+    // place, so a guest on a shared or borrowed machine has an actual exit. Nothing
+    // here is a secret, but together the name plus the stable client_id/vsid are a
+    // durable local record that you were in this room, and there was no way to
+    // remove it. Reloads afterwards so the page comes back with a fresh identity.
+    function forgetMe() {
+      try {
+        localStorage.removeItem(nameKey);
+        localStorage.removeItem("hh_name");          // legacy global, pre-B11
+        sessionStorage.removeItem("hh_cid_" + slug);
+        sessionStorage.removeItem("hh_vsid_" + slug);
+      } catch (e) {}
+      sysLine("forgot your name and this device's room identity — reloading. " +
+              "You will rejoin as a new guest and will need drive approval again.");
+      setTimeout(() => { try { location.reload(); } catch (e) {} }, 600);
+    }
+    function openNameSheet() {
+      $("nameinput").value = myName;
+      $("namesheet").classList.add("open");
+      setTimeout(() => { try { $("nameinput").focus(); $("nameinput").select(); } catch (e) {} }, 30);
+    }
+    // One-time first-visit handle prompt, tied to CHAT engagement (never room entry):
+    // the name is chat-only, so gating the view-only terminal on it hid the whole UI.
+    let namePrompted = false;
+    function maybePromptName() {
+      if (namePrompted || storedName) return;
+      namePrompted = true;
+      openNameSheet();
+    }
+    $("chatinput").addEventListener("focus", maybePromptName);  // desktop: chat panel always visible
+    $("nameform").addEventListener("submit", (e) => {
+      e.preventDefault();
+      commitName($("nameinput").value);
+      $("namesheet").classList.remove("open");
+      if (!$("chatinput").disabled) $("chatinput").focus();
+    });
+
+    const chatDecoder = new TextDecoder();
+    let lastChatSeq = 0;
+    function renderChat(from, text) {
+      const log = $("chatlog");
+      const row = document.createElement("div");
+      row.className = "msg";
+      const who = document.createElement("span");
+      who.className = "who"; who.textContent = (from || "?") + ": ";
+      row.appendChild(who);
+      row.appendChild(document.createTextNode(text || ""));  // textNode = no HTML injection
+      const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+      log.appendChild(row);
+      if (atBottom) log.scrollTop = log.scrollHeight;
+    }
+    // Decrypt an opaque chat frame {seq, ct, nonce} → {from, text, ts} and render.
+    // Chat has its own seq space (publisher's _chat_seq) so reconnect de-dupes.
+    async function applyChat(frame) {
+      if (!keys || !frame || !frame.ct) return;
+      try {
+        const seq = frame.seq;
+        if (typeof seq === "number" && seq <= lastChatSeq) return;  // dup on resync
+        const pt = await decryptRaw("chat", b64ToBytes(frame.nonce), b64ToBytes(frame.ct));
+        const obj = JSON.parse(chatDecoder.decode(pt));
+        renderChat(obj.from, obj.text);
+        if (typeof seq === "number") lastChatSeq = seq;
+      } catch (e) { /* forged/undecryptable → skip */ }
+    }
+    // Send a chat message: encrypt {from, text} under #k, post as a JSON `chat`
+    // frame. The room echo brings it back for display (single source of truth),
+    // so we do NOT optimistically render it here (avoids duplicates).
+    $("chatform").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const input = $("chatinput");
+      const text = (input.value || "").trim();
+      if (!text || !keys || !sock || sock.readyState !== WebSocket.OPEN) return;
+      input.value = "";
+      // `/send` never leaves the browser as chat — it opens the file picker.
+      // Match on the VERB, not the whole line. The help overlay used to list the
+      // native app's forms (`/send <user> <file>`, `/sendroom <file>`), so a guest
+      // who typed what they were shown fell through and posted their command into
+      // the room as an ordinary chat message — which looks like success here and
+      // arrives as nothing on the host, with no offer to /accept. The overlay now
+      // shows `/send <file>`, but keep matching the verb: `/sendroom` is muscle
+      // memory for anyone who also uses the TUI.
+      const verb = text.split(/\s+/, 1)[0].toLowerCase();
+      if (verb === "/send" || verb === "/sendroom") {
+        if (text !== verb) {
+          sysLine(`“${verb}” takes no arguments from the browser — the file comes ` +
+                  `off this device, and the host chooses who receives it.`);
+        }
+        pickUpload();
+        return;
+      }
+      if (verb === "/cancel") { cancelUpload(); return; }
+      if (verb === "/forget") { forgetMe(); return; }
+      // No `from`: the publisher posts under the roster handle it holds for this
+      // viewer (prefixed `web/`) and ignores anything we assert, so sending a name
+      // here would only be a claim nobody reads. Set your name with /name — that
+      // goes through the roster, which is the thing the host actually sees.
+      const pt = encoder.encode(JSON.stringify({ text }));
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const ct = new Uint8Array(await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce }, keys["chat"], pt));
+      sock.send(JSON.stringify({
+        type: "chat", ct: bytesToB64(ct), nonce: bytesToB64(nonce),
+      }));
+    });
+
+    // ── uploads: this device → the host (docs/plan-web-upload.md) ────────
+    // The reverse of the delivery path above, and a very different trust story:
+    // this page is reachable by anyone the share link was forwarded to, so an
+    // upload is an OFFER, never a write. Nothing leaves this browser until the
+    // host has answered the /accept prompt in their terminal — the `upload_ack`
+    // below IS that answer. Everything travels encrypted under the same #k, so
+    // the relay carries the file without ever being able to read it.
+    const UP_CHUNK = 64 * 1024;          // matches the room's own chunk size
+    const UP_MAX = 25 * 1024 * 1024;     // publisher's WEB_UPLOAD_MAX
+    const UP_BUFFER_HIGH = 1024 * 1024;  // pause while the socket is this far behind
+    let upActive = null;   // {tok, name, bytes, sent, cancelled, acked}
+
+    function sysLine(text) {
+      const log = $("chatlog");
+      const row = document.createElement("div");
+      row.className = "sys";
+      row.textContent = text;
+      const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+      log.appendChild(row);
+      if (atBottom) log.scrollTop = log.scrollHeight;
+      return row;
+    }
+    async function upSend(type, obj) {
+      if (!keys || !sock || sock.readyState !== WebSocket.OPEN) return false;
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const ct = new Uint8Array(await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce }, keys["file"], encoder.encode(JSON.stringify(obj))));
+      sock.send(JSON.stringify({
+        type, tok: upActive ? upActive.tok : "", seq: obj.seq || 0,
+        ct: bytesToB64(ct), nonce: bytesToB64(nonce),
+      }));
+      return true;
+    }
+    function pickUpload() {
+      if (upActive) { sysLine("an upload is in progress — cancel it first"); return; }
+      $("filepick").click();
+    }
+    async function cancelUpload() {
+      if (!upActive) { sysLine("nothing to cancel"); return; }
+      // Flag first so the streaming loop stops before the next chunk, then tell
+      // the publisher so it releases the slot rather than waiting for a timeout.
+      upActive.cancelled = true;
+      const name = upActive.name;
+      await upSend("upload-cancel", { tok: upActive.tok });
+      upEnd(`↑ “${name}” — cancelled`);
+    }
+    $("attach").addEventListener("click", pickUpload);
+    // Ask the host to save the LIVE VM state and send it to me. The host approves
+    // (/accept-save); the resulting .tar arrives as a normal file offer, which the
+    // Accept handler streams straight to disk (see acceptOffer streaming path).
+    $("savevm").addEventListener("click", () => {
+      if (!sock || sock.readyState !== WebSocket.OPEN) { flash("not connected"); return; }
+      sock.send(JSON.stringify({ type: "savevm" }));
+      flash("requested a VM save — waiting for the host to approve…");
+    });
+    $("filepick").addEventListener("change", async (e) => {
+      const file = (e.target.files || [])[0];
+      e.target.value = "";                      // so re-picking the same file fires
+      if (!file || upActive) return;
+      if (file.size === 0 || file.size > UP_MAX) {
+        sysLine(`“${file.name}” is ${fmtSize(file.size)} — the limit is ${fmtSize(UP_MAX)}`);
+        return;
+      }
+      // WebCrypto has no streaming digest, so the file must be resident to hash
+      // it — which is exactly why the cap above is 25 MB and not 100. Hashing
+      // here (not in the publisher) keeps the integrity claim on this device:
+      // the host verifies the bytes against a digest we computed over the file
+      // we actually hold, so nothing in between can corrupt it undetectably.
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+      const sha = Array.from(digest).map(b => b.toString(16).padStart(2, "0")).join("");
+      // randHex, not randomUUID: the same B8 reasoning as `clientId` above — this
+      // is the one remaining unguarded randomUUID call, and where it is missing
+      // (Safari private mode) it throws rather than degrading, killing the upload.
+      upActive = { tok: randHex(8), name: file.name,
+                   bytes, sent: 0, cancelled: false, acked: false };
+      // The only way to abort used to be typing `/cancel`, which made the help
+      // sheet teach a command for something the guest is already looking at. The
+      // status line owns its own button instead; `upEnd` removes it.
+      upActive.row = sysLine("");
+      upActive.label = document.createElement("span");
+      upActive.label.textContent =
+        `↑ offering “${file.name}” (${fmtSize(file.size)}) — waiting for the host to accept… `;
+      upActive.stop = document.createElement("button");
+      upActive.stop.className = "badge";
+      upActive.stop.style.cursor = "pointer";
+      upActive.stop.textContent = "cancel";
+      upActive.stop.addEventListener("click", cancelUpload);
+      upActive.row.append(upActive.label, upActive.stop);
+      // Hashing a large file takes long enough for the socket to flap underneath
+      // us, and `upSend` no-ops when it is not OPEN. Discarding that answer left
+      // the guest reading "waiting for the host to accept…" over a frame that
+      // never left this device — indistinguishable, from here, from a host who
+      // simply had not looked yet. Say so instead, and free the slot to retry.
+      const sent = await upSend("upload-offer", { tok: upActive.tok, name: file.name,
+                                                  size: file.size, sha256: sha });
+      if (!sent) upEnd(`↑ “${file.name}” — not connected; try again once reconnected`);
+    });
+    function upEnd(text) {
+      if (upActive && upActive.row) {
+        upActive.row.textContent = text;   // drops the cancel button with it
+      } else {
+        sysLine(text);
+      }
+      upActive = null;
+    }
+    async function upStream() {
+      // Paced by the socket's own backlog: the relay drops viewers whose queue
+      // runs too far behind, so an unthrottled upload would evict the uploader
+      // mid-transfer. Yielding while `bufferedAmount` is high keeps us under that.
+      const u = upActive;
+      let seq = 0;
+      while (u && !u.cancelled && u.sent < u.bytes.length) {
+        if (!sock || sock.readyState !== WebSocket.OPEN) { upEnd("↑ upload failed — connection lost"); return; }
+        if (sock.bufferedAmount > UP_BUFFER_HIGH) {
+          await new Promise(r => setTimeout(r, 50));
+          continue;
+        }
+        const end = Math.min(u.sent + UP_CHUNK, u.bytes.length);
+        const slice = u.bytes.subarray(u.sent, end);
+        seq += 1;
+        await upSend("upload-chunk", { seq, data: bytesToB64(slice) });
+        u.sent = end;
+        if (u.label) {
+          // Write to the label, not the row — the row also holds the cancel
+          // button, and mid-transfer is exactly when it is wanted.
+          u.label.textContent = `↑ sending “${u.name}” — ${Math.round(100 * u.sent / u.bytes.length)}% `;
+        }
+      }
+      if (u && !u.cancelled) await upSend("upload-done", { tok: u.tok });
+    }
+    async function applyUpload(type, frame) {
+      if (!keys || !upActive) return;
+      let obj = {};
+      try {
+        obj = JSON.parse(chatDecoder.decode(
+          await decryptRaw("file", b64ToBytes(frame.nonce), b64ToBytes(frame.ct))));
+      } catch (e) { return; }
+      if (obj.tok && obj.tok !== upActive.tok) return;   // a stale transfer's echo
+      if (type === "upload_ack") {
+        if (upActive.acked) return;
+        upActive.acked = true;
+        upStream();
+      } else if (type === "upload_reject") {
+        upEnd(`↑ “${upActive.name}” — the host declined`);
+      } else if (type === "upload_error") {
+        upEnd(`↑ “${upActive.name}” — ${obj.msg || "upload refused"}`);
+      } else if (type === "upload_progress" && obj.complete) {
+        upEnd(`↑ “${upActive.name}” delivered — the host's terminal verifies it`);
+      }
+    }
+
+    // ── file delivery (spec §8): publisher-proxied, receive-only ─────────
+    // A room member's file is decrypted by the publisher and re-encrypted under
+    // the SAME #k, then streamed here as file_offer → file_chunk* → file_done.
+    // The browser holds the whole payload in RAM (hence the publisher's ~100MB
+    // web cap), verifies SHA-256 against the (authenticated) offer, then downloads
+    // it. We serialise: one popup / one active download at a time, queuing extra
+    // offers. That is purely this browser's own pacing — accepting is per-viewer, so
+    // another viewer taking the same file never costs us ours (the publisher re-serves
+    // late accepters from its retained copy).
+    let ftOffer = null;      // offer shown in the popup {tok,name,size,sha256,dir,from,desc}
+    let ftActive = null;     // in-flight download {tok,name,sha256,dir,chunks:[],received}
+    const ftQueue = [];      // offers waiting behind an open popup / active download
+
+    function fmtSize(n) {
+      n = Number(n) || 0;
+      const u = ["B", "KB", "MB", "GB"]; let i = 0;
+      while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+      return (i === 0 ? n : (n < 10 ? n.toFixed(1) : Math.round(n))) + " " + u[i];
+    }
+    function openFileSheet(meta) {
+      $("filename").textContent = meta.name || "file";
+      $("filesize").textContent = fmtSize(meta.size) + (meta.dir ? " · directory archive" : "");
+      $("filefrom").textContent = meta.from || "a room member";
+      $("filedesc").textContent = meta.desc || "—";
+      const sha = (meta.sha256 || "").toLowerCase();
+      $("filesha").textContent = sha ? "sha256 " + sha.slice(0, 16) + "…" + sha.slice(-8) : "";
+      $("filesheet").classList.add("open");
+    }
+    // Show the next queued offer, but only when nothing else is on screen / in flight.
+    function showNextOffer() {
+      if (ftOffer || ftActive) return;
+      const meta = ftQueue.shift();
+      if (!meta) return;
+      ftOffer = meta;
+      openFileSheet(meta);
+    }
+    async function onFileOffer(m) {
+      if (!keys || !m || !m.ct) return;
+      let meta;
+      try { meta = JSON.parse(chatDecoder.decode(await decodeFrame(m, "file"))); }
+      catch (e) { return; }  // forged/undecryptable → ignore
+      if (!meta || !meta.tok) return;
+      ftQueue.push(meta);
+      showNextOffer();
+    }
+    async function acceptOffer() {
+      const meta = ftOffer; ftOffer = null;
+      $("filesheet").classList.remove("open");
+      if (!meta) return;
+      if (!sock || sock.readyState !== WebSocket.OPEN) { flash("not connected — offer lost"); return; }
+      ftActive = { tok: meta.tok, name: meta.name, sha256: (meta.sha256 || "").toLowerCase(),
+                   dir: !!meta.dir, size: meta.size, chunks: [], received: 0, writable: null };
+      // STREAMING: for a large payload (a VM .tar can be hundreds of MB), buffering
+      // every chunk into one Blob would need 2–3× the file in RAM and crash the tab.
+      // The File System Access API lets us write each chunk straight to a file the
+      // user picks, so RAM stays flat regardless of size. `showSaveFilePicker` needs
+      // a user gesture — this runs from the Accept click, so it's allowed. If it's
+      // unsupported (Firefox/Safari) or the user cancels the picker, fall back to the
+      // in-RAM Blob path (fine for small files). Per-chunk AES-GCM already
+      // authenticates the bytes; the whole-file sha256 check is only done in the Blob
+      // path (we can't buffer the whole file to hash it while streaming).
+      if (window.showSaveFilePicker && (meta.size || 0) >= 8 * 1024 * 1024) {
+        try {
+          const handle = await window.showSaveFilePicker({ suggestedName: meta.name || "download" });
+          ftActive.writable = await handle.createWritable();
+        } catch (e) {
+          if (e && e.name === "AbortError") { ftActive = null; flash("save cancelled"); showNextOffer(); return; }
+          ftActive.writable = null;  // API present but failed → Blob fallback
+        }
+      }
+      sock.send(JSON.stringify({ type: "file-accept", tok: meta.tok }));
+      flash((ftActive.writable ? "streaming “" : "receiving “") + (meta.name || "file") + "”…");
+    }
+    function declineOffer() {
+      const meta = ftOffer; ftOffer = null;
+      $("filesheet").classList.remove("open");
+      if (meta && sock && sock.readyState === WebSocket.OPEN)
+        sock.send(JSON.stringify({ type: "file-reject", tok: meta.tok }));
+      showNextOffer();
+    }
+    async function onFileChunk(m) {
+      if (!ftActive || !keys || !m || !m.ct) return;
+      let raw;
+      try { raw = await decodeFrame(m, "file"); }  // → Uint8Array of file bytes
+      catch (e) { return; }
+      if (ftActive.writable) {
+        // Stream straight to disk — flat RAM. Serialise writes so chunks land in order.
+        ftActive._w = (ftActive._w || Promise.resolve()).then(() => ftActive.writable.write(raw));
+        try { await ftActive._w; } catch (e) { flash("save write failed"); }
+      } else {
+        ftActive.chunks.push(raw);
+      }
+      ftActive.received += raw.length;
+    }
+    async function onFileDone(m) {
+      const dl = ftActive; ftActive = null;
+      if (!dl) { showNextOffer(); return; }
+      if (dl.writable) {
+        // Streamed to disk: flush + close. Whole-file sha256 is skipped (we never
+        // buffered it); per-chunk AES-GCM auth already guarantees byte integrity.
+        try { await (dl._w || Promise.resolve()); await dl.writable.close(); }
+        catch (e) { flash("download failed — could not finalise the file"); showNextOffer(); return; }
+        flash("“" + (dl.name || "file") + "” streamed to disk (" + fmtSize(dl.received) + ")");
+        showNextOffer();
+        return;
+      }
+      const blob = new Blob(dl.chunks, { type: "application/octet-stream" });
+      // Integrity: the sha256 rode inside the authenticated (AES-GCM) offer.
+      if (dl.sha256) {
+        try {
+          const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+          const got = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+          if (got !== dl.sha256) { flash("download failed — checksum mismatch"); showNextOffer(); return; }
+        } catch (e) { /* WebCrypto digest unavailable (insecure ctx) → skip verify */ }
+      }
+      triggerDownload(blob, dl.name);
+      flash("“" + (dl.name || "file") + "” downloaded");
+      showNextOffer();
+    }
+    async function onFileError(m) {
+      let info = {};
+      try { info = JSON.parse(chatDecoder.decode(await decodeFrame(m, "file"))); } catch (e) {}
+      ftActive = null;  // our accept failed → free the slot
+      flash(info.msg || "file transfer failed");
+      showNextOffer();
+    }
+    // Hand a completed Blob to a download. Desktop + Android Chrome honour the
+    // <a download> attribute; iOS Safari ignores it, so prefer the Web Share API
+    // (share sheet → Save to Files) and fall back to opening the blob in a new tab.
+    function triggerDownload(blob, name) {
+      name = name || "download";
+      const ua = navigator.userAgent || "";
+      const isIOS = /iP(hone|ad|od)/.test(ua) ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+      if (isIOS && navigator.canShare) {
+        try {
+          const file = new File([blob], name, { type: blob.type });
+          if (navigator.canShare({ files: [file] })) {
+            navigator.share({ files: [file], title: name }).catch(() => {});
+            return;
+          }
+        } catch (e) { /* fall through to blob URL */ }
+      }
+      const url = URL.createObjectURL(blob);
+      const supportsDownload = "download" in document.createElement("a");
+      if (supportsDownload && !isIOS) {
+        const a = document.createElement("a");
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+      } else {
+        window.open(url, "_blank");  // iOS last resort: long-press → Save
+      }
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+    $("fileaccept").addEventListener("click", acceptOffer);
+    $("filedecline").addEventListener("click", declineOffer);
+
+    // Preserve frame order despite async decrypt: chain all terminal mutations on
+    // one promise. `lastSeq` is the highest applied `seq` — sent on reconnect so
+    // the relay can replay just the delta (spec §5.3), and used to skip duplicate
+    // frames from a snapshot/resync overlap.
+    let writeChain = Promise.resolve();
+    let lastSeq = 0;
+    // Every terminal write funnels through here, so it is also where the live-tail
+    // indicator is refreshed: a reset (resync) or a burst of output while scrolled
+    // up moves the tail without moving the viewport, and xterm's onScroll only
+    // fires for the latter.
+    const enqueueWrite = (fn) => {
+      writeChain = writeChain.then(fn).catch(() => {}).then(updateLiveBtn);
+    };
+
+    // The transcript is append-only and `seq` is contiguous on the wire (the
+    // publisher assigns it at encrypt time, after its drop-oldest queue), so a hole
+    // means frames were withheld. Silently skipping them is how censorship goes
+    // unnoticed, so say it out loud — once per hole, not once per frame.
+    let gapWarned = 0;
+    function noteGap(from, to) {
+      if (to - from < 2 || gapWarned === to) return;
+      gapWarned = to;
+      sysLine(`⚠ transcript gap — frames ${from + 1}…${to - 1} never arrived. `
+            + `The relay cannot read this session, but it can withhold from it.`);
+    }
+
+    function applyOut(frame) {
+      if (!keys || !frame || !frame.ct) return;
+      enqueueWrite(async () => {
+        const seq = frame.seq;
+        if (typeof seq === "number" && seq <= lastSeq) return;  // dup replay → skip
+        term.write(await decodeFrame(frame, "out", "out"));
+        if (typeof seq === "number") { if (lastSeq) noteGap(lastSeq, seq); lastSeq = seq; }
+      });
+    }
+    // Binary `out` fast-path (0x01 | seq(4) | nonce(12) | ct). Same seq de-dupe as
+    // the JSON path; the ciphertext body is opaque to everyone but this key. The
+    // relay re-frames the publisher's JSON into this shape, so seq/nonce/ct — and
+    // therefore the AAD — are the publisher's own.
+    function applyOutBinary(buf) {
+      if (!keys) return;
+      const u = new Uint8Array(buf);
+      if (u.length < 1 + 4 + 12 || u[0] !== 0x01) return;
+      const seq = ((u[1] << 24) | (u[2] << 16) | (u[3] << 8) | u[4]) >>> 0;
+      const nonce = u.subarray(5, 17);
+      const ct = u.subarray(17);
+      enqueueWrite(async () => {
+        if (seq <= lastSeq) return;
+        term.write(await decryptRaw("out", nonce, ct, aadFor("out", seq)));
+        if (lastSeq) noteGap(lastSeq, seq);
+        lastSeq = seq;
+      });
+    }
+    // Full-state (re)build from a `sync`: reset, apply the snapshot, then the ring
+    // tail. Used for late join and for drop-to-latest resync.
+    function applySync(m) {
+      if (m.viewer_id) myViewerId = m.viewer_id;
+      if (m.label) $("label").textContent = m.label;
+      // Relay-supplied ints straight into term.resize() is a one-message memory DoS
+      // (cols*rows buffers), so clamp to something a terminal could plausibly be.
+      if (m.cols && m.rows) {
+        term.resize(Math.max(20, Math.min(500, m.cols | 0)),
+                    Math.max(5, Math.min(300, m.rows | 0)));
+      }
+      driverId = m.driver || null;
+      // B2: `term.reset()` used to fire on the relay's say-so alone, so an
+      // unauthenticated `sync` wiped the transcript on demand. The reset now happens
+      // only in the same write step as a snapshot that actually decrypts — if the
+      // AEAD refuses, decodeFrame throws, enqueueWrite swallows it, and the screen
+      // is left exactly as it was.
+      if (m.snapshot && m.snapshot.ct) {
+        enqueueWrite(async () => {
+          const pt = await decodeFrame(m.snapshot, "out", "snapshot");
+          term.reset();
+          lastSeq = 0;
+          gapWarned = 0;
+          term.write(pt);
+          const s = m.snapshot.seq;
+          if (typeof s === "number" && s > lastSeq) lastSeq = s;
+        });
+      }
+      (m.ring || []).forEach(applyOut);
+      (m.chat || []).forEach(applyChat);  // recent-chat backlog for late joiners
+      // Tell the publisher which vsid owns this viewer_id, before any approval can
+      // be made against it (B2).
+      announceVsid();
+      // Re-announce a deliberately chosen name so it survives reconnects (the
+      // publisher forgets guests on `viewer_left`). Fresh anonymous `guest-…`
+      // sessions stay pseudonymous — only an opted-in name is re-sent.
+      if (storedName) sendName();
+      updateMode();
+      scheduleFit();
+    }
+
+    // Set after a 4403 so the re-prompt says "incorrect" instead of asking blind.
+    let pinWasWrong = false;
+    // Answer the relay's `pin_challenge`. Prompts on first use, then reuses the
+    // derived key for the rest of the session (and across reconnects) so a flapping
+    // mobile socket does not ask for the PIN over and over.
+    async function answerPinChallenge(ws, nonceHex) {
+      try {
+        if (!roomPinKey) {
+          // The KDF parameters come from the link fragment, not the relay. A link
+          // without them cannot open a gated room — that is a malformed or
+          // truncated share URL, not a wrong PIN, so say which.
+          if (!fragPinSalt || !fragPinIter) {
+            setStatus("this share link is missing its PIN parameters — ask for a fresh link");
+            return;
+          }
+          const entered = window.prompt(
+            pinWasWrong ? "Incorrect PIN — try again:" : "This room requires a PIN:");
+          pinWasWrong = false;
+          if (!entered) { setStatus("PIN required to view this room"); ended = true; ws.close(); return; }
+          setStatus("verifying PIN…");
+          roomPinKey = await derivePinKey(entered, fragPinSalt, fragPinIter);
+        }
+        const sig = await signPinNonce(roomPinKey, nonceHex);
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ pin_sig: sig }));
+      } catch (e) {
+        // Most likely cause is a browser without WebCrypto Ed25519. Distinguish it
+        // from a bad PIN, because retrying will never help and the user needs to
+        // know to switch browsers rather than hunt for a typo.
+        roomPinKey = null;
+        const why = (e && /Ed25519|not supported|Unrecognized/i.test(String(e.message || e)))
+          ? "this browser lacks WebCrypto Ed25519 — use a current Firefox, Chrome or Safari"
+          : "could not derive the PIN key — try reloading";
+        setStatus(why);
+        ended = true;
+        try { ws.close(); } catch (_) {}
+      }
+    }
+
+    function connect() {
+      const ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";  // receive binary `out` frames (P4 optimization)
+      sock = ws;
+      // One hello carries: reconnect-by-seq (last_seq, spec §5.3), the binary opt-in,
+      // and the PIN if we have one. null last_seq on first connect → full sync.
+      ws.onopen = () => {
+        setStatus("connected · E2E");
+        // No PIN material rides the hello any more. If the room is gated the relay
+        // answers this with a `pin_challenge` and we sign its nonce — proof is
+        // per-connection, so there is nothing here worth capturing and replaying.
+        ws.send(JSON.stringify({ type: "hello",
+                                 last_seq: lastSeq > 0 ? lastSeq : null,
+                                 bin: true, client_id: clientId }));
+      };
+      ws.onclose = (ev) => {
+        sock = null; driverId = null; requested = false; updateMode();
+        if (ended) return;   // the server already told us why; don't retry
+        // 4403 PIN wrong → drop the derived key so the next challenge re-prompts,
+        // and reconnect to get a fresh nonce. 4401 means our proof was missing or
+        // malformed, which is a bug or a timed-out prompt rather than a bad guess.
+        if (ev.code === 4403) {
+          roomPinKey = null; pinWasWrong = true; connect(); return;
+        }
+        if (ev.code === 4401) {
+          setStatus("PIN required to view this room"); return;
+        }
+        if (ev.code === 4429) {  // rate-limited / PIN lockout
+          setStatus("rate-limited — retrying shortly…"); setTimeout(connect, 5000); return;
+        }
+        if (ev.code === 4503) { setStatus("room is full — retrying…"); setTimeout(connect, 4000); return; }
+        if (ev.code === 4404) { setStatus("room not found"); return; }
+        setStatus("disconnected — retrying…"); setTimeout(connect, 1500);
+      };
+      ws.onerror = () => setStatus("connection error");
+      ws.onmessage = (ev) => {
+        // Binary `out` fast-path — no JSON parse, no base64.
+        if (ev.data instanceof ArrayBuffer) { applyOutBinary(ev.data); return; }
+        let m; try { m = JSON.parse(ev.data); } catch { return; }
+        switch (m.type) {
+          case "pin_challenge":  // gated room: sign the nonce, stay connected
+            answerPinChallenge(ws, m.nonce);
+            break;
+          case "sync":       // full state (late join or drop-to-latest resync)
+            applySync(m);
+            break;
+          case "resume":     // delta replay: keep the screen; `out` frames follow
+            if (m.viewer_id) myViewerId = m.viewer_id;  // re-pin identity (P0 fix)
+            setStatus(`resumed @seq ${m.from_seq} · E2E`);
+            // Re-announce here too, not just on `sync`. A reconnect whose delta is
+            // still in the ring resumes instead of syncing, and the publisher may
+            // have dropped us from the roster while we were away — without this the
+            // host gets our pseudonym back until we set the name by hand again.
+            if (storedName) sendName();
+            break;
+          case "out":
+            applyOut(m);  // {seq, ct, nonce}
+            break;
+          case "chat":
+            applyChat(m);  // {seq, ct, nonce} → {from, text, ts}
+            break;
+          case "file_offer":  // a room member is sending a file to web viewers
+            onFileOffer(m);   // {seq, ct, nonce} → {tok, name, size, sha256, dir, from, desc}
+            break;
+          case "file_chunk":  // raw bytes of an accepted transfer (targeted to us)
+            onFileChunk(m);
+            break;
+          case "file_done":   // sender finished → assemble + verify + download
+            onFileDone(m);
+            break;
+          case "file_error":  // targeted transfer error (expired/busy)
+            onFileError(m);
+            break;
+          case "upload_ack":       // the host typed /accept — bytes may now move
+          case "upload_reject":    // the host declined
+          case "upload_error":     // refused: uploads off, too big, over quota
+          case "upload_progress":  // delivered to the host
+            applyUpload(m.type, m);
+            break;
+          case "upload_unavailable":
+            // Cleartext from the relay, not the host — it means the publisher was
+            // not connected to hear the offer at all. Distinct from a refusal:
+            // nothing was decided, so retrying is the right move.
+            if (upActive && (!m.tok || m.tok === upActive.tok))
+              upEnd(`↑ “${upActive.name}” — the host is not connected right now; try again in a moment`);
+            break;
+          case "resize":
+            // Clamped: these ints come from the relay, and term.resize allocates
+            // cols*rows of buffer.
+            if (m.cols && m.rows) {
+              term.resize(Math.max(20, Math.min(500, m.cols | 0)),
+                          Math.max(5, Math.min(300, m.rows | 0)));
+              scheduleFit();
+            }
+            break;
+          case "roster":
+            if (typeof m.viewers === "number")
+              $("viewers").textContent = m.viewers + " viewer" + (m.viewers === 1 ? "" : "s");
+            driverId = m.driver || null;  // whose drive badge to show
+            updateMode();
+            break;
+          case "end": {
+            ended = true;
+            // A restart is not the host's decision, and the link does not survive
+            // it: the relay keeps nothing on disk, so the room and its K_web are
+            // both gone. Say that, rather than leaving the guest re-loading a URL
+            // that can never work again.
+            const restart = m.reason === "relay_restart";
+            const short = restart ? "relay restarted — this link is dead"
+                        : m.reason === "ended_by_operator" ? "ended by the relay operator"
+                        : "room ended";
+            const long = restart
+              ? "— the relay restarted; ask the host for a new link —"
+              : m.reason === "ended_by_operator"
+              ? "— ended by the relay operator —"
+              : "— room ended —";
+            setStatus(short);
+            term.writeln("\r\n\x1b[33m" + long + "\x1b[0m");
+            ws.close();
+            break;
+          }
+        }
+      };
+    }
+
+    // Refuse to render without the fragment key — the relay is blind, so no key
+    // means no readable screen (this is the point of the ZK design, spec §7).
+    (async () => {
+      if (!(await deriveKeys())) {
+        $("mode").textContent = "no key";
+        setStatus("missing or short #k fragment — cannot decrypt");
+        term.writeln("\x1b[31mThis room is end-to-end encrypted.\x1b[0m");
+        term.writeln("The share URL must include its \x1b[1m#k=…\x1b[0m fragment key to view.");
+        term.writeln("A key shorter than 32 bytes is refused, not downgraded.");
+        return;
+      }
+      scheduleFit();
+      connect();
+    })();
+  })();
+  </script>
+</body>
+</html>

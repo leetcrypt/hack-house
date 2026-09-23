@@ -1,9 +1,13 @@
 //! TUI application state, network event model, and the async run loop.
 
 use crate::ft;
-use crate::layout::Layout;
+use crate::layout::{Dir, Layout, Resize};
+use crate::music;
 use crate::net::{self, Session};
+use crate::persona::{self, Persona};
+use crate::registry;
 use crate::sbx;
+use crate::snapshot;
 use crate::theme::Theme;
 use crate::ui;
 use anyhow::Result;
@@ -20,6 +24,7 @@ use crossterm::terminal::{
 use futures_util::{SinkExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -56,6 +61,15 @@ pub struct User {
     pub username: String,
 }
 
+/// A browser viewer of the web relay, surfaced as a display-only roster guest
+/// from the publisher's `_web:presence` frame. Holds only view-only `#k` (no
+/// room socket), so it is never a real `User`.
+#[derive(Clone)]
+pub struct WebGuest {
+    pub handle: String,
+    pub driving: bool,
+}
+
 /// An in-progress incoming transfer we accepted. Chunks stream straight to a
 /// disk-backed `Sink` (created lazily on the first chunk) so a multi-GB payload
 /// never sits in RAM.
@@ -80,14 +94,36 @@ pub enum Net {
     Init {
         lines: Vec<ChatLine>,
         users: Vec<User>,
+        /// Reachable onion address ("<id>.onion:<port>") when the room is hosted
+        /// with --tor, else empty. Surfaced so `/share` can print a connect block.
+        onion: String,
+        /// Shareable (label, addr) connect addresses for the room's bind —
+        /// tailscale/lan/host. Empty for a loopback-only bind. Used by `/share`.
+        reach: Vec<(String, String)>,
     },
     Message(ChatLine),
     Roster {
         users: Vec<User>,
         capacity: usize,
+        /// Room host (kick authority) username, or None if unknown/empty.
+        host: Option<String>,
     },
     Joined(String),
     Left(String),
+    /// A member was force-kicked by the host (server-enforced).
+    Kicked {
+        username: String,
+        by: String,
+    },
+    /// The room password was rotated (e.g. after a kick) — clients adopt it so
+    /// `/pw`, `/share`, and reconnect use the new secret.
+    PasswordRotated {
+        password: String,
+    },
+    /// The server refused this client's `/kick` (not host / no such member).
+    KickDenied {
+        reason: String,
+    },
     SbxStatus {
         backend: String,
         ready: bool,
@@ -143,7 +179,45 @@ pub enum Net {
         by: String,
         vm: String,
     },
+    /// A peer asked for our shareable-VM catalog (`/sbx catalog @me`). `by` is the
+    /// server-authenticated requester; `to` is whom the request named (we act only
+    /// if it's us). We reply with a `_sbx:catalog` frame of our published VMs.
+    SbxCatReq {
+        by: String,
+        to: String,
+    },
+    /// A peer answered our `/sbx catalog @them` with their published-VM slice.
+    SbxCatalog {
+        by: String,
+        to: String,
+        items: Vec<CatalogItem>,
+    },
+    /// A peer asked us to hand over a published VM (`/sbx pull @me <label>`). If we
+    /// published `label`, we `/send` them its portable artifact.
+    SbxPullReq {
+        by: String,
+        to: String,
+        label: String,
+    },
+    /// The web publisher's `_web:presence` frame: the roster of browser viewers
+    /// (display-only). `publisher` is the server-stamped sender, not the claim.
+    WebPresence {
+        publisher: String,
+        guests: Vec<WebGuest>,
+    },
     Closed,
+}
+
+/// One row of a peer's shareable-VM catalog, as it rides the `_sbx:catalog` frame.
+/// A trimmed view of `registry::Entry` — enough for the requester to decide what
+/// to `/sbx pull`, without leaking host-local paths.
+#[derive(Clone, Debug, Default)]
+pub struct CatalogItem {
+    pub label: String,
+    pub purpose: String,
+    pub status: String,
+    pub tags: Vec<String>,
+    pub size_bytes: Option<u64>,
 }
 
 pub struct SbxView {
@@ -151,9 +225,9 @@ pub struct SbxView {
     pub backend: String,
 }
 
-/// The arrow-navigable VirtualBox VM picker, opened by a bare `/sbx launch vbox`
+/// The arrow-navigable VirtualBox VM picker, opened by a bare `/sbx vbox`
 /// (or `/sbx gui`). Holds the locally-registered VM names and the highlighted
-/// row; Enter/Tab fills `/sbx launch vbox gui <vm>` into the input, Esc dismisses.
+/// row; Enter/Tab fills `/sbx vbox gui <vm>` into the input, Esc dismisses.
 #[derive(Clone)]
 pub struct VboxPicker {
     pub vms: Vec<String>,
@@ -162,15 +236,65 @@ pub struct VboxPicker {
 
 /// A resizable region of the window, for interactive layout editing. Selected by
 /// clicking it (or cycling with F5); once selected, arrow keys resize it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Pane {
     Chat,
     Roster,
     Terminal,
+    /// The message/compose box at the bottom. Unlike the other three it lives
+    /// outside the BSP body tree (it's the frame's fixed bottom row), so its only
+    /// adjustable axis is height — grow it to read a long/wrapped message.
+    Input,
+}
+
+/// Launch parameters captured when `/sbx launch` needs root but sudo isn't
+/// cached. Held aside while the masked password modal collects the secret; the
+/// launch fires (with the password) once it's submitted.
+pub struct PendingSudoLaunch {
+    pub backend: sbx::Backend,
+    pub image: String,
+    pub members: Vec<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub start_daemon: bool,
+    pub install_first: bool,
+}
+
+/// Launch parameters captured when installing VirtualBox needs root but sudo
+/// isn't cached. Held aside while the masked password modal collects the secret;
+/// the install + VM boot fires (with the password) once it's submitted. Mirrors
+/// `PendingSudoLaunch` for the VirtualBox GUI path.
+pub struct PendingVboxInstall {
+    pub vm: String,
+    pub conflicts: Vec<sbx::VtxHolder>,
+    pub needs_install: bool,
+    pub needs_import: bool,
+    pub room: Arc<fernet::Fernet>,
+}
+
+/// What a submitted sudo password authorizes. The masked modal is shared; this
+/// records which privileged action to fire once the password is entered.
+pub enum PendingPrivileged {
+    /// Launch a container sandbox that needs root (binary install / daemon start).
+    Launch(PendingSudoLaunch),
+    /// Install VirtualBox (apt needs root), then boot the requested VM's GUI.
+    VboxInstall(PendingVboxInstall),
+}
+
+/// A local, masked sudo-password prompt. The typed password lives ONLY here —
+/// it never enters `App::input` (chat), a `ChatLine`, the PTY stream, or any
+/// outbound frame — until it's handed to `sudo -S` for the pending action.
+/// Deliberately no `Debug` derive so the secret can't be logged by accident.
+pub struct SudoPrompt {
+    pub password: String,
+    pub pending: PendingPrivileged,
 }
 
 pub struct App {
     pub me: String,
+    /// This client's pseudonymous signing identity. Signs every file offer and
+    /// backs `/export-signed`; loaded/persisted once at startup.
+    pub persona: Arc<Persona>,
     pub lines: Vec<ChatLine>,
     pub users: Vec<User>,
     pub capacity: usize,
@@ -205,8 +329,25 @@ pub struct App {
     pub error: Option<String>,
     /// The room password this client authenticated with (shown by `/pw`).
     pub password: String,
+    /// Reachable onion address ("<id>.onion:<port>") if the server is hosted with
+    /// --tor, else empty. Received in the init frame; used by `/share`.
+    pub onion: String,
+    /// Shareable (label, addr) connect addresses (tailscale/lan/host) for the
+    /// room's bind, from the init frame; empty for loopback-only. Used by `/share`.
+    pub reach: Vec<(String, String)>,
+    /// Room host (kick authority) username, from the roster; None until known.
+    /// You may `/kick` only when this equals your own name.
+    pub host: Option<String>,
+    /// Set to the new room password when a kick rotates it — the run loop then
+    /// reconnects (re-runs SRP) to re-key, since the E2E key derives from the
+    /// password. Taken (cleared) by the loop once the re-key is kicked off.
+    pub pending_rekey: Option<String>,
     /// AI agents currently generating a reply — drives the "thinking" spinner.
     pub ai_typing: std::collections::HashSet<String>,
+    /// Every room member we've identified as an AI agent (via its `_ai` frames
+    /// or its `(ai) online` announce). Lets `/grant ai` grant drive to all of
+    /// them at once; pruned when a member leaves.
+    pub ai_agents: std::collections::HashSet<String>,
     /// Live, in-progress reply text per streaming agent, shown as a transient
     /// preview bubble until the final message lands. Keyed by agent name.
     pub ai_stream: std::collections::HashMap<String, String>,
@@ -228,12 +369,28 @@ pub struct App {
     /// (click it or cycle with F5), or None when not editing. When set, arrow
     /// keys resize this pane instead of scrolling.
     pub focused_pane: Option<Pane>,
+    /// Active local sudo-password prompt (None unless `/sbx launch` needs root
+    /// and creds aren't cached). While `Some`, keystrokes feed this masked
+    /// buffer instead of chat — the secret never leaves the client.
+    pub sudo_prompt: Option<SudoPrompt>,
+    /// Browser viewers of the web relay, surfaced as display-only roster guests
+    /// from the publisher's `_web:presence` frame. Empty when no one is watching
+    /// or no web publisher is in the room.
+    pub web_guests: Vec<WebGuest>,
+    /// The room member (the web publisher) whose `_web:presence` we're rendering;
+    /// tracked so `web_guests` is cleared when that member leaves.
+    pub web_publisher: Option<String>,
+    /// "album ▸ Track" for the music now-playing indicator, or None when no
+    /// background music is playing. Mirrors the `music::Player` label so the UI
+    /// never has to touch the player's process handle.
+    pub now_playing: Option<String>,
 }
 
 impl App {
     fn new(me: String) -> Self {
         Self {
             me,
+            persona: Arc::new(Persona::load_or_create()),
             lines: Vec::new(),
             users: Vec::new(),
             capacity: 0,
@@ -256,27 +413,47 @@ impl App {
             reconnecting: false,
             error: None,
             password: String::new(),
+            onion: String::new(),
+            reach: Vec::new(),
+            host: None,
+            pending_rekey: None,
             ai_typing: std::collections::HashSet::new(),
+            ai_agents: std::collections::HashSet::new(),
             ai_stream: std::collections::HashMap::new(),
             spin: 0,
             agent_sbx_allow: false,
             agent_name: None,
             layout: Layout::default(),
             focused_pane: None,
+            sudo_prompt: None,
+            web_guests: Vec::new(),
+            web_publisher: None,
+            now_playing: None,
         }
     }
 
-    /// Cycle the interactive-edit selection: Terminal → Chat → Roster → off.
-    /// Bound to F5; clicking a pane jumps straight to it instead. The Terminal
-    /// step is skipped when no sandbox is up (nothing to resize there).
+    /// Length of the in-progress sudo password (for the masked modal to render
+    /// `•`s), or `None` when no prompt is open. Exposes only the length — never
+    /// the secret itself — so `ui` can draw it without touching the bytes.
+    pub fn sudo_prompt_len(&self) -> Option<usize> {
+        self.sudo_prompt.as_ref().map(|p| p.password.chars().count())
+    }
+
+    /// Cycle the interactive-edit selection: Chat → Terminal → Roster → Input →
+    /// off. Bound to F5; clicking a pane jumps straight to it instead. The
+    /// Terminal step is skipped when no sandbox is up (nothing to resize there);
+    /// the Input bar is always a stop (height-only).
     fn cycle_focus(&mut self) {
-        let has_term = self.sandbox.is_some();
+        // Cycle over the panes the layout is actually painting (chat → terminal →
+        // roster → input), then off. Skips the terminal with no sandbox and the
+        // roster when it's hidden, so every stop is something you can resize.
+        let panes = self.layout.present_panes(self.sandbox.is_some());
         self.focused_pane = match self.focused_pane {
-            None if has_term => Some(Pane::Terminal),
-            None => Some(Pane::Chat),
-            Some(Pane::Terminal) => Some(Pane::Chat),
-            Some(Pane::Chat) => Some(Pane::Roster),
-            Some(Pane::Roster) => None,
+            None => panes.first().copied(),
+            Some(cur) => match panes.iter().position(|p| *p == cur) {
+                Some(i) => panes.get(i + 1).copied(),
+                None => panes.first().copied(),
+            },
         };
     }
 
@@ -361,29 +538,61 @@ impl App {
 
     fn apply(&mut self, n: Net) {
         match n {
-            Net::Init { lines, users } => {
+            Net::Init { lines, users, onion, reach } => {
                 self.lines = lines;
                 self.users = users;
+                self.onion = onion;
+                self.reach = reach;
                 self.connected = true;
                 self.chat_scroll = 0;
-                self.sys(format!("joined as {} ⛧", self.me));
-                self.sys("/sbx launch <docker|multipass|vbox> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /pw show password · PgUp/PgDn scroll chat · ctrl-q quit");
+                self.sys(format!("joined as {} †", self.me));
+                self.sys("/sbx <docker|podman|multipass|vbox|local|pager> · /drive (F2 releases) · /ai start · /ai <question> · /send <user> <file> · /sendroom <file> · /export-signed <dir> · /pw show password · /share invite link · /help full command list · PgUp/PgDn scroll chat · ctrl-q quit");
             }
-            Net::Message(l) => self.push_line(l),
-            Net::Roster { users, capacity } => {
+            Net::Message(l) => {
+                // An agent announces itself with "<name> (ai) online …" — record
+                // it as an AI member so `/grant ai` can reach it before it acts.
+                if !l.system && l.text.starts_with(&format!("{} (ai) ", l.username)) {
+                    self.ai_agents.insert(l.username.clone());
+                }
+                self.push_line(l);
+            }
+            Net::Roster { users, capacity, host } => {
                 self.users = users;
                 self.capacity = capacity;
+                self.host = host;
             }
             Net::Joined(name) => self.sys(format!("{name} entered the house")),
+            Net::Kicked { username, by } => {
+                if let Some(p) = self.users.iter().position(|u| u.username == username) {
+                    self.users.remove(p);
+                }
+                self.ai_typing.remove(&username);
+                self.ai_agents.remove(&username);
+                self.ai_stream.remove(&username);
+                self.sys(format!("✝ {username} was kicked by {by}"));
+            }
+            Net::PasswordRotated { password } => {
+                self.password = password.clone();
+                self.pending_rekey = Some(password); // loop reconnects to re-key
+                self.sys("† room password rotated (a member was kicked) — re-keying; /share or /pw to reshare");
+            }
+            Net::KickDenied { reason } => self.err(format!("kick denied: {reason}")),
             Net::Left(uid) => {
                 if let Some(p) = self.users.iter().position(|u| u.user_id == uid) {
                     let name = self.users.remove(p).username;
                     self.ai_typing.remove(&name); // a departed agent isn't thinking
+                    self.ai_agents.remove(&name); // …nor an AI member any more
                     self.ai_stream.remove(&name); // …nor streaming a reply
+                    // The web publisher left → its browser viewers are gone too.
+                    if self.web_publisher.as_deref() == Some(name.as_str()) {
+                        self.web_publisher = None;
+                        self.web_guests.clear();
+                    }
                     self.sys(format!("{name} left"));
                 }
             }
             Net::AiTyping { name, on } => {
+                self.ai_agents.insert(name.clone()); // an `_ai` frame ⇒ AI member
                 if on {
                     self.ai_typing.insert(name);
                 } else {
@@ -391,6 +600,7 @@ impl App {
                 }
             }
             Net::AiStream { name, text, done } => {
+                self.ai_agents.insert(name.clone()); // an `_ai` frame ⇒ AI member
                 if done {
                     self.ai_stream.remove(&name);
                 } else {
@@ -423,7 +633,7 @@ impl App {
                                 parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
                                 backend: backend.clone(),
                             });
-                            self.sys(format!("⛧ sandbox summoned ({backend}) — F2 to drive"));
+                            self.sys(format!("† sandbox summoned ({backend}) — F2 to drive"));
                         }
                     }
                 } else {
@@ -433,7 +643,7 @@ impl App {
                     self.owner = None;
                     self.drivers.clear();
                     self.sudoers.clear();
-                    self.sys("⛧ sandbox dismissed");
+                    self.sys("† sandbox dismissed");
                 }
             }
             Net::SbxResize { rows, cols } => {
@@ -455,26 +665,33 @@ impl App {
                 let new: std::collections::HashSet<String> = drivers.into_iter().collect();
                 let sudo: std::collections::HashSet<String> = sudoers.into_iter().collect();
                 if !owner.is_empty() && self.owner.as_deref() != Some(owner.as_str()) {
-                    self.sys(format!("⛧ {owner} is the superuser (sandbox owner)"));
+                    self.sys(format!("† {owner} is the superuser (sandbox owner)"));
                 }
                 if new.contains(&self.me)
                     && !self.drivers.contains(&self.me)
                     && self.owner.is_some()
                 {
-                    self.sys("⛧ you were granted drive (F2 to take the shell)");
+                    self.sys("† you were granted drive (F2 to take the shell)");
                 } else if !new.contains(&self.me) && self.drivers.contains(&self.me) {
                     self.driving = false;
-                    self.sys("⛧ your drive permission was revoked");
+                    self.sys("† your drive permission was revoked");
                 }
                 if sudo.contains(&self.me)
                     && !self.sudoers.contains(&self.me)
                     && self.owner.is_some()
                 {
-                    self.sys("⛧ you were granted sudo (superuser) in the VM");
+                    self.sys("† you were granted sudo (superuser) in the VM");
                 }
                 self.owner = Some(owner).filter(|o| !o.is_empty());
                 self.drivers = new;
                 self.sudoers = sudo;
+            }
+            Net::WebPresence { publisher, guests } => {
+                // Trust the server-stamped publisher; render its browser viewers
+                // as display-only roster guests. An empty list (publisher (re)join
+                // or last viewer left) simply clears the group.
+                self.web_publisher = Some(publisher);
+                self.web_guests = guests;
             }
             Net::Ft(_) => {} // handled in the run loop (needs out channel + disk)
             Net::SendReady { .. } => {} // handled in the run loop (stages active_send)
@@ -484,8 +701,36 @@ impl App {
                 // Skip our own echo — we already saw the local "launched" line.
                 if by != self.me {
                     self.sys(format!(
-                        "⛧ {by} opened ‘{vm}’ locally — `/sbx gui {vm}` to open your own copy"
+                        "† {by} opened ‘{vm}’ locally — `/sbx gui {vm}` to open your own copy"
                     ));
+                }
+            }
+            // catreq/pullreq need to send frames + read disk → handled in the run
+            // loop; they never reach here. Arms kept for match exhaustiveness.
+            Net::SbxCatReq { .. } | Net::SbxPullReq { .. } => {}
+            Net::SbxCatalog { by, to, items } => {
+                // Only render a catalog that was sent to us (everyone sees the
+                // broadcast, but it's a private reply to one requester).
+                if to != self.me {
+                    return;
+                }
+                if items.is_empty() {
+                    self.sys(format!("† {by} has no shareable VMs"));
+                } else {
+                    self.sys(format!("† {by}'s shareable VMs ({}):", items.len()));
+                    for it in items {
+                        let purpose = if it.purpose.is_empty() { "—" } else { it.purpose.as_str() };
+                        let status = if it.status.is_empty() { "?" } else { it.status.as_str() };
+                        let mut line = format!("  • {} · [{}] · {}", it.label, status, purpose);
+                        if !it.tags.is_empty() {
+                            line.push_str(&format!(" · {{{}}}", it.tags.join(", ")));
+                        }
+                        if let Some(sz) = it.size_bytes {
+                            line.push_str(&format!(" · {}", crate::ft::human(sz as usize)));
+                        }
+                        self.sys(line);
+                        self.sys(format!("      pull with `/sbx pull @{by} {}`", it.label));
+                    }
                 }
             }
             Net::Closed => {
@@ -502,6 +747,7 @@ fn pane_label(p: Pane) -> &'static str {
         Pane::Chat => "chat",
         Pane::Roster => "roster",
         Pane::Terminal => "terminal",
+        Pane::Input => "input",
     }
 }
 
@@ -514,17 +760,28 @@ fn once_or_none(names: Vec<String>) -> String {
     }
 }
 
-/// PTY grid (rows, cols) for the sandbox terminal. `pty_pct` is the terminal's
-/// share of the body height (see `layout::Layout`); it must match the split
-/// `ui::draw` paints, so they stay in lock-step via `app.layout`. Width is the
-/// full body width — the terminal pane always spans the frame, only its height
-/// changes with the split.
-fn sbx_dims(term_w: u16, term_h: u16, pty_pct: u16) -> (u16, u16) {
-    let body_h = term_h.saturating_sub(4);
-    let sbx_h = (body_h as u32 * pty_pct as u32 / 100) as u16;
+/// PTY grid (rows, cols) for the sandbox terminal, derived from the Terminal
+/// leaf's actual rectangle in the layout tree — so it tracks **both** axes (the
+/// old height-only `pty_pct` couldn't express width changes). Matches the split
+/// `ui::draw` paints, keeping the local PTY and the room in lock-step. Subtracts
+/// the pane border (2 each way) and floors at 1. Falls back to the full body
+/// when no Terminal leaf is laid out (e.g. transiently before the tree rebuilds).
+fn sbx_grid(term_w: u16, term_h: u16, layout: &Layout) -> (u16, u16) {
+    use ratatui::layout::Rect;
+    // Mirror ui::draw's frame split: 1-line top bar, body, then the input bar
+    // (now a resizable height, not a fixed 3 lines).
+    let body = Rect {
+        x: 0,
+        y: 1,
+        width: term_w,
+        height: term_h.saturating_sub(1 + layout.input_height()),
+    };
+    let r = layout
+        .rect_of(body, Pane::Terminal, true)
+        .unwrap_or(body);
     (
-        sbx_h.saturating_sub(2).max(1),
-        term_w.saturating_sub(2).max(1),
+        r.height.saturating_sub(2).max(1),
+        r.width.saturating_sub(2).max(1),
     )
 }
 
@@ -567,6 +824,83 @@ fn send_frame(out: &UnboundedSender<WsMsg>, room: &fernet::Fernet, value: serde_
     let _ = out.send(WsMsg::Text(room.encrypt(value.to_string().as_bytes())));
 }
 
+/// The bundled Encrypt-Share-Attribution builder (Princess_Pi's ESA scheme,
+/// non-interactive). Embedded in the binary so `/export-signed` is self-contained;
+/// materialized to a temp file and run when invoked.
+const ESA_BUILD: &str = include_str!("../tools/esa/esa_build.sh");
+
+/// Split a trailing `--attest <passphrase>` off a send/export command. Returns
+/// `(payload_part, Some(passphrase))`, or `(whole, None)` if the flag is absent
+/// or has no value.
+fn split_attest(s: &str) -> (&str, Option<&str>) {
+    match s.split_once("--attest ") {
+        Some((head, pass)) => {
+            let pass = pass.trim();
+            (head.trim_end(), (!pass.is_empty()).then_some(pass))
+        }
+        None => (s, None),
+    }
+}
+
+/// `/export-signed <dir>`: build a portable ESA archive (fresh Ed25519 key signs
+/// an inner 7z of `dir`, SHA-512 checksums, self-contained verify scripts, and —
+/// with `--attest` — a revealable attribution commitment). Runs off the UI thread
+/// (7z + ssh-keygen are slow) and reports the archive path back via the channel.
+fn export_signed(app: &mut App, app_tx: &UnboundedSender<Net>, src: &str, attest: Option<&str>) {
+    let src = src.to_string();
+    let attest = attest.map(str::to_string);
+    let tx = app_tx.clone();
+    app.sys(format!("† building attributable archive from {src}…"));
+    tokio::task::spawn_blocking(move || match run_esa_build(&src, attest.as_deref()) {
+        Ok(out) => {
+            let _ = tx.send(Net::Sys(format!(
+                "† signed archive ready: {out} — recipients run ./verify-everything.sh (inside) to check integrity + signature"
+            )));
+        }
+        Err(e) => {
+            let _ = tx.send(Net::Err(format!("export-signed failed: {e}")));
+        }
+    });
+}
+
+/// Materialize the embedded ESA script and run it non-interactively. Returns the
+/// path to the produced `verifiable_archive_<ts>.7z` (the script's last stdout
+/// line), or an error carrying the script's stderr.
+fn run_esa_build(src: &str, attest: Option<&str>) -> anyhow::Result<String> {
+    let script = std::env::temp_dir().join(format!("hh-esa-build-{}.sh", std::process::id()));
+    std::fs::write(&script, ESA_BUILD)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(&script).arg("--src").arg(src);
+    if let Some(p) = attest {
+        cmd.arg("--attrib-pass").arg(p);
+    }
+    let out = cmd.output();
+    let _ = std::fs::remove_file(&script);
+    let out = out?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "{}",
+            msg.trim().lines().last().unwrap_or("archive build failed")
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let path = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    anyhow::ensure!(!path.is_empty(), "archive built but no path reported");
+    Ok(path)
+}
+
 /// Read `path` and broadcast a file/dir offer. `to = Some(user)` targets one
 /// member (only they're prompted); `to = None` offers to the whole room. The
 /// payload is staged in `active_send` and streamed once an /accept arrives.
@@ -578,11 +912,16 @@ fn offer_payload(
     app_tx: &UnboundedSender<Net>,
     path: &str,
     to: Option<&str>,
+    // Optional ESA-style attribution passphrase: when set, the offer carries a
+    // `SHA-512(passphrase || sha256)` commitment the sender can later open.
+    attest: Option<&str>,
 ) {
     *send_seq += 1;
     let id = format!("{}-{}", app.me, send_seq);
     let path = path.to_string();
     let to = to.map(str::to_string);
+    let attest = attest.map(str::to_string);
+    let persona = app.persona.clone();
     let out = out_tx.clone();
     let room = room.clone();
     let atx = app_tx.clone();
@@ -601,9 +940,20 @@ fn offer_payload(
                 size: s.size,
                 to: to.clone(),
             });
+            // Attribution: sign the content hash (+ name/size) with our persona
+            // key so receivers can verify authorship. Additive JSON fields — a
+            // Python receiver just ignores them.
+            let sig = persona.sign_b64(&persona::attest_msg(&s.sha256, &s.name, s.size));
             let mut frame = json!({
-                "_ft":"offer","id": id,"name": s.name,"size": s.size,"sha256": s.sha256,"dir": s.dir
+                "_ft":"offer","id": id,"name": s.name,"size": s.size,"sha256": s.sha256,"dir": s.dir,
+                "persona": persona.pub_b64(), "sig": sig
             });
+            if let Some(pass) = &attest {
+                frame["attrib"] = json!(persona::commitment(pass, &s.sha256));
+                let _ = atx.send(Net::Sys(
+                    "† attribution commitment attached — reveal the passphrase later to prove authorship".into(),
+                ));
+            }
             if let Some(t) = &to {
                 frame["to"] = json!(t);
             }
@@ -695,13 +1045,38 @@ fn handle_ft(
                 }
             }
             app.sys(format!(
-                "⛧ {} offers {} ({}{}){} — /accept or /reject",
+                "† {} offers {} ({}{}){} — /accept or /reject",
                 o.from,
                 o.name,
                 ft::human(o.size as usize),
                 if o.dir { ", directory" } else { "" },
                 if o.to.is_some() { " directly to you" } else { "" },
             ));
+            // Attribution: verify the sender's persona signature over the content
+            // hash, and surface the pseudonym fingerprint so peers can recognize
+            // "the same author" across offers.
+            match (&o.persona, &o.sig) {
+                (Some(pk), Some(sig)) => {
+                    let msg = persona::attest_msg(&o.sha256, &o.name, o.size);
+                    if persona::verify(pk, sig, &msg) {
+                        let fp = persona::fingerprint_of(pk).unwrap_or_else(|| "unknown".into());
+                        app.sys(format!(
+                            "   † signed by persona †{fp} ✓ (attributable){}",
+                            if o.attrib.is_some() {
+                                " · attribution passphrase committed"
+                            } else {
+                                ""
+                            }
+                        ));
+                    } else {
+                        app.err(format!(
+                            "   ⚠ {} — BAD persona signature; author UNVERIFIED",
+                            o.name
+                        ));
+                    }
+                }
+                _ => app.sys("   (unsigned — no attribution proof)"),
+            }
             app.transfers.insert(
                 o.id.clone(),
                 Transfer {
@@ -792,7 +1167,7 @@ fn handle_ft(
                                     match ft::commit(downloads, &t.meta, &tmp) {
                                         Ok(p) => {
                                             app.sys(format!(
-                                                "⛧ saved {} ({}) — verified ✓",
+                                                "† saved {} ({}) — verified ✓",
                                                 p.display(),
                                                 ft::human(t.meta.size as usize)
                                             ));
@@ -844,7 +1219,7 @@ impl Drop for TermGuard {
     }
 }
 
-pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme) -> Result<()> {
+pub async fn run(mut params: net::ConnParams, mut session: Session, mut theme: Theme) -> Result<()> {
     let (tx, mut rx) = unbounded_channel::<Net>();
     let app_tx = tx.clone();
     let write = net::open(&session, tx.clone()).await?;
@@ -871,6 +1246,8 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
     let mut send_seq: u64 = 0;
     // The local AI agent subprocess this client spawned via `/ai start`, if any.
     let mut agent: Option<std::process::Child> = None;
+    // Background-music session this client started via `/music play`, if any.
+    let mut music: Option<music::Player> = None;
     let downloads = PathBuf::from("./downloads");
 
     enable_raw_mode()?;
@@ -901,7 +1278,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
     // Seed the roster width from the active vestment so a `--theme` with a wider
     // roster is honoured; from here on the live layout owns it (so /theme swaps
     // don't stomp a width the user has set with /layout).
-    app.layout.roster_width = theme.roster_width;
+    app.layout.set_roster_width(theme.roster_width);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(50));
 
@@ -923,7 +1300,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
 
         if broker.is_some() {
             if let Ok(sz) = term.size() {
-                let dims = sbx_dims(sz.width, sz.height, app.layout.effective_pty_pct());
+                let dims = sbx_grid(sz.width, sz.height, &app.layout);
                 if announced_dims != Some(dims) {
                     announced_dims = Some(dims);
                     if let Some(sb) = &broker {
@@ -953,7 +1330,81 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                         {
                             break Ok(());
                         }
-                        if k.modifiers.contains(KeyModifiers::CONTROL)
+                        // Masked sudo-password prompt (Option C). When open it
+                        // swallows EVERY keystroke so the password can never leak
+                        // into chat, the PTY, or an outbound frame — it lives only
+                        // in `app.sudo_prompt.password` until it's moved into the
+                        // launch task and fed to `sudo -S` over stdin.
+                        if app.sudo_prompt.is_some() {
+                            match k.code {
+                                KeyCode::Enter => {
+                                    // SAFETY of secrecy: `take()` moves the buffer
+                                    // out; it's never cloned into any logged/visible
+                                    // surface. The password is handed to spawn_launch
+                                    // and dropped there after stdin is fed.
+                                    let SudoPrompt { password, pending } =
+                                        app.sudo_prompt.take().unwrap();
+                                    if password.is_empty() {
+                                        app.sys("† cancelled — empty password");
+                                    } else {
+                                        match pending {
+                                        PendingPrivileged::Launch(pending) => {
+                                            launching = true;
+                                            app.sys("🔒 authenticating + launching…");
+                                            spawn_launch(
+                                                pending.backend,
+                                                pending.image,
+                                                app.me.clone(),
+                                                pending.members,
+                                                pending.rows,
+                                                pending.cols,
+                                                pending.start_daemon,
+                                                pending.install_first,
+                                                Some(password),
+                                                pty_tx.clone(),
+                                                broker_tx.clone(),
+                                                app_tx.clone(),
+                                            );
+                                        }
+                                        PendingPrivileged::VboxInstall(p) => {
+                                            // Root authenticated → install VirtualBox
+                                            // (sudo -S reads this password) then boot
+                                            // the VM. The password is dropped inside
+                                            // spawn_vm_execute after stdin is fed.
+                                            app.sys("🔒 authenticating + installing VirtualBox…");
+                                            let room = p.room.clone();
+                                            spawn_vm_execute(
+                                                p.vm,
+                                                p.conflicts,
+                                                p.needs_install,
+                                                p.needs_import,
+                                                &mut app,
+                                                &app_tx,
+                                                &out_tx,
+                                                &room,
+                                                Some(password),
+                                            );
+                                        }
+                                        }
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    app.sudo_prompt = None;
+                                    app.sys("† sudo cancelled — launch aborted");
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(p) = app.sudo_prompt.as_mut() {
+                                        p.password.pop();
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(p) = app.sudo_prompt.as_mut() {
+                                        p.password.push(c);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else if k.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(k.code, KeyCode::Char('x'))
                             && !app.driving
                         {
@@ -971,7 +1422,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 app.agent_sbx_allow = false;
                                 let _ = sb.write_input(&[0x03]); // Ctrl-C into the shell
                                 broadcast_acl(&out_tx, &session.room, &app);
-                                app.sys("⛧ kill switch — revoked all drive + interrupted the shell");
+                                app.sys("† kill switch — revoked all drive + interrupted the shell");
                             } else {
                                 app.sys("kill switch is for the sandbox owner (you don't hold the PTY)");
                             }
@@ -994,7 +1445,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             // stays responsive, then re-attach the websocket on success.
                             if !app.reconnecting {
                                 app.reconnecting = true;
-                                app.sys("⛧ reconnecting…");
+                                app.sys("† reconnecting…");
                                 let p = params.clone();
                                 let rtx = recon_tx.clone();
                                 tokio::task::spawn_blocking(move || {
@@ -1006,7 +1457,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 });
                             }
                         } else if app.vbox_picker.is_some() {
-                            // Modal VM picker (from a bare `/sbx launch vbox`): arrow
+                            // Modal VM picker (from a bare `/sbx vbox`): arrow
                             // keys move the highlight, Enter/Tab boots the selected VM
                             // on this machine (host-frictionless path; a non-host who
                             // needs install/import is steered to re-issue with `yes`),
@@ -1036,7 +1487,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 }
                                 KeyCode::Esc => {
                                     app.vbox_picker = None;
-                                    app.sys("⛧ picker dismissed");
+                                    app.sys("† picker dismissed");
                                 }
                                 _ => {} // ignore other keys so the picker stays put
                             }
@@ -1110,9 +1561,9 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             if app.sandbox.is_some() {
                                 app.layout.cycle_zoom();
                                 announced_dims = None; // re-sync PTY to the new height
-                                app.sys(format!("⛧ {}", app.layout.describe()));
+                                app.sys(format!("† {}", app.layout.describe()));
                             } else {
-                                app.sys("no sandbox to fullscreen — /sbx launch first");
+                                app.sys("no sandbox to fullscreen — /sbx <type> first");
                             }
                         } else if k.code == KeyCode::F(5) {
                             // Enter/cycle interactive layout editing: pick a pane to
@@ -1121,10 +1572,10 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             app.cycle_focus();
                             match app.focused_pane {
                                 Some(p) => app.sys(format!(
-                                    "⛧ editing {} — arrows resize · Esc done",
+                                    "† editing {} — arrows resize · Esc done",
                                     pane_label(p)
                                 )),
-                                None => app.sys("⛧ layout editing off"),
+                                None => app.sys("† layout editing off"),
                             }
                         } else if app.focused_pane.is_some() && !app.driving {
                             // Interactive layout editing: a pane is selected (via click
@@ -1132,32 +1583,48 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             // before the driving branch but is gated on !driving so the
                             // shell still gets its keys while you hold the PTY.
                             let pane = app.focused_pane.unwrap();
-                            match (pane, k.code) {
-                                (_, KeyCode::Esc) | (_, KeyCode::Enter) => {
+                            let has_term = app.sandbox.is_some();
+                            let dir = match k.code {
+                                KeyCode::Up => Some(Dir::Up),
+                                KeyCode::Down => Some(Dir::Down),
+                                KeyCode::Left => Some(Dir::Left),
+                                KeyCode::Right => Some(Dir::Right),
+                                _ => None,
+                            };
+                            match k.code {
+                                KeyCode::Esc | KeyCode::Enter => {
                                     app.focused_pane = None;
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                    app.sys(format!("† {}", app.layout.describe()));
                                 }
-                                // Terminal taller / chat shorter (and the mirror image
-                                // when the chat pane is the one selected).
-                                (Pane::Terminal, KeyCode::Up) | (Pane::Chat, KeyCode::Down) => {
-                                    app.layout.grow_pty(3);
-                                    announced_dims = None;
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                _ if dir.is_some() => {
+                                    // Every pane is resizable on both axes wherever a
+                                    // divider bounds it; resize_focused moves the right
+                                    // one (or reports NoAxisHere so we can hint).
+                                    match app.layout.resize_focused(pane, dir.unwrap(), has_term) {
+                                        Resize::Moved => {
+                                            // Any divider move can change the terminal's
+                                            // rect (height *or* width now), so force a
+                                            // PTY re-sync to rebroadcast the new grid.
+                                            announced_dims = None;
+                                            app.sys(format!("† {}", app.layout.describe()));
+                                        }
+                                        Resize::NoAxisHere => {
+                                            app.sys(
+                                                "no divider on that axis here — F5 to the input bar to grow the compose box, or launch a sandbox for terminal height",
+                                            );
+                                        }
+                                    }
                                 }
-                                (Pane::Terminal, KeyCode::Down) | (Pane::Chat, KeyCode::Up) => {
-                                    app.layout.shrink_pty(3);
-                                    announced_dims = None;
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
-                                }
-                                (Pane::Roster, KeyCode::Left) => {
-                                    app.layout.roster_width =
-                                        app.layout.roster_width.saturating_sub(2);
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
-                                }
-                                (Pane::Roster, KeyCode::Right) => {
-                                    app.layout.roster_width =
-                                        (app.layout.roster_width + 2).min(Layout::MAX_ROSTER);
-                                    app.sys(format!("⛧ {}", app.layout.describe()));
+                                // Typing a printable char is an escape hatch: drop out
+                                // of layout-edit mode and feed the key to the compose box.
+                                // Without this, a stray click into edit mode silently
+                                // swallows every keystroke and feels like a freeze.
+                                KeyCode::Char(c)
+                                    if !k.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !k.modifiers.contains(KeyModifiers::ALT) =>
+                                {
+                                    app.focused_pane = None;
+                                    app.input.push(c);
                                 }
                                 _ => {} // ignore other keys while editing
                             }
@@ -1190,7 +1657,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                     handle_command(&line, &mut app, &mut theme, &mut send_seq,
                                         &mut broker, &mut broker_meta, &mut launching, &mut announced_dims,
                                         &out_tx, &pty_tx, &broker_tx, &app_tx, &session, &term,
-                                        &mut agent, &params);
+                                        &mut agent, &mut music, &params);
                                 }
                                 KeyCode::Backspace => { app.input.pop(); }
                                 // Scroll: ↑/↓ scroll the sandbox terminal if one is up,
@@ -1253,16 +1720,20 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 if !app.driving && !app.show_help && app.vbox_picker.is_none() =>
                             {
                                 if let Ok(sz) = term.size() {
-                                    if let Some(p) =
-                                        ui::pane_at(sz.width, sz.height, &app, m.column, m.row)
-                                    {
-                                        app.focused_pane = Some(p);
-                                        app.sys(format!(
-                                            "⛧ editing {} — arrows resize · Esc done",
-                                            pane_label(p)
-                                        ));
-                                    } else {
-                                        app.focused_pane = None;
+                                    match ui::pane_at(sz.width, sz.height, &app, m.column, m.row) {
+                                        // Clicking the compose box must NOT enter layout-edit
+                                        // mode — that's where you type, and locking it on a
+                                        // click is exactly the "stuck, can't type" footgun.
+                                        Some(p) if p != Pane::Input => {
+                                            app.focused_pane = Some(p);
+                                            app.sys(format!(
+                                                "† editing {} — arrows resize · Esc done",
+                                                pane_label(p)
+                                            ));
+                                        }
+                                        _ => {
+                                            app.focused_pane = None;
+                                        }
                                     }
                                 }
                             }
@@ -1303,7 +1774,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             {
                                 // A received VirtualBox appliance auto-imports so the VM
                                 // registers locally and the recipient can immediately
-                                // `/sbx launch vbox gui <vm>`. Off-thread (VBoxManage import
+                                // `/sbx vbox gui <vm>`. Off-thread (VBoxManage import
                                 // is slow); reports back via the app channel.
                                 let ext = path
                                     .extension()
@@ -1319,7 +1790,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                         .await;
                                         let _ = match res {
                                             Ok(Ok(vm)) => tx.send(Net::Sys(format!(
-                                                "⛧ imported VM ‘{vm}’ — `/sbx launch vbox gui {vm}` to boot it"
+                                                "† imported VM ‘{vm}’ — `/sbx vbox gui {vm}` to boot it"
                                             ))),
                                             Ok(Err(e)) => tx.send(Net::Sys(format!(
                                                 "(received .ova not auto-imported: {e})"
@@ -1328,8 +1799,38 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                         };
                                     });
                                 }
+                                // A pulled OCI snapshot (`hh-snap-<label>.tar`) loads
+                                // into the local engine and self-registers — the
+                                // manifest rides inside the image, so the receiver's
+                                // `/sbx browse`/`load` light up without a human briefing.
+                                let is_snap_tar = ext.as_deref() == Some("tar")
+                                    && path
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .is_some_and(|n| n.starts_with("hh-snap-"));
+                                if is_snap_tar {
+                                    let tx = app_tx.clone();
+                                    let tar = path.clone();
+                                    tokio::spawn(async move {
+                                        let res = tokio::task::spawn_blocking(move || {
+                                            register_received_snapshot(&tar)
+                                        })
+                                        .await;
+                                        let _ = match res {
+                                            Ok(Ok(msg)) => tx.send(Net::Sys(msg)),
+                                            Ok(Err(e)) => tx.send(Net::Sys(format!(
+                                                "(received snapshot not imported: {e:#})"
+                                            ))),
+                                            Err(e) => tx.send(Net::Err(format!("import task: {e}"))),
+                                        };
+                                    });
+                                }
+                                // Bridge any *other* received file into a hosted
+                                // sandbox so the room can use it from the shared
+                                // shell. Snapshot archives are skipped — they're
+                                // loaded as images above, not dropped into a shell.
                                 if let Some((be, name)) = &broker_meta {
-                                    if !matches!(be, sbx::Backend::Local) {
+                                    if !is_snap_tar && !matches!(be, sbx::Backend::Local) {
                                         let (be, name) = (*be, name.clone());
                                         let run_user = sbx::run_user_for(
                                             be,
@@ -1343,7 +1844,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                             .await;
                                             let _ = match res {
                                                 Ok(Ok(dest)) => tx.send(Net::Sys(format!(
-                                                    "⛧ bridged into sandbox → {dest}"
+                                                    "† bridged into sandbox → {dest}"
                                                 ))),
                                                 Ok(Err(e)) => tx.send(Net::Sys(format!(
                                                     "(received file not bridged into sandbox: {e})"
@@ -1374,11 +1875,12 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             // The status/data handlers are idempotent, so members
                             // already in the room aren't disturbed by the replay.
                             if broker.is_some() {
-                                if let (Some(v), Some((be, _))) = (&app.sandbox, &broker_meta) {
+                                if let (Some(v), Some((be, sbx_name))) = (&app.sandbox, &broker_meta) {
                                     let (rows, cols) = v.parser.screen().size();
                                     send_frame(&out_tx, &session.room, json!({
                                         "_sbx":"status","state":"ready",
-                                        "backend": be.label(),"rows": rows,"cols": cols
+                                        "backend": be.label(),"engine": be.engine(),"name": sbx_name,
+                                        "rows": rows,"cols": cols
                                     }));
                                     let snap = v.parser.screen().contents_formatted();
                                     send_frame(&out_tx, &session.room, json!({
@@ -1407,7 +1909,73 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                                 )),
                             }
                         }
+                        // A peer asked for our shareable-VM catalog — reply (only
+                        // if the request named us) with our published slice.
+                        Net::SbxCatReq { by, to } => {
+                            if to == app.me {
+                                let items: Vec<serde_json::Value> = registry::list_shareable()
+                                    .into_iter()
+                                    .map(|e| json!({
+                                        "label": e.label, "purpose": e.purpose,
+                                        "status": e.status, "tags": e.tags, "size": e.size_bytes,
+                                    }))
+                                    .collect();
+                                send_frame(&out_tx, &session.room, json!({
+                                    "_sbx":"catalog","to": by,"items": items
+                                }));
+                            }
+                        }
+                        // A peer asked us to hand over a published VM — if we
+                        // actually published it (and the artifact's still on disk),
+                        // `/send` it to them; their ft path auto-imports + registers.
+                        Net::SbxPullReq { by, to, label } => {
+                            if to == app.me {
+                                match registry::get(&label) {
+                                    Some(e)
+                                        if e.shareable
+                                            && !e.share_path.is_empty()
+                                            && std::path::Path::new(&e.share_path).exists() =>
+                                    {
+                                        app.sys(format!(
+                                            "† {by} is pulling ‘{label}’ — sending it over…"
+                                        ));
+                                        let path = e.share_path.clone();
+                                        offer_payload(
+                                            &mut app, &mut send_seq, &out_tx, &session.room,
+                                            &app_tx, &path, Some(&by), None,
+                                        );
+                                    }
+                                    Some(_) => app.sys(format!(
+                                        "† {by} asked for ‘{label}’ but it isn't published — `/sbx publish {label}` first"
+                                    )),
+                                    None => app.sys(format!(
+                                        "† {by} asked for ‘{label}’ but no such saved VM exists here"
+                                    )),
+                                }
+                            }
+                        }
                         other => app.apply(other),
+                    }
+                }
+                // A kick rotated the room password: re-key by reconnecting with the
+                // new secret (the E2E key derives from the password). Gated on the
+                // socket having CLOSED (Net::Closed) so the server has already freed
+                // our old session — reconnecting before that races into "name taken".
+                // Reuses the Ctrl-R reconnect path — re-runs SRP off-thread.
+                if !app.connected && app.pending_rekey.is_some() {
+                    let newpw = app.pending_rekey.take().unwrap();
+                    params.password = newpw;
+                    if !app.reconnecting {
+                        app.reconnecting = true;
+                        let p = params.clone();
+                        let rtx = recon_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let r = net::authenticate(
+                                &p.ip, p.port, &p.user, &p.password, p.no_tls, p.insecure,
+                            )
+                            .map_err(|e| e.to_string());
+                            let _ = rtx.send(r);
+                        });
                     }
                 }
             }
@@ -1415,7 +1983,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                 match msg {
                     Some(BrokerMsg::Ready { sb, backend, name, rows, cols }) => {
                         broker = Some(sb);
-                        broker_meta = Some((backend, name));
+                        broker_meta = Some((backend, name.clone()));
                         announced_dims = Some((rows, cols));
                         launching = false;
                         // Local sandbox view — broker renders straight from the PTY.
@@ -1423,7 +1991,7 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
                             backend: backend.label().to_string(),
                         });
-                        app.sys(format!("⛧ sandbox summoned ({}) — /drive to take the shell", backend.label()));
+                        app.sys(format!("† sandbox summoned ({}) — /drive to take the shell", backend.label()));
                         app.owner = Some(app.me.clone());
                         app.drivers.clear();
                         app.drivers.insert(app.me.clone());
@@ -1436,7 +2004,8 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             }
                         }
                         send_frame(&out_tx, &session.room, json!({
-                            "_sbx":"status","state":"ready","backend": backend.label(), "rows": rows, "cols": cols
+                            "_sbx":"status","state":"ready","backend": backend.label(),
+                            "engine": backend.engine(),"name": name,"rows": rows,"cols": cols
                         }));
                         broadcast_acl(&out_tx, &session.room, &app);
                     }
@@ -1453,15 +2022,16 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
                             match net::open(&session, tx.clone()).await {
                                 Ok(w) => {
                                     let _ = sink_tx.send(w);
-                                    app.sys("⛧ websocket re-attached — syncing…");
+                                    app.sys("† websocket re-attached — syncing…");
                                     // If we host the sandbox, re-announce it so the
                                     // rest of the house re-syncs the shared shell.
-                                    if let Some((be, _)) = &broker_meta {
+                                    if let Some((be, sbx_name)) = &broker_meta {
                                         if let Some(v) = &app.sandbox {
                                             let (rows, cols) = v.parser.screen().size();
                                             send_frame(&out_tx, &session.room, json!({
                                                 "_sbx":"status","state":"ready",
-                                                "backend": be.label(),"rows": rows,"cols": cols
+                                                "backend": be.label(),"engine": be.engine(),"name": sbx_name,
+                                                "rows": rows,"cols": cols
                                             }));
                                             broadcast_acl(&out_tx, &session.room, &app);
                                         }
@@ -1488,7 +2058,18 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
             }
             _ = sigterm.recv() => { break Ok(()); }
             _ = sighup.recv() => { break Ok(()); }
-            _ = tick.tick() => { app.spin = app.spin.wrapping_add(1); }
+            _ = tick.tick() => {
+                app.spin = app.spin.wrapping_add(1);
+                // Advance background music when the current track ends. Compute
+                // the event before touching `music`/`app` so the player borrow
+                // is released first.
+                let ev = music.as_mut().and_then(|p| p.tick());
+                match ev {
+                    Some(Ok(label)) => app.now_playing = Some(label),
+                    Some(Err(e)) => { music = None; app.now_playing = None; app.err(e); }
+                    None => {}
+                }
+            }
         }
     };
 
@@ -1501,6 +2082,9 @@ pub async fn run(params: net::ConnParams, mut session: Session, mut theme: Theme
     if let Some(mut child) = agent.take() {
         let _ = child.kill();
         let _ = child.wait();
+    }
+    if let Some(mut p) = music.take() {
+        p.stop();
     }
     disable_raw_mode()?;
     execute!(
@@ -1591,6 +2175,7 @@ fn handle_command(
     session: &Session,
     term: &Terminal<CrosstermBackend<std::io::Stdout>>,
     agent: &mut Option<std::process::Child>,
+    music: &mut Option<music::Player>,
     params: &net::ConnParams,
 ) {
     let room = &session.room;
@@ -1601,15 +2186,175 @@ fn handle_command(
         // room — other peers keep their own history.
         app.lines.clear();
         app.chat_scroll = 0;
-        app.sys("⛧ chat cleared");
+        app.sys("† chat cleared");
     } else if line == "/pw" || line == "/password" {
         // Show the room password locally (never broadcast). Handy when the
         // server's password was autogenerated and you need to read it off / share
         // it out-of-band to invite someone into the room.
         if app.password.is_empty() {
-            app.sys("⛧ no room password (joined without one)");
+            app.sys("† no room password (joined without one)");
         } else {
-            app.sys(format!("⛧ room password: {}", app.password));
+            app.sys(format!("† room password: {}", app.password));
+        }
+    } else if line == "/share" {
+        // Print a paste-ready invite block for THIS room (local only, never
+        // broadcast). The onion address (if the host used --tor) arrives in the
+        // init frame; the client already holds host/port/password. This block is
+        // a bearer credential — share it out-of-band, as the host banner warns.
+        let tls = if params.no_tls { " --no-tls" } else { "" };
+        let pw = if app.password.is_empty() {
+            "<none>".to_string()
+        } else {
+            app.password.clone()
+        };
+        app.sys("† share this room — out-of-band only (this block is a bearer credential):");
+        app.sys(format!("†   pass     {pw}"));
+        let mut any = false;
+        // Tor (onion) — anonymous, reachable from anywhere with tor+torsocks.
+        if !app.onion.is_empty() {
+            any = true;
+            let (oaddr, oport) = match app.onion.rsplit_once(':') {
+                Some((a, p)) => (a.to_string(), p.to_string()),
+                None => (app.onion.clone(), params.port.to_string()),
+            };
+            app.sys(format!("†   [tor]    {}", app.onion));
+            app.sys(format!(
+                "†            scripts/tor-onion-connect.sh {oaddr} {oport} <name> --password {pw}"
+            ));
+        }
+        // Tailscale / LAN / public addresses the room is bound to (from the server).
+        for (label, addr) in app.reach.clone() {
+            any = true;
+            app.sys(format!("†   [{label}] {addr}:{}", params.port));
+            app.sys(format!(
+                "†            hack-house connect {} {} <name> --password {pw}{tls}",
+                addr, params.port
+            ));
+        }
+        if !any {
+            app.sys(format!("†   room     {}:{}", params.ip, params.port));
+            app.sys(format!(
+                "†            hack-house connect {} {} <name> --password {pw}{tls}",
+                params.ip, params.port
+            ));
+            app.sys("†   note     loopback only — reachable from this host. To share, host on \
+                     your tailnet/LAN (bind 0.0.0.0) or with --tor (onion).");
+        }
+    } else if let Some(rest) = line.strip_prefix("/kick") {
+        // Host-only force-kick: the server disconnects the member AND rotates the
+        // room password so they can't rejoin with the shared secret. The server is
+        // the authority; we also guard locally for a clear message. Sent CLEARTEXT
+        // (not room-encrypted) — it's server-directed moderation, not room content.
+        let target = rest.trim();
+        if target.is_empty() {
+            app.err("usage: /kick <user> — remove a member (host only; rotates the room password)");
+        } else if app.host.as_deref() != Some(app.me.as_str()) {
+            let who = app.host.clone().unwrap_or_else(|| "the host".to_string());
+            app.err(format!("only the room host ({who}) can /kick"));
+        } else if target == app.me {
+            app.err("you can't kick yourself");
+        } else if !app.users.iter().any(|u| u.username == target) {
+            app.err(format!("no member named ‘{target}’ in the room"));
+        } else {
+            let frame = json!({ "type": "kick", "target": target }).to_string();
+            let _ = out_tx.send(WsMsg::Text(frame));
+            app.sys(format!("† kick requested for {target} — rotating room password…"));
+        }
+    } else if let Some(rest) = line.strip_prefix("/music") {
+        // Background music for the session. Plays bundled CC-BY albums or the
+        // operator's imported files through an external player (ffplay/mpv/cvlc);
+        // the run loop's tick auto-advances tracks. Local to this client — never
+        // broadcast, so each member scores their own session.
+        let rest = rest.trim();
+        let (cmd, arg) = rest
+            .split_once(char::is_whitespace)
+            .map(|(c, a)| (c, a.trim()))
+            .unwrap_or((rest, ""));
+        // Start (or restart into) an album by name, replacing any current session.
+        let play = |app: &mut App, music: &mut Option<music::Player>, name: &str| {
+            if let Some(mut p) = music.take() {
+                p.stop();
+            }
+            match music::Player::start(name) {
+                Ok(p) => {
+                    let label = p.label();
+                    *music = Some(p);
+                    app.now_playing = Some(label.clone());
+                    app.sys(format!("♪ playing {label}"));
+                }
+                Err(e) => app.err(e),
+            }
+        };
+        match cmd {
+            "" | "list" | "ls" => {
+                app.sys(format!(
+                    "♪ albums: {} — /music play [album] (blank/random = shuffle) · stop · next · import <path> [as <name>]",
+                    music::once_or_none(music::available())
+                ));
+                if let Some(np) = &app.now_playing {
+                    app.sys(format!("♪ now playing: {np}"));
+                }
+            }
+            "play" | "start" => {
+                // Bare `/music play`, or `/music play random|shuffle`, rolls a
+                // random album; otherwise play the named one.
+                let pick = if arg.is_empty()
+                    || arg.eq_ignore_ascii_case("random")
+                    || arg.eq_ignore_ascii_case("shuffle")
+                {
+                    music::random()
+                } else {
+                    Some(arg.to_string())
+                };
+                match pick {
+                    Some(name) => play(app, music, &name),
+                    None => app.err("no albums installed"),
+                }
+            }
+            "stop" | "off" | "pause" => {
+                if let Some(mut p) = music.take() {
+                    p.stop();
+                    app.now_playing = None;
+                    app.sys("♪ music stopped");
+                } else {
+                    app.sys("♪ nothing playing");
+                }
+            }
+            "next" | "skip" => match music.as_mut() {
+                Some(p) => match p.skip() {
+                    Ok(label) => {
+                        app.now_playing = Some(label.clone());
+                        app.sys(format!("♪ playing {label}"));
+                    }
+                    Err(e) => {
+                        *music = None;
+                        app.now_playing = None;
+                        app.err(e);
+                    }
+                },
+                None => app.sys("♪ nothing playing — /music play <album>"),
+            },
+            "random" | "shuffle" => match music::random() {
+                Some(name) => play(app, music, &name),
+                None => app.err("no albums installed"),
+            },
+            "import" | "add" if !arg.is_empty() => {
+                // `/music import <path> [as <name>]`
+                let (path, as_name) = match arg.rsplit_once(" as ") {
+                    Some((p, n)) => (p.trim(), Some(n.trim())),
+                    None => (arg, None),
+                };
+                match music::import(path, as_name) {
+                    Ok((name, n)) => app.sys(format!(
+                        "♪ imported {n} track(s) as album '{name}' — /music play {name}"
+                    )),
+                    Err(e) => app.err(e),
+                }
+            }
+            "import" | "add" => app.err("usage: /music import <file-or-dir> [as <name>]"),
+            other => app.err(format!(
+                "unknown /music '{other}' — list · play <album> · stop · next · random · import <path>"
+            )),
         }
     } else if let Some(rest) = line.strip_prefix("/theme") {
         // Live vestment switch: `/theme <name>`, or bare `/theme` to list options.
@@ -1669,7 +2414,7 @@ fn handle_command(
         let mut resized = false;
         match cmd {
             "" => {
-                app.sys(format!("⛧ layout: {}", app.layout.describe()));
+                app.sys(format!("† layout: {}", app.layout.describe()));
                 app.sys("  resize live: F4 fullscreen · F5 or click a pane, then arrows · Esc done");
                 app.sys(format!(
                     "  presets: {} — /layout save <name> · load <name> · rm <name>",
@@ -1677,15 +2422,15 @@ fn handle_command(
                 ));
             }
             "reset" | "default" => {
-                let roster = app.layout.roster_width;
+                let roster = app.layout.roster_width();
                 app.layout = Layout::default();
-                app.layout.roster_width = roster; // keep your roster choice on reset
+                app.layout.set_roster_width(roster); // keep your roster choice on reset
                 resized = true;
-                app.sys(format!("⛧ layout reset — {}", app.layout.describe()));
+                app.sys(format!("† layout reset — {}", app.layout.describe()));
             }
             "save" if !arg.is_empty() => match app.layout.save(arg) {
                 Ok(slug) => app.sys(format!(
-                    "⛧ saved layout '{slug}' — re-apply anytime with /layout load {slug}"
+                    "† saved layout '{slug}' — re-apply anytime with /layout load {slug}"
                 )),
                 Err(e) => app.err(format!("couldn't save layout: {e}")),
             },
@@ -1693,7 +2438,7 @@ fn handle_command(
                 Ok(l) => {
                     app.layout = l;
                     resized = true;
-                    app.sys(format!("⛧ loaded layout '{arg}' — {}", app.layout.describe()));
+                    app.sys(format!("† loaded layout '{arg}' — {}", app.layout.describe()));
                 }
                 Err(_) => app.err(format!(
                     "no saved layout '{arg}' — saved: {}",
@@ -1701,10 +2446,10 @@ fn handle_command(
                 )),
             },
             "list" | "presets" | "ls" => {
-                app.sys(format!("⛧ saved layouts: {}", once_or_none(Layout::available())));
+                app.sys(format!("† saved layouts: {}", once_or_none(Layout::available())));
             }
             "rm" | "delete" | "del" if !arg.is_empty() => match Layout::remove(arg) {
-                Ok(()) => app.sys(format!("⛧ deleted layout '{arg}'")),
+                Ok(()) => app.sys(format!("† deleted layout '{arg}'")),
                 Err(e) => app.err(format!("{e}")),
             },
             // Bare `/layout <name>` → load a saved preset if it exists.
@@ -1712,7 +2457,7 @@ fn handle_command(
                 Ok(l) => {
                     app.layout = l;
                     resized = true;
-                    app.sys(format!("⛧ loaded layout '{name}' — {}", app.layout.describe()));
+                    app.sys(format!("† loaded layout '{name}' — {}", app.layout.describe()));
                 }
                 Err(_) => app.sys(
                     "usage: /layout [save <name>|load <name>|list|rm <name>|reset] — resize live with F4/F5 or click",
@@ -1725,20 +2470,23 @@ fn handle_command(
     } else if line == "/drive" {
         // Mobile-friendly alternative to F2 (no function key needed).
         if app.sandbox.is_none() {
-            app.sys("no sandbox running — /sbx launch first");
+            app.sys("no sandbox running — /sbx <type> first");
         } else if app.can_drive() {
             app.driving = true;
-            app.sys("⛧ drive mode ON — type into the shell (Esc reaches vim etc.) · press F2 to release");
+            app.sys("† drive mode ON — type into the shell (Esc reaches vim etc.) · press F2 to release");
         } else {
             app.sys("you don't have drive permission — the owner can /grant you");
         }
     } else if let Some(rest) = line.strip_prefix("/sendroom ") {
-        // Offer a file/dir to the whole room — anyone may /accept.
-        offer_payload(app, send_seq, out_tx, room, app_tx, rest.trim(), None);
+        // Offer a file/dir to the whole room — anyone may /accept. An optional
+        // trailing `--attest <passphrase>` attaches a revealable attribution proof.
+        let (path, attest) = split_attest(rest.trim());
+        offer_payload(app, send_seq, out_tx, room, app_tx, path, None, attest);
     } else if let Some(rest) = line.strip_prefix("/send ") {
         // Direct send to one member: `/send <user> <path>`. Everyone receives the
-        // broadcast offer, but only <user> is prompted to /accept.
-        let rest = rest.trim();
+        // broadcast offer, but only <user> is prompted to /accept. An optional
+        // trailing `--attest <passphrase>` attaches a revealable attribution proof.
+        let (rest, attest) = split_attest(rest.trim());
         match rest.split_once(char::is_whitespace) {
             Some((who, path)) => {
                 let (who, path) = (who.trim(), path.trim());
@@ -1756,7 +2504,7 @@ fn handle_command(
                         .join(" · ");
                     app.err(format!("no member '{who}' in the room — try: {roster}"));
                 } else {
-                    offer_payload(app, send_seq, out_tx, room, app_tx, path, Some(who));
+                    offer_payload(app, send_seq, out_tx, room, app_tx, path, Some(who), attest);
                 }
             }
             None => app.sys("usage: /send <user> <path>  ·  /sendroom <path> for everyone"),
@@ -1779,15 +2527,39 @@ fn handle_command(
         } else {
             app.sys("no pending offer");
         }
+    } else if let Some(rest) = line.strip_prefix("/export-signed") {
+        // Package a directory into a portable, self-verifying ESA archive.
+        let (src, attest) = split_attest(rest.trim());
+        let src = src.trim();
+        if src.is_empty() {
+            app.sys("usage: /export-signed <dir> [--attest <passphrase>] — build a portable ESA-signed 7z");
+        } else {
+            export_signed(app, app_tx, src, attest);
+        }
     } else if let Some(rest) = line.strip_prefix("/sbx") {
         let mut p = rest.split_whitespace();
         match p.next() {
-            Some("launch") => {
+            // Grammar: `/sbx <vm type> <option>` — the backend leads, e.g.
+            // `/sbx podman`, `/sbx docker`, `/sbx multipass`, `/sbx local`.
+            // vbox is the exception that takes extra options (a VM name, `new`,
+            // confirm): `/sbx vbox gui <vm>`, `/sbx vbox new [name]`.
+            // `launch` stays accepted as a transitional alias (`/sbx launch
+            // <backend> …`) so older muscle memory and help strings keep working.
+            Some(
+                sub @ ("launch" | "docker" | "podman" | "multipass" | "local" | "vbox"
+                | "virtualbox" | "device" | "pager"),
+            ) => {
                 // `--start` (alias `--start-daemon` / `-y`) opts in to booting a
                 // stopped Docker daemon; everything else is positional. The first
-                // positional selects the backend: docker | multipass | vbox |
-                // local. Each runs on the *invoker's* own machine.
-                let args: Vec<&str> = p.collect();
+                // positional selects the backend: docker | podman | multipass |
+                // vbox | local. Each runs on the *invoker's* own machine.
+                let mut args: Vec<&str> = p.collect();
+                // Backend-led form: the matched token IS the backend, so push it to
+                // the front of the positional args where the `first` logic below
+                // expects it. The `launch` alias leaves the backend in `args` as-is.
+                if sub != "launch" {
+                    args.insert(0, sub);
+                }
                 let start_daemon = args
                     .iter()
                     .any(|a| matches!(*a, "--start" | "--start-daemon" | "-y"));
@@ -1795,28 +2567,31 @@ fn handle_command(
                 // `install` opts in to installing it (detect-then-install). It's
                 // a positional keyword (not the image), so filter it out below.
                 let want_install = args.iter().any(|a| matches!(*a, "install" | "--install"));
+                // `gui` is only meaningful for the vbox path (`/sbx vbox gui <vm>`);
+                // it's a keyword, not an image, so strip it from the positionals like
+                // `install` so the VM name is the next positional.
                 let mut pos = args
                     .iter()
                     .copied()
-                    .filter(|a| !a.starts_with('-') && !matches!(*a, "install"));
+                    .filter(|a| !a.starts_with('-') && !matches!(*a, "install" | "gui"));
                 let first = pos.next();
                 if matches!(first, Some("virtualbox") | Some("vbox")) {
                     // VirtualBox runs locally in its own GUI — host & guest each
                     // open their own copy, nothing is relayed. It's independent of
                     // the shared-PTY sandbox, so it bypasses the "already running"
-                    // guard. Grammar: `/sbx launch vbox [gui] <vm> [yes]`; a bare
-                    // `/sbx launch vbox` opens the arrow-navigable VM picker.
+                    // guard. Grammar: `/sbx vbox [gui] <vm> [yes]`; a bare
+                    // `/sbx vbox` opens the arrow-navigable VM picker.
                     let mut rest = pos.peekable();
                     if rest.peek() == Some(&"new") {
-                        // `/sbx launch vbox new [name]` — build a brand-new VM from
+                        // `/sbx vbox new [name]` — build a brand-new VM from
                         // a cloud image (cloud-init toolchain), not an existing one.
                         rest.next();
                         let name = rest.next().unwrap_or("hh-vbox").to_string();
                         launch_vbox_new(app, name, app.me.clone(), app_tx);
                     } else {
-                        if rest.peek() == Some(&"gui") {
-                            rest.next(); // optional `gui` keyword (sugar)
-                        }
+                        // The optional `gui` keyword is already stripped from `pos`
+                        // (it's a global option filter), so the next positional is
+                        // the VM name directly.
                         match rest.next() {
                             Some(vm) => {
                                 let confirmed = rest
@@ -1832,22 +2607,36 @@ fn handle_command(
                     let backend = first
                         .and_then(sbx::Backend::parse)
                         .unwrap_or(sbx::Backend::Local);
-                    let image = pos
-                        .next()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| backend.default_image().to_string());
-                    // Is this backend's binary present? Docker/Multipass can be
-                    // installed on consent; Local needs nothing and vbox is
-                    // handled in its own branch above.
+                    let image = if backend == sbx::Backend::Device {
+                        // A device has no OCI image — carry its ssh alias in the
+                        // image slot instead (spawn_launch uses it as the `name`,
+                        // and command_for opens `ssh -tt <alias>`). `/sbx pager`
+                        // is sugar for alias "pager"; `/sbx device <alias>` takes
+                        // an explicit alias positional.
+                        match first {
+                            Some("device") => pos.next().unwrap_or("pager").to_string(),
+                            _ => "pager".to_string(),
+                        }
+                    } else {
+                        pos.next()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| backend.default_image().to_string())
+                    };
+                    // Is this backend's binary present? Docker/Podman/Multipass can
+                    // be installed on consent; Local needs nothing and vbox is
+                    // handled in its own branch above. Podman is daemonless and
+                    // rootless, so unlike Docker it skips the daemon/sudo gates
+                    // below entirely (those are guarded by `== Backend::Docker`).
                     let installed = match backend {
                         sbx::Backend::Docker => sbx::docker_installed(),
+                        sbx::Backend::Podman => sbx::podman_installed(),
                         sbx::Backend::Multipass => sbx::multipass_installed(),
                         _ => true,
                     };
                     let token = first.unwrap_or("docker");
                     if !installed && !want_install {
                         app.err(format!(
-                            "{} is not installed — retry with `/sbx launch {token} install` to install it (needs sudo)",
+                            "{} is not installed — retry with `/sbx {token} install` to install it (needs sudo)",
                             backend.label()
                         ));
                     } else if installed
@@ -1855,41 +2644,72 @@ fn handle_command(
                         && !start_daemon
                         && !sbx::docker_daemon_up()
                     {
-                        app.err("docker daemon is not running — retry with `/sbx launch docker --start` to boot it (sudo), or run ./scripts/ensure-docker.sh in a terminal first");
+                        app.err("docker daemon is not running — retry with `/sbx docker --start` to boot it (sudo), or run ./scripts/ensure-docker.sh in a terminal first");
                     } else {
                         // install_first ⇒ binary missing + consent given: install
                         // it off-thread before provisioning (a fresh Docker
                         // install also leaves its daemon up).
                         let install_first = !installed;
+                        // Installing Docker needs root; booting its daemon needs
+                        // root too — *except* Docker Desktop, whose engine starts
+                        // via a per-user systemd unit with no sudo at all.
+                        let needs_sudo = install_first
+                            || (start_daemon
+                                && backend == sbx::Backend::Docker
+                                && !sbx::docker_daemon_up()
+                                && !sbx::docker_desktop());
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                        let (rows, cols) = sbx_dims(sz.0, sz.1, app.layout.effective_pty_pct());
-                        *launching = true;
+                        let (rows, cols) = sbx_grid(sz.0, sz.1, &app.layout);
                         let members: Vec<String> =
                             app.users.iter().map(|u| u.username.clone()).collect();
-                        if install_first {
-                            app.sys(format!(
-                                "installing {} (needs sudo)… then summoning the sandbox",
-                                backend.label()
-                            ));
+                        if needs_sudo && !sbx::sudo_ready() {
+                            // Root is needed but sudo isn't cached. sudo can't prompt
+                            // on the tty from inside the raw-mode TUI, so capture the
+                            // password in a masked, local-only modal and feed it to
+                            // `sudo -S`. The launch fires on submit (see the run loop).
+                            app.sudo_prompt = Some(SudoPrompt {
+                                password: String::new(),
+                                pending: PendingPrivileged::Launch(PendingSudoLaunch {
+                                    backend,
+                                    image,
+                                    members,
+                                    rows,
+                                    cols,
+                                    start_daemon,
+                                    install_first,
+                                }),
+                            });
+                            app.sys("🔒 sudo password needed — type it here (hidden), Enter to launch · Esc cancels. Local only: never sent to the room.");
                         } else {
-                            app.sys(format!(
-                                "summoning {} sandbox… (provisioning unix users; multipass boot ~30s)",
-                                backend.label()
-                            ));
+                            *launching = true;
+                            if install_first {
+                                app.sys(format!(
+                                    "installing {} (needs sudo)… then summoning the sandbox",
+                                    backend.label()
+                                ));
+                            } else if backend == sbx::Backend::Device {
+                                app.sys(format!("opening {image} shell over ssh… (/drive to type once granted)"));
+                            } else {
+                                app.sys(format!(
+                                    "summoning {} sandbox… (provisioning unix users; multipass boot ~30s)",
+                                    backend.label()
+                                ));
+                            }
+                            spawn_launch(
+                                backend,
+                                image,
+                                app.me.clone(),
+                                members,
+                                rows,
+                                cols,
+                                start_daemon,
+                                install_first,
+                                None,
+                                pty_tx.clone(),
+                                broker_tx.clone(),
+                                app_tx.clone(),
+                            );
                         }
-                        spawn_launch(
-                            backend,
-                            image,
-                            app.me.clone(),
-                            members,
-                            rows,
-                            cols,
-                            start_daemon,
-                            install_first,
-                            pty_tx.clone(),
-                            broker_tx.clone(),
-                            app_tx.clone(),
-                        );
                     }
                 }
             }
@@ -1940,11 +2760,20 @@ fn handle_command(
                         app.sys("multipass must power off to snapshot — stopping the shared shell, then saving (reload it with `/sbx load`)");
                     }
                     let (tx, lbl) = (app_tx.clone(), label.clone());
+                    let created_by = app.me.clone();
                     tokio::spawn(async move {
-                        let res = tokio::task::spawn_blocking(move || sbx::save_state(be, &name, &label, local)).await;
+                        let res = tokio::task::spawn_blocking(move || {
+                            let desc = sbx::save_state(be, &name, &label, local)?;
+                            // Index the snapshot in the host-global registry, caching
+                            // its .hh-agent manifest summary. Best-effort: an index
+                            // hiccup must never fail the save the user just asked for.
+                            snapshot::register_saved_snapshot(be, &name, &label, &created_by);
+                            Ok::<String, anyhow::Error>(desc)
+                        })
+                        .await;
                         let _ = match res {
                             Ok(Ok(desc)) => tx.send(Net::Sys(format!(
-                                "⛧ saved sandbox → {desc} · reload with `/sbx load {lbl}`"))),
+                                "† saved sandbox → {desc} · reload with `/sbx load {lbl}` · `/sbx browse`"))),
                             Ok(Err(e)) => tx.send(Net::Err(format!("save failed: {e}"))),
                             Err(e) => tx.send(Net::Err(format!("save task: {e}"))),
                         };
@@ -1954,7 +2783,7 @@ fn handle_command(
                 }
             }
             Some("load") => match p.next() {
-                None => app.sys("usage: /sbx load <label>  (a docker or multipass snapshot saved via /sbx save)"),
+                None => app.sys("usage: /sbx load <label>  (a docker, podman or multipass snapshot saved via /sbx save)"),
                 Some(label) if !is_snap_label(label) => {
                     app.sys("snapshot label must be alphanumerics, '.', '_' or '-'");
                 }
@@ -1968,7 +2797,7 @@ fn handle_command(
                         // (stopped, preserved) instance and re-attaches its shell.
                         let label = label.to_string();
                         let sz = term.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                        let (rows, cols) = sbx_dims(sz.0, sz.1, app.layout.effective_pty_pct());
+                        let (rows, cols) = sbx_grid(sz.0, sz.1, &app.layout);
                         *launching = true;
                         let members: Vec<String> =
                             app.users.iter().map(|u| u.username.clone()).collect();
@@ -1986,7 +2815,7 @@ fn handle_command(
                             match kind {
                                 sbx::SnapKind::Docker => {
                                     if !sbx::docker_daemon_up() {
-                                        let _ = atx.send(Net::Err("docker daemon is not running — `/sbx launch docker --start` once to boot it, then retry".into()));
+                                        let _ = atx.send(Net::Err("docker daemon is not running — `/sbx docker --start` once to boot it, then retry".into()));
                                         let _ = btx.send(BrokerMsg::Failed);
                                         return;
                                     }
@@ -1994,7 +2823,17 @@ fn handle_command(
                                     let _ = atx.send(Net::Sys(format!("loading docker sandbox from {image}…")));
                                     spawn_launch(
                                         sbx::Backend::Docker, image, owner, members, rows,
-                                        cols, false, false, pty, btx, atx,
+                                        cols, false, false, None, pty, btx, atx,
+                                    );
+                                }
+                                sbx::SnapKind::Podman => {
+                                    // Podman is daemonless — no daemon-up check; the
+                                    // committed image reruns directly via the engine.
+                                    let image = format!("{}:{}", sbx::SNAP_REPO, label);
+                                    let _ = atx.send(Net::Sys(format!("loading podman sandbox from {image}…")));
+                                    spawn_launch(
+                                        sbx::Backend::Podman, image, owner, members, rows,
+                                        cols, false, false, None, pty, btx, atx,
                                     );
                                 }
                                 sbx::SnapKind::Multipass => {
@@ -2005,11 +2844,11 @@ fn handle_command(
                                     .await;
                                     match res {
                                         Ok(Ok(desc)) => {
-                                            let _ = atx.send(Net::Sys(format!("⛧ {desc} · booting…")));
+                                            let _ = atx.send(Net::Sys(format!("† {desc} · booting…")));
                                             spawn_launch(
                                                 sbx::Backend::Multipass,
                                                 sbx::Backend::Multipass.default_image().to_string(),
-                                                owner, members, rows, cols, false, false, pty, btx, atx,
+                                                owner, members, rows, cols, false, false, None, pty, btx, atx,
                                             );
                                         }
                                         Ok(Err(e)) => {
@@ -2050,6 +2889,97 @@ fn handle_command(
                     };
                 });
             }
+            Some("browse") | Some("registry") => {
+                // The discovery layer: every saved VM with WHAT it's for + where the
+                // work stands, read from the host-global registry. Reconciled against
+                // the engine so pruned snapshots drop out (no passive accumulation).
+                let tx = app_tx.clone();
+                tokio::spawn(async move {
+                    let res = tokio::task::spawn_blocking(|| {
+                        registry::list_reconciled(oci_image_exists)
+                    })
+                    .await;
+                    match res {
+                        Ok(entries) if !entries.is_empty() => {
+                            let _ = tx.send(Net::Sys(format!("saved VMs ({}):", entries.len())));
+                            for e in entries {
+                                let purpose = if e.purpose.is_empty() { "—" } else { e.purpose.as_str() };
+                                let status = if e.status.is_empty() { "?" } else { e.status.as_str() };
+                                let mut line = format!("  • {} · [{}] · {}", e.label, status, purpose);
+                                let nt = e.next_todo();
+                                if !nt.is_empty() {
+                                    line.push_str(&format!(" · next: {nt}"));
+                                }
+                                let _ = tx.send(Net::Sys(line));
+                                let _ = tx.send(Net::Sys(format!(
+                                    "      load with `/sbx load {}`", e.label)));
+                            }
+                        }
+                        Ok(_) => {
+                            let _ = tx.send(Net::Sys(
+                                "no saved VMs yet — `/sbx save [label]` records one with its manifest".into()));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Net::Err(format!("browse task: {e}")));
+                        }
+                    }
+                });
+            }
+            Some("publish") => {
+                // Mark a saved VM shareable so peers can pull it. Ensures a
+                // portable artifact exists (exports an image-backed snap to a
+                // `.tar`), then flips the registry entry's `shareable` flag.
+                let args: Vec<String> = p.map(str::to_string).collect();
+                let mut pos = args.iter().filter(|a| !a.starts_with('-'));
+                match pos.next() {
+                    None => app.sys(
+                        "usage: /sbx publish <label> [tag…]  (mark a saved VM shareable so peers can /sbx pull it)",
+                    ),
+                    Some(label) => {
+                        let label = label.clone();
+                        let tags: Vec<String> = pos.cloned().collect();
+                        app.sys(format!("publishing '{label}'…"));
+                        let tx = app_tx.clone();
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(move || {
+                                snapshot::publish_snapshot(&label, &tags)
+                            })
+                            .await;
+                            let _ = match res {
+                                Ok(Ok(msg)) => tx.send(Net::Sys(msg)),
+                                Ok(Err(e)) => tx.send(Net::Err(format!("publish failed: {e:#}"))),
+                                Err(e) => tx.send(Net::Err(format!("publish task: {e}"))),
+                            };
+                        });
+                    }
+                }
+            }
+            Some("catalog") => {
+                // Ask a peer what VMs they offer. They reply with a `_sbx:catalog`
+                // frame (handled in apply → printed). Leading '@' optional.
+                match p.next().map(|s| s.trim_start_matches('@')) {
+                    Some(u) if !u.is_empty() => {
+                        send_frame(out_tx, room, json!({"_sbx":"catreq","to": u}));
+                        app.sys(format!("requested {u}'s shareable VMs…"));
+                    }
+                    _ => app.sys("usage: /sbx catalog @<user>  (ask a peer which VMs they offer)"),
+                }
+            }
+            Some("pull") => {
+                // Pull a published VM from a peer: send a pullreq; they `/send` the
+                // artifact and our ft path auto-imports + registers it on /accept.
+                let who = p.next().map(|s| s.trim_start_matches('@').to_string());
+                let label = p.next().map(str::to_string);
+                match (who, label) {
+                    (Some(u), Some(l)) if !u.is_empty() && !l.is_empty() => {
+                        send_frame(out_tx, room, json!({"_sbx":"pullreq","to": u,"label": l}));
+                        app.sys(format!(
+                            "asked {u} for ‘{l}’ — when it offers, `/accept` to receive + import it"
+                        ));
+                    }
+                    _ => app.sys("usage: /sbx pull @<user> <label>  (pull a published VM from a peer)"),
+                }
+            }
             Some("vms") => {
                 let tx = app_tx.clone();
                 tokio::spawn(async move {
@@ -2058,15 +2988,23 @@ fn handle_command(
                             "VirtualBox isn't installed — install it with `/sbx gui <vm> --install`, or run ./scripts/ensure-vbox.sh".to_string()
                         })?;
                         let vms = sbx::list_vms().map_err(|e| e.to_string())?;
-                        Ok::<_, String>((ver, vms))
+                        let running = sbx::running_vms();
+                        Ok::<_, String>((ver, vms, running))
                     })
                     .await;
                     let _ = match res {
-                        Ok(Ok((ver, v))) if !v.is_empty() => tx.send(Net::Sys(format!(
+                        Ok(Ok((ver, v, running))) if !v.is_empty() => tx.send(Net::Sys(format!(
                             "VirtualBox {ver} detected · VMs: {}",
-                            v.join(", ")
+                            v.iter()
+                                .map(|n| if running.iter().any(|r| r == n) {
+                                    format!("{n} ▶")
+                                } else {
+                                    n.clone()
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ))),
-                        Ok(Ok((ver, _))) => tx.send(Net::Sys(format!(
+                        Ok(Ok((ver, _, _))) => tx.send(Net::Sys(format!(
                             "VirtualBox {ver} detected · no VMs registered"
                         ))),
                         Ok(Err(e)) => tx.send(Net::Err(e)),
@@ -2100,7 +3038,7 @@ fn handle_command(
                                 })
                                 .await;
                                 let _ = match res {
-                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ saved VM → {desc}"))),
+                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("† saved VM → {desc}"))),
                                     Ok(Err(e)) => tx.send(Net::Err(format!("vmsave failed: {e}"))),
                                     Err(e) => tx.send(Net::Err(format!("vmsave task: {e}"))),
                                 };
@@ -2159,7 +3097,7 @@ fn handle_command(
                                 })
                                 .await;
                                 let _ = match res {
-                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
+                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("† {desc}"))),
                                     Ok(Err(e)) => tx.send(Net::Err(format!("vmload failed: {e}"))),
                                     Err(e) => tx.send(Net::Err(format!("vmload task: {e}"))),
                                 };
@@ -2168,10 +3106,106 @@ fn handle_command(
                     }
                 }
             }
+            Some("vmlib") => {
+                // VM library: a catalog of pointers to installable VMs (no
+                // images are bundled). Bare `/sbx vmlib` lists the catalog
+                // marking which are already installed locally; `/sbx vmlib <id>`
+                // shows the pointer/notes; `/sbx vmlib <id> install [--iso path]`
+                // builds the chosen VM locally on the caller's own machine.
+                let args: Vec<&str> = p.collect();
+                let iso = args
+                    .iter()
+                    .position(|a| *a == "--iso")
+                    .and_then(|i| args.get(i + 1).copied())
+                    .map(str::to_string);
+                let mut pos = args.iter().copied().filter(|a| !a.starts_with('-'));
+                match pos.next() {
+                    None => {
+                        // Catalog listing
+                        let tx = app_tx.clone();
+                        tokio::spawn(async move {
+                            let res =
+                                tokio::task::spawn_blocking(sbx::vbox_library).await;
+                            let _ = match res {
+                                Ok(Ok(vms)) => {
+                                    let body = vms
+                                        .iter()
+                                        .map(|v| {
+                                            let mark = if v.installed { "✓" } else { "↓" };
+                                            format!("{mark} {} — {} ({})", v.id, v.name, v.os)
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    tx.send(Net::Sys(format!(
+                                        "VM library (✓ installed · ↓ available) — `/sbx vmlib <id>` for details, `/sbx vmlib <id> install` to build locally:\n{body}"
+                                    )))
+                                }
+                                Ok(Err(e)) => tx.send(Net::Err(format!("vmlib: {e}"))),
+                                Err(e) => tx.send(Net::Err(format!("vmlib task: {e}"))),
+                            };
+                        });
+                    }
+                    Some(id) => {
+                        let id = id.to_string();
+                        let action = pos.next();
+                        if matches!(action, Some("install")) {
+                            app.sys(format!(
+                                "building VM '{id}' locally{}… (this downloads + provisions on your own machine; watch for a VirtualBox window)",
+                                iso.as_deref().map(|p| format!(" from {p}")).unwrap_or_default()
+                            ));
+                            let (tx, iso) = (app_tx.clone(), iso.clone());
+                            tokio::spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    sbx::vbox_library_install(&id, iso)
+                                })
+                                .await;
+                                let _ = match res {
+                                    Ok(Ok(desc)) => tx.send(Net::Sys(format!("† {desc}"))),
+                                    Ok(Err(e)) => tx.send(Net::Err(format!("vmlib install failed: {e}"))),
+                                    Err(e) => tx.send(Net::Err(format!("vmlib install task: {e}"))),
+                                };
+                            });
+                        } else {
+                            // Info / pointer for one entry
+                            let tx = app_tx.clone();
+                            tokio::spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    sbx::library_vm(&id).ok_or(id)
+                                })
+                                .await;
+                                let _ = match res {
+                                    Ok(Ok(v)) => {
+                                        let state = if v.installed {
+                                            "already installed".to_string()
+                                        } else {
+                                            "available — `/sbx vmlib <id> install` to build locally".to_string()
+                                        };
+                                        let mut body = format!(
+                                            "{} ({}) · {} · {}\n{}",
+                                            v.name, v.id, v.os, v.size, state
+                                        );
+                                        if !v.notes.is_empty() {
+                                            body.push_str(&format!("\n{}", v.notes));
+                                        }
+                                        if !v.page.is_empty() {
+                                            body.push_str(&format!("\nsource: {}", v.page));
+                                        }
+                                        tx.send(Net::Sys(body))
+                                    }
+                                    Ok(Err(bad)) => tx.send(Net::Err(format!(
+                                        "no VM library entry '{bad}' — `/sbx vmlib` lists the catalog"
+                                    ))),
+                                    Err(e) => tx.send(Net::Err(format!("vmlib task: {e}"))),
+                                };
+                            });
+                        }
+                    }
+                }
+            }
             Some("gui") => {
-                // Convenience alias for `/sbx launch vbox gui <vm> [yes]` — opens a
+                // Convenience alias for `/sbx vbox gui <vm> [yes]` — opens a
                 // local VirtualBox VM's GUI on your own machine. Bare `/sbx gui`
-                // opens the VM picker, same as `/sbx launch vbox`.
+                // opens the VM picker, same as `/sbx vbox`.
                 let mut gpos = p.filter(|a| !a.starts_with('-'));
                 match gpos.next() {
                     Some(vm) => {
@@ -2182,9 +3216,17 @@ fn handle_command(
                     None => open_vbox_picker(app),
                 }
             }
-            _ => app.sys(
-                "usage: /sbx launch vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx launch vbox new [name] (fresh VM) · /sbx gui <vm> alias · launch <docker|multipass> [image] (or local) · vms · stop · save [label] [--local] · load <label> · snaps · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>",
-            ),
+            other => {
+                let usage = "usage: /sbx <type> <option> — /sbx docker|podman|multipass|local [image] · /sbx vbox [gui] <vm> [yes] (host opens directly; non-host appends yes) · /sbx vbox new [name] (fresh VM) · vmlib [<id> [install [--iso path]]] (VM library — build locally) · vms · stop · save [label] [--local] · load <label> · snaps · browse (saved VMs + what each is for) · publish <label> [tag…] (mark shareable) · catalog @user (peer's VMs) · pull @user <label> (fetch a peer's VM) · vmsave <vm> [label] [--local] · vmload <vm> [label] · vmsnaps <vm>";
+                // Bare `/sbx` → usage. An unrecognised subcommand → suggest the
+                // closest documented one before the usage line.
+                match other.and_then(|bad| closest(bad, SBX_SUBCOMMANDS).map(|s| (bad, s))) {
+                    Some((bad, s)) => {
+                        app.sys(format!("unknown `/sbx {bad}` — did you mean `/sbx {s}`?  {usage}"))
+                    }
+                    None => app.sys(usage.to_string()),
+                }
+            }
         }
     } else if let Some(rest) = line.strip_prefix("/unsudo") {
         let target = rest.trim();
@@ -2221,7 +3263,26 @@ fn handle_command(
         if !app.is_owner() {
             app.sys("only the sandbox owner can /grant");
         } else if target.is_empty() {
-            app.sys("usage: /grant <user>");
+            app.sys("usage: /grant <user>  (or /grant ai for every AI agent)");
+        } else if target == "ai" {
+            // Grant drive to every AI agent in the room in one shot, so the owner
+            // never has to name each model. Intersect the known-AI set with the
+            // live roster so departed agents are skipped.
+            let agents: Vec<String> = app
+                .users
+                .iter()
+                .map(|u| u.username.clone())
+                .filter(|n| app.ai_agents.contains(n))
+                .collect();
+            if agents.is_empty() {
+                app.sys("no AI agents in the room to grant — /ai start one first");
+            } else {
+                for n in &agents {
+                    app.drivers.insert(n.clone());
+                }
+                broadcast_acl(out_tx, room, app);
+                app.sys(format!("granted drive to all AI agents: {}", agents.join(", ")));
+            }
         } else {
             app.drivers.insert(target.to_string());
             broadcast_acl(out_tx, room, app);
@@ -2240,6 +3301,40 @@ fn handle_command(
             broadcast_acl(out_tx, room, app);
             app.sys(format!("revoked drive from {target}"));
         }
+    } else if let Some(rest) = line
+        .strip_prefix("/web")
+        .filter(|r| r.is_empty() || r.starts_with(' '))
+    {
+        // The `/web …` operator channel is consumed by the web publisher, which
+        // taps room chat for owner-issued commands. The TUI's job is to forward
+        // the line so the publisher can act on it — and, for an *approval*, to
+        // collapse the grant two-step: auto-ensure Gate A (the publisher holds the
+        // room driver token) before forwarding, so the owner no longer has to
+        // `/grant` the publisher as a separate step.
+        let rest = rest.trim();
+        if !app.connected {
+            app.sys("not connected — can't reach the web relay");
+        } else {
+            // Grant-collapse fires only for the approval verb, only while a
+            // sandbox is running (owner known), and only from the sandbox owner
+            // (fail closed — same rule as /grant). We grant the *tapped* publisher
+            // by its server-authenticated name; if no presence frame has arrived
+            // yet the publisher's own "drive token not held" notice is the fallback.
+            let approving = rest.split_whitespace().next() == Some("allow");
+            if approving && app.sandbox.is_some() && app.is_owner() {
+                if let Some(pubname) = app.web_publisher.clone() {
+                    if !app.drivers.contains(&pubname) {
+                        app.drivers.insert(pubname.clone());
+                        broadcast_acl(out_tx, room, app);
+                        app.sys(format!(
+                            "† auto-granted drive to {pubname} (web relay) so the approval enables typing"
+                        ));
+                    }
+                }
+            }
+            // Forward the raw `/web …` line to the room for the publisher to tap.
+            let _ = out_tx.send(WsMsg::Text(room.encrypt(line.as_bytes())));
+        }
     } else if line == "/ai stop" {
         // Reap a child that already exited (e.g. failed auth) so the message is honest.
         if agent
@@ -2251,7 +3346,7 @@ fn handle_command(
         if let Some(mut child) = agent.take() {
             let _ = child.kill();
             let _ = child.wait();
-            app.sys("⛧ dismissed the AI agent");
+            app.sys("† dismissed the AI agent");
             // Drop any sandbox drive the agent held so a dead handle can't act.
             app.agent_sbx_allow = false;
             let revoked = app
@@ -2275,15 +3370,45 @@ fn handle_command(
         {
             *agent = None;
         }
-        if agent.is_some() {
+        if !app.is_owner() && !app.can_drive() {
+            // Summoning an agent joins a new member that (with `allow`) can drive
+            // the shared sandbox — a privileged action. Only the room owner or a
+            // granted driver may do it; everyone else is told to ask for /grant.
+            // `/ai list` stays open so any member can still see their own models.
+            app.sys("/ai start needs drive permission — ask the host to /grant you first");
+        } else if agent.is_some() {
             app.sys("an AI agent is already running from this client — /ai stop first");
         } else {
-            // A trailing `allow` flag auto-grants the agent sandbox drive on launch.
-            let raw = rest.trim();
-            let (raw, grant_sbx) = match raw.strip_suffix("allow") {
-                Some(head) if head.is_empty() || head.ends_with(' ') => (head.trim(), true),
-                _ => (raw, false),
-            };
+            // Trailing flag words (any order): `allow` auto-grants the agent
+            // sandbox drive on launch; the harness word `native` (default) or
+            // `simple` picks the granted-`!task` harness. `plain` is a back-compat
+            // alias for `simple`.
+            let mut raw = rest.trim();
+            let mut grant_sbx = false;
+            let mut harness: Option<&str> = None;
+            loop {
+                if let Some(head) = raw
+                    .strip_suffix("allow")
+                    .filter(|h| h.is_empty() || h.ends_with(' '))
+                {
+                    grant_sbx = true;
+                    raw = head.trim();
+                    continue;
+                }
+                if let Some((word, head)) = ["native", "simple", "plain"]
+                    .iter()
+                    .find_map(|w| {
+                        raw.strip_suffix(w)
+                            .filter(|h| h.is_empty() || h.ends_with(' '))
+                            .map(|h| (*w, h))
+                    })
+                {
+                    harness = Some(if word == "native" { "native" } else { "simple" });
+                    raw = head.trim();
+                    continue;
+                }
+                break;
+            }
             // A bare name (no ':' tag, no '/' path) is a models.toml profile;
             // anything else is treated as a literal Ollama model tag.
             let (profile, model): (Option<&str>, &str) = if raw.is_empty() {
@@ -2297,7 +3422,7 @@ fn handle_command(
             // profile keeps its label; a direct Ollama model uses its tag
             // (e.g. "qwen2.5:3b" — model name + parameter size).
             let name = profile.unwrap_or(model);
-            match spawn_agent(params, &app.password, name, profile, model) {
+            match spawn_agent(params, &app.password, name, profile, model, harness) {
                 Ok(child) => {
                     *agent = Some(child);
                     app.agent_name = Some(name.to_string());
@@ -2306,8 +3431,12 @@ fn handle_command(
                         Some(p) => format!("profile {p}"),
                         None => format!("ollama/{model}"),
                     };
+                    let hdesc = match harness {
+                        Some(h) => format!(", {h} harness"),
+                        None => String::new(),
+                    };
                     app.sys(format!(
-                        "⛧ summoning {name} ({desc})… it will announce when online"
+                        "† summoning {name} ({desc}{hdesc})… it will announce when online"
                     ));
                     if grant_sbx {
                         // Grant now if a sandbox is already running; otherwise the
@@ -2317,7 +3446,7 @@ fn handle_command(
                             broadcast_acl(out_tx, room, app);
                         }
                         app.sys(format!(
-                            "⛧ {name} will get sandbox drive — Ctrl-X kills all drive in a pinch"
+                            "† {name} will get sandbox drive — Ctrl-X kills all drive in a pinch"
                         ));
                     }
                 }
@@ -2357,6 +3486,21 @@ fn handle_command(
                 let _ = tx.send(Net::Sys(msg));
             });
         }
+    } else if line.starts_with('/') {
+        // Leading slash but no command branch matched. Either a known command
+        // family that intentionally falls through to chat (notably `/ai
+        // <question>`, which a running agent reads from the room), or a typo we
+        // should help with instead of silently broadcasting as a chat message.
+        let cmd = line.split_whitespace().next().unwrap_or(line);
+        if KNOWN_COMMANDS.contains(&cmd) {
+            if app.connected {
+                let _ = out_tx.send(WsMsg::Text(room.encrypt(line.as_bytes())));
+            }
+        } else if let Some(s) = closest(cmd, KNOWN_COMMANDS) {
+            app.sys(format!("unknown command ‘{cmd}’ — did you mean `{s}`?  (/help lists all)"));
+        } else {
+            app.sys(format!("unknown command ‘{cmd}’ — /help lists all commands"));
+        }
     } else if !line.is_empty() && app.connected {
         let _ = out_tx.send(WsMsg::Text(room.encrypt(line.as_bytes())));
     }
@@ -2393,6 +3537,103 @@ fn local_ollama_models() -> Result<Vec<String>, String> {
         })
         .unwrap_or_default();
     Ok(models)
+}
+
+/// Every top-level slash command (the leading token). Used both to recognise a
+/// known command family that legitimately falls through to chat (e.g. `/ai
+/// <question>`) and as the candidate set for the "did you mean" suggester.
+const KNOWN_COMMANDS: &[&str] = &[
+    "/help", "/?", "/clear", "/cls", "/pw", "/password", "/share", "/theme", "/layout", "/music",
+    "/drive", "/sendroom", "/send", "/accept", "/reject", "/sbx", "/unsudo", "/sudo", "/grant",
+    "/revoke", "/kick", "/ai", "/web",
+];
+
+/// Canonical `/sbx` subcommands (backends + actions) for the subcommand-level
+/// "did you mean". Aliases (`launch`, `virtualbox`, `snapshots`, `gui`) are
+/// omitted so suggestions point at the documented form.
+const SBX_SUBCOMMANDS: &[&str] = &[
+    "docker", "podman", "multipass", "local", "vbox", "stop", "save", "load", "snaps", "browse",
+    "publish", "catalog", "pull", "vms", "vmsave", "vmload", "vmsnaps", "vmlib",
+];
+
+/// Classic Levenshtein edit distance (insert/delete/substitute, each cost 1).
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The nearest candidate to `input` by edit distance, if one is close enough to
+/// be a plausible typo: distance ≤ 3 and strictly less than the input length (so
+/// a tiny stray token doesn't "match" everything). Case-insensitive; ties go to
+/// the first candidate. Returns `None` when nothing is close.
+fn closest<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let input = input.to_ascii_lowercase();
+    let len = input.chars().count();
+    candidates
+        .iter()
+        .map(|c| (levenshtein(&input, &c.to_ascii_lowercase()), *c))
+        .filter(|(d, _)| *d <= 3 && *d < len)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c)
+}
+
+/// Load a pulled `hh-snap-<label>.tar` into the local engine and record it in the
+/// host registry, scraping the `.hh-agent` manifest that rides inside the image so
+/// the receiver's `/sbx browse`/`load` know what the VM is for. Blocking — runs
+/// off the UI thread. Returns a status line for the room. The kept `.tar` doubles
+/// as this host's portable artifact, so a pulled VM is immediately re-shareable.
+fn register_received_snapshot(tar: &std::path::Path) -> anyhow::Result<String> {
+    let (engine, image, label) = sbx::import_image_archive(tar)?;
+    let (purpose, status, todo) = sbx::read_image_manifest(&engine, &image)
+        .as_deref()
+        .map(registry::scan_manifest)
+        .unwrap_or_default();
+    let entry = registry::Entry {
+        label: label.clone(),
+        backend: engine.clone(),
+        artifact_kind: "image".to_string(),
+        artifact_ref: image.clone(),
+        size_bytes: snapshot::oci_image_size(&engine, &image),
+        created_unix: registry::now_unix(),
+        created_by: "pulled".to_string(),
+        repo: registry::cwd_repo(),
+        purpose,
+        status,
+        // The received file is already a portable artifact — keep it shareable so
+        // a pulled skill VM can be re-traded onward without re-exporting.
+        share_path: tar.to_string_lossy().into_owned(),
+        shareable: true,
+        todo,
+        ..Default::default()
+    };
+    registry::upsert(entry)?;
+    Ok(format!(
+        "† imported snapshot ‘{label}’ — `/sbx load {label}` to boot it · `/sbx browse` for details"
+    ))
+}
+
+/// Does an OCI image still exist? Used to reconcile the registry so entries whose
+/// snapshot was pruned drop out of `/sbx browse`. Blocking.
+fn oci_image_exists(backend: &str, image: &str) -> bool {
+    let engine = if backend == "podman" { "podman" } else { "docker" };
+    std::process::Command::new(engine)
+        .args(["image", "inspect", image])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// A safe snapshot label — compatible with both a Docker image tag and a
@@ -2442,16 +3683,16 @@ fn find_local_appliance(vm: &str) -> Option<std::path::PathBuf> {
 /// Empty/uninstalled cases steer the user instead of opening an empty list.
 fn open_vbox_picker(app: &mut App) {
     if !sbx::vbox_installed() {
-        app.sys("VirtualBox isn't installed — `/sbx launch vbox gui <vm> yes` installs it, or run ./scripts/ensure-vbox.sh");
+        app.sys("VirtualBox isn't installed — `/sbx vbox gui <vm> yes` installs it, or run ./scripts/ensure-vbox.sh");
         return;
     }
     match sbx::list_vms() {
         Ok(vms) if !vms.is_empty() => {
             app.vbox_picker = Some(VboxPicker { vms, selected: 0 });
-            app.sys("⛧ pick a VM — ↑/↓ move · Enter/Tab choose · Esc dismiss");
+            app.sys("† pick a VM — ↑/↓ move · Enter/Tab choose · Esc dismiss");
         }
         Ok(_) => app.sys(
-            "no VirtualBox VMs registered — a host can /send you a .ova, then `/sbx launch vbox gui <vm> yes` to import it",
+            "no VirtualBox VMs registered — a host can /send you a .ova, then `/sbx vbox gui <vm> yes` to import it",
         ),
         Err(e) => app.err(format!("listing VMs: {e}")),
     }
@@ -2459,7 +3700,7 @@ fn open_vbox_picker(app: &mut App) {
 
 /// Launch (or pull-then-launch) a local VirtualBox VM's GUI on the caller's OWN
 /// machine — nothing is relayed; every member opens their own copy. Shared by
-/// `/sbx launch vbox gui <vm>` and the `/sbx gui <vm>` alias.
+/// `/sbx vbox gui <vm>` and the `/sbx gui <vm>` alias.
 ///
 /// Frictionless for a "host" who already has VirtualBox AND the VM imported with
 /// no other VM holding VT-x: it just boots. A non-host missing VirtualBox or the
@@ -2494,7 +3735,7 @@ fn launch_vbox_new(app: &mut App, name: String, user: String, app_tx: &Unbounded
         let (n, u) = (name.clone(), user);
         let res = tokio::task::spawn_blocking(move || sbx::vbox_new(&n, &u)).await;
         let _ = match res {
-            Ok(Ok(desc)) => tx.send(Net::Sys(format!("⛧ {desc}"))),
+            Ok(Ok(desc)) => tx.send(Net::Sys(format!("† {desc}"))),
             Ok(Err(e)) => tx.send(Net::Err(format!("vbox new failed: {e}"))),
             Err(e) => tx.send(Net::Err(format!("vbox new task: {e}"))),
         };
@@ -2524,7 +3765,7 @@ fn launch_vbox_gui(
     // Host path: VirtualBox + this VM already present and nothing to stop → boot
     // immediately, no confirmation.
     if installed && have_vm && conflicts.is_empty() {
-        spawn_vm_execute(vm, conflicts, false, false, app, app_tx, out_tx, room);
+        spawn_vm_execute(vm, conflicts, false, false, app, app_tx, out_tx, room, None);
         return;
     }
 
@@ -2540,7 +3781,7 @@ fn launch_vbox_gui(
                 Some(p) => steps.push(format!("import {}", p.display())),
                 None => {
                     app.sys(format!(
-                        "no local appliance for ‘{vm}’ yet — have the host export it (`/sbx vmsave {vm} --local`) and /send you the .ova, then `/sbx launch vbox gui {vm} yes`"
+                        "no local appliance for ‘{vm}’ yet — have the host export it (`/sbx vmsave {vm} --local`) and /send you the .ova, then `/sbx vbox gui {vm} yes`"
                     ));
                     return;
                 }
@@ -2550,7 +3791,7 @@ fn launch_vbox_gui(
             steps.push(format!("stop {} other VM(s) holding VT-x", conflicts.len()));
         }
         app.sys(format!(
-            "opening ‘{vm}’ on YOUR machine will {}.  →  `/sbx launch vbox gui {vm} yes` to proceed",
+            "opening ‘{vm}’ on YOUR machine will {}.  →  `/sbx vbox gui {vm} yes` to proceed",
             steps.join(", ")
         ));
         return;
@@ -2559,12 +3800,30 @@ fn launch_vbox_gui(
     // Confirmed. Refuse VT-x holders we can't cleanly restart rather than kill them.
     if let Some(bad) = conflicts.iter().find(|h| !h.stoppable) {
         app.err(format!(
-            "can't free VT-x automatically — {} is running and I won't kill it. Stop it yourself, then retry `/sbx launch vbox gui {vm} yes`.",
+            "can't free VT-x automatically — {} is running and I won't kill it. Stop it yourself, then retry `/sbx vbox gui {vm} yes`.",
             bad.label
         ));
         return;
     }
-    spawn_vm_execute(vm, conflicts, needs_install, needs_import, app, app_tx, out_tx, room);
+    // Installing VirtualBox needs root. If creds aren't cached, capture the
+    // password in the same masked, local-only modal the container path uses —
+    // sudo can't prompt on the tty from inside the raw-mode TUI. The install +
+    // VM boot fires on submit (see the run loop's sudo handler).
+    if needs_install && !sbx::sudo_ready() {
+        app.sudo_prompt = Some(SudoPrompt {
+            password: String::new(),
+            pending: PendingPrivileged::VboxInstall(PendingVboxInstall {
+                vm,
+                conflicts,
+                needs_install,
+                needs_import,
+                room: room.clone(),
+            }),
+        });
+        app.sys("🔒 sudo password needed to install VirtualBox — type it here (hidden), Enter to proceed · Esc cancels. Local only: never sent to the room.");
+        return;
+    }
+    spawn_vm_execute(vm, conflicts, needs_install, needs_import, app, app_tx, out_tx, room, None);
 }
 
 /// Final step of the gauntlet: off-thread, stop any VT-x holders (reversibly),
@@ -2584,6 +3843,10 @@ fn spawn_vm_execute(
     app_tx: &UnboundedSender<Net>,
     out_tx: &UnboundedSender<WsMsg>,
     room: &Arc<fernet::Fernet>,
+    // sudo password captured by the masked modal when VBox install needed root
+    // and creds weren't cached. Fed to the install's `sudo -S` over stdin; `None`
+    // means creds are already cached (the install step uses `sudo -n`).
+    password: Option<String>,
 ) {
     // Resolve the appliance path now (on the app thread) so the blocking task
     // doesn't have to re-scan; None is fine unless an import actually proves
@@ -2605,13 +3868,18 @@ fn spawn_vm_execute(
     let out = out_tx.clone();
     let room = room.clone();
     let announce_vm = vm.clone();
+    let pw = password; // moved into the blocking install step below
     tokio::spawn(async move {
         let res = tokio::task::spawn_blocking(move || {
             for h in &conflicts {
                 sbx::stop_vtx_holder(h).map_err(|e| format!("freeing VT-x: {e}"))?;
             }
             if needs_install && !sbx::vbox_installed() {
-                sbx::ensure_vbox_install().map_err(|e| format!("install failed: {e}"))?;
+                // VirtualBox install needs root. `pw` is `Some` when the masked
+                // modal captured a password (creds weren't cached) → fed to
+                // `sudo -S`; `None` means creds are cached → `sudo -n`. Either way
+                // it never hangs on a tty prompt the raw-mode TUI can't host.
+                sbx::ensure_vbox_install(pw).map_err(|e| format!("install failed: {e}"))?;
             }
             // Pull the shared appliance in if the VM still isn't registered.
             if needs_import && !sbx::vm_registered(&vm) {
@@ -2628,7 +3896,7 @@ fn spawn_vm_execute(
                 // Tell the room the shared VM is live (others can open their own).
                 let frame = json!({"_sbx": "vm", "vm": announce_vm});
                 let _ = out.send(WsMsg::Text(room.encrypt(frame.to_string().as_bytes())));
-                tx.send(Net::Sys(format!("⛧ {desc}")))
+                tx.send(Net::Sys(format!("† {desc}")))
             }
             Ok(Err(e)) => tx.send(Net::Err(e)),
             Err(e) => tx.send(Net::Err(format!("gui task: {e}"))),
@@ -2646,6 +3914,10 @@ fn spawn_launch(
     cols: u16,
     start_daemon: bool,
     install_first: bool,
+    // The sudo password captured by the in-TUI masked prompt, if escalation was
+    // needed. Local-only: it is fed to `sudo -S` via stdin inside the blocking
+    // install/prepare steps and never enters chat, the PTY, or any outbound frame.
+    password: Option<String>,
     pty_tx: UnboundedSender<Vec<u8>>,
     broker_tx: UnboundedSender<BrokerMsg>,
     app_tx: UnboundedSender<Net>,
@@ -2655,25 +3927,34 @@ fn spawn_launch(
         // opted in. Runs before provisioning; failure aborts the launch (and
         // clears the *launching guard via BrokerMsg::Failed).
         if install_first {
+            let pw = password.clone();
             let res = tokio::task::spawn_blocking(move || match backend {
-                sbx::Backend::Docker => sbx::ensure_docker_install(),
-                sbx::Backend::Multipass => sbx::ensure_multipass_install(),
+                sbx::Backend::Docker => sbx::ensure_docker_install(pw),
+                sbx::Backend::Podman => sbx::ensure_podman_install(pw),
+                sbx::Backend::Multipass => sbx::ensure_multipass_install(pw),
                 _ => Ok(()),
             })
             .await;
             if let Err(e) = res.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))) {
-                let _ = app_tx.send(Net::Err(format!("install failed: {e}")));
+                let _ = app_tx.send(Net::Err(format!("install failed: {e:#}")));
                 let _ = broker_tx.send(BrokerMsg::Failed);
                 return;
             }
         }
-        let name = SBX_NAME.to_string();
+        // A device sandbox targets an ssh alias, carried in `image` (there's no
+        // OCI image); every other backend uses the fixed container/instance name.
+        let name = if backend == sbx::Backend::Device {
+            image.clone()
+        } else {
+            SBX_NAME.to_string()
+        };
         let prep = {
-            let (n, img) = (name.clone(), image.clone());
-            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon)).await
+            let (n, img, pw) = (name.clone(), image.clone(), password.clone());
+            tokio::task::spawn_blocking(move || sbx::prepare(backend, &n, &img, start_daemon, pw))
+                .await
         };
         if let Err(e) = prep.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))) {
-            let _ = app_tx.send(Net::Err(format!("sandbox prepare failed: {e}")));
+            let _ = app_tx.send(Net::Err(format!("sandbox prepare failed: {e:#}")));
             let _ = broker_tx.send(BrokerMsg::Failed);
             return;
         }
@@ -2743,6 +4024,7 @@ fn spawn_agent(
     name: &str,
     profile: Option<&str>,
     model: &str,
+    harness: Option<&str>,
 ) -> std::result::Result<std::process::Child, String> {
     use std::process::{Command, Stdio};
     let root = find_repo_root().ok_or_else(|| {
@@ -2755,7 +4037,12 @@ fn spawn_agent(
     } else {
         std::path::PathBuf::from(std::env::var("HH_AI_PYTHON").unwrap_or_else(|_| "python3".into()))
     };
-    let log_path = std::env::temp_dir().join(format!("hh-agent-{name}.log"));
+    // Model tags can carry '/' and ':' (e.g. "huihui_ai/nemotron:8b"); left in a
+    // filename the '/' reads as a nonexistent subdir, so File::create below fails
+    // with "No such file or directory". Flatten separators for the log path only —
+    // the roster/--name keeps the real tag.
+    let safe_name = name.replace(['/', ':'], "-");
+    let log_path = std::env::temp_dir().join(format!("hh-agent-{safe_name}.log"));
     let log = std::fs::File::create(&log_path)
         .map_err(|e| format!("agent log {}: {e}", log_path.display()))?;
     let log_err = log.try_clone().map_err(|e| e.to_string())?;
@@ -2779,6 +4066,11 @@ fn spawn_agent(
                 .arg("--model")
                 .arg(model);
         }
+    }
+    // Override the agent's default `!task` harness when the launcher asked for a
+    // specific one via `/ai start … native|simple` (plain aliases simple).
+    if let Some(h) = harness {
+        cmd.arg("--harness").arg(h);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))

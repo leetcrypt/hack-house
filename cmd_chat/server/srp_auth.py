@@ -3,7 +3,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 from uuid import uuid4
 
-import srp
+try:
+    import srp
+except ImportError:  # no aarch64 wheel / C-ext build (Termux) — use the shim
+    from ..client import _srp_pure as srp
 
 
 srp.rfc5054_enable()
@@ -28,6 +31,17 @@ class SRPAuthManager:
     def __init__(self, password: str):
         self.password = password.encode()
         self.sessions: dict[str, SRPSession] = {}
+        self.salt, self.vkey = srp.create_salted_verification_key(
+            b"chat", self.password, hash_alg=srp.SHA256
+        )
+
+    def rotate(self, password: str) -> None:
+        """Replace the room password: re-derive salt+verifier and drop in-flight
+        handshakes. Live ws sessions (already holding a ws_token) keep working;
+        only NEW joins must use the new password. Used by the host's `/kick` to
+        lock a removed member out — the old password no longer authenticates."""
+        self.password = password.encode()
+        self.sessions.clear()
         self.salt, self.vkey = srp.create_salted_verification_key(
             b"chat", self.password, hash_alg=srp.SHA256
         )

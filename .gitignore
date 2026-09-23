@@ -13,6 +13,10 @@ secured_console_chat.egg-info/
 
 # Secrets / keys
 *.pem
+# hh host state dir (registry.json + credentials). Global copy lives at
+# ~/.hh (symlinked to the workspace parent); this guards the code's `./.hh`
+# fallback (registry.rs) from ever being committed inside a repo.
+.hh/
 
 # Editor / OS
 .idea/
@@ -21,12 +25,26 @@ secured_console_chat.egg-info/
 *.log
 err.log
 
+# Sandbox save/load snapshots (large runtime tarballs, not source)
+/hh/hh-snapshots/
+# VM-library /loop artifacts — exported snapshot tars (repo-root, when `sbx`
+# is run from here) + per-run logs. Generated; the VMs live in the host registry.
+/hh-snapshots/
+/.loop-runs/
+
 # Out-of-tree experiments (not part of hack-house)
 /experiments/
 /headroom/
 
 # Heavy / superseded demo-build kit (real demos live in video-toolkit)
 /docs/demo/
+
+# Native-harness benchmark harness + results — dev-internal test tooling, kept
+# on disk but never pushed to origin (coupled to the local tmux+podman test rig)
+/bench/
+
+# Local-only planning/design docs (kept on disk, never pushed to origin)
+/docs/plans/
 
 # Project scratch
 /i-try/

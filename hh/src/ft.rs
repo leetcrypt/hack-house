@@ -30,6 +30,14 @@ pub struct Offer {
     pub sha256: String,
     pub dir: bool,
     pub from: String,
+    /// Base64 Ed25519 persona public key of the sender (attribution). Absent on
+    /// legacy/Python senders that don't sign — wire-compatible either way.
+    pub persona: Option<String>,
+    /// Base64 detached signature over `persona::attest_msg(sha256, name, size)`.
+    pub sig: Option<String>,
+    /// Optional ESA-style attribution commitment `SHA-512(passphrase || sha256)`
+    /// the sender can later open by revealing the passphrase.
+    pub attrib: Option<String>,
     /// Direct-send recipient: `Some(username)` means only that member should be
     /// prompted; `None` (or absent/empty on the wire) means the whole room. The
     /// relay still broadcasts to everyone, so this is an advisory app-layer
@@ -313,6 +321,9 @@ pub fn parse(text: &str, sender: &str) -> Option<Ft> {
             sha256: v["sha256"].as_str().unwrap_or("").to_string(),
             dir: v["dir"].as_bool().unwrap_or(false),
             from: sender.to_string(),
+            persona: v["persona"].as_str().map(String::from),
+            sig: v["sig"].as_str().map(String::from),
+            attrib: v["attrib"].as_str().map(String::from),
             to: match v["to"].as_str() {
                 Some(s) if !s.is_empty() => Some(s.to_string()),
                 _ => None,
@@ -354,6 +365,9 @@ mod tests {
             sha256: src.sha256.clone(),
             dir: src.dir,
             from: "x".into(),
+            persona: None,
+            sig: None,
+            attrib: None,
             to: None,
         };
         let (tmp, sha) = sink.finish().unwrap();

@@ -146,7 +146,7 @@ if [[ ! -f "$IMG_PATH" ]]; then
 fi
 
 # ── 2. register the VM (creates its folder) ──────────────────────────────────
-echo "⛧ creating VM '$NAME' …" >&2
+echo "† creating VM '$NAME' …" >&2
 VBoxManage createvm --name "$NAME" --ostype Ubuntu_64 --register >/dev/null
 MACHINE_FOLDER="$(VBoxManage list systemproperties | sed -n 's/^Default machine folder: *//p')"
 VMDIR="$MACHINE_FOLDER/$NAME"
@@ -159,7 +159,7 @@ trap 'echo "✖ build failed — rolling back VM" >&2; cleanup' ERR
 set -e
 
 # ── 3. cloud-image → VDI, grown to the requested size ────────────────────────
-echo "⛧ converting cloud image → VDI …" >&2
+echo "† converting cloud image → VDI …" >&2
 qemu-img convert -O vdi "$IMG_PATH" "$VDI"
 VBoxManage modifymedium disk "$VDI" --resize "$((DISK * 1024))" >/dev/null
 
@@ -208,7 +208,7 @@ trap 'echo "✖ build failed — rolling back VM" >&2; cleanup; rm -rf "$WORK"' 
     for p in "${PKG_LIST[@]}"; do echo "  - $p"; done
 } > "$WORK/user-data"
 
-echo "⛧ building cloud-init seed ($SEED_TOOL) …" >&2
+echo "† building cloud-init seed ($SEED_TOOL) …" >&2
 case "$SEED_TOOL" in
     cloud-localds)
         cloud-localds "$SEED_ISO" "$WORK/user-data" "$WORK/meta-data"
@@ -245,7 +245,7 @@ echo "  cloud-init runs the toolchain install on first boot (give it a minute)."
 
 # ── 6. boot ──────────────────────────────────────────────────────────────────
 if [[ $DO_BOOT -eq 1 ]]; then
-    echo "⛧ booting '$NAME' (GUI) …" >&2
+    echo "† booting '$NAME' (GUI) …" >&2
     VBoxManage startvm "$NAME" --type gui >/dev/null
     echo "✓ launched $NAME" >&2
 else

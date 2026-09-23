@@ -66,8 +66,9 @@ def run_server(
     cert_path: Optional[str] = None,
     key_path: Optional[str] = None,
     no_tls: bool = False,
+    onion: Optional[str] = None,
 ) -> None:
-    app = create_app(password=password or "")
+    app = create_app(password=password or "", onion=onion or "", bind_host=host or "")
 
     ssl_ctx = None
     if not no_tls:

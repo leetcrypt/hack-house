@@ -124,7 +124,7 @@ ensure_branch() {
         echo "  commit/stash first, or run with BRANCH= to build '$cur' as-is." >&2
         exit 2
     fi
-    echo "⛧ switching $cur → $BRANCH before build"
+    echo "† switching $cur → $BRANCH before build"
     git -C "$ROOT" switch "$BRANCH" || { echo "✖ couldn't switch to '$BRANCH'" >&2; exit 2; }
 }
 

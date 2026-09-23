@@ -1,0 +1,10 @@
+# hh-egress-gw — the sidecar gateway that owns a sandbox's netns + egress rules.
+# A sandbox joins it with `--network=container:hh-egw-<name>`; the gateway holds
+# NET_ADMIN and the nftables ruleset (pivot-block / scope / tor-redirect), so the
+# sandbox's traffic is filtered with nothing the in-sandbox agent can bypass.
+FROM docker.io/library/alpine:latest
+RUN apk add --no-cache nftables tor iproute2 \
+ && adduser -D -s /bin/sh tor 2>/dev/null || true
+# Rules + tor are applied at run time (mode-specific) by the operator; keep the
+# image a thin, deterministic toolbox so launch does no network installs.
+CMD ["sleep", "infinity"]

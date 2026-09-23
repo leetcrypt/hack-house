@@ -1,7 +1,6 @@
 //! ratatui rendering — top bar, chat, roster, input.
 
 use crate::app::{App, ChatLine, Role};
-use crate::layout::Zoom;
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,7 +20,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(app.layout.input_height()),
     ])
     .split(f.area());
 
@@ -51,6 +50,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     if let Some(msg) = &app.error {
         draw_error(f, f.area(), theme, msg);
     }
+    if let Some(len) = app.sudo_prompt_len() {
+        draw_sudo_prompt(f, f.area(), theme, len);
+    }
 }
 
 /// The body's pane rectangles. Any field is `None` when that pane is hidden
@@ -65,40 +67,25 @@ struct BodyAreas {
 /// honouring the sandbox presence, `Zoom`, and roster width. This is the single
 /// source of truth used by both `draw` (painting) and `pane_at` (hit-testing).
 fn body_areas(body: Rect, app: &App) -> BodyAreas {
-    // Vertical split: chat-column vs sandbox terminal.
-    let (chat_col, sbx) = if app.sandbox.is_some() {
-        match app.layout.zoom {
-            Zoom::Term => (None, Some(body)), // terminal fullscreen
-            Zoom::Chat => (Some(body), None), // chat fullscreen (terminal hidden)
-            Zoom::Normal => {
-                let pty = app.layout.pty_pct;
-                let split = Layout::vertical([
-                    Constraint::Percentage(100 - pty),
-                    Constraint::Percentage(pty),
-                ])
-                .split(body);
-                (Some(split[0]), Some(split[1]))
-            }
-        }
-    } else {
-        (Some(body), None) // no sandbox → chat owns the whole body
+    use crate::app::Pane;
+    let mut out = BodyAreas {
+        chat: None,
+        roster: None,
+        sbx: None,
     };
-
-    // Horizontal split of the chat column into chat vs roster.
-    let (chat, roster) = match chat_col {
-        Some(col) if app.layout.roster_width != 0 => {
-            let lr = Layout::horizontal([
-                Constraint::Min(1),
-                Constraint::Length(app.layout.roster_width),
-            ])
-            .split(col);
-            (Some(lr[0]), Some(lr[1]))
+    // The layout tree is the single source of truth: it honours zoom, sandbox
+    // presence and roster width, returning one rect per visible pane.
+    for (pane, rect) in app.layout.regions(body, app.sandbox.is_some()) {
+        match pane {
+            Pane::Chat => out.chat = Some(rect),
+            Pane::Roster => out.roster = Some(rect),
+            Pane::Terminal => out.sbx = Some(rect),
+            // The input bar isn't a body region (it's the frame's bottom row);
+            // `regions` never yields it, so this arm is just for exhaustiveness.
+            Pane::Input => {}
         }
-        Some(col) => (Some(col), None), // roster hidden
-        None => (None, None),
-    };
-
-    BodyAreas { chat, roster, sbx }
+    }
+    out
 }
 
 /// Hit-test a screen cell against the laid-out panes, for click-to-select in
@@ -112,16 +99,19 @@ pub fn pane_at(w: u16, h: u16, app: &App, col: u16, row: u16) -> Option<crate::a
         width: w,
         height: h,
     };
-    // Mirror draw()'s top-bar / body / input split; only the body is selectable.
+    // Mirror draw()'s top-bar / body / input split; the body panes and the input
+    // bar are selectable (the input bar grows its height when focused).
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(app.layout.input_height()),
     ])
     .split(area);
     let areas = body_areas(rows[1], app);
     let p = Position { x: col, y: row };
-    if areas.sbx.is_some_and(|r| r.contains(p)) {
+    if rows[2].contains(p) {
+        Some(Pane::Input)
+    } else if areas.sbx.is_some_and(|r| r.contains(p)) {
         Some(Pane::Terminal)
     } else if areas.roster.is_some_and(|r| r.contains(p)) {
         Some(Pane::Roster)
@@ -185,6 +175,43 @@ fn draw_error(f: &mut Frame, area: Rect, theme: &Theme, msg: &str) {
     f.render_widget(popup, rect);
 }
 
+/// Masked sudo-password modal (Option C). Renders one bullet per typed char —
+/// never the password itself — anchored just above the input box. The buffer it
+/// reflects lives in `app.sudo_prompt` and is never sent to chat or the PTY.
+fn draw_sudo_prompt(f: &mut Frame, area: Rect, theme: &Theme, len: usize) {
+    let dots: String = "•".repeat(len);
+    let body = format!("password: {dots}");
+    let w = area.width.saturating_sub(4).clamp(28, 56);
+    let h = 3; // one input line + its borders
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    // Hover just above the input row (bottom of the screen) so it reads as a prompt.
+    let y = area.y + area.height.saturating_sub(h + 2);
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let popup = Paragraph::new(body)
+        .style(Style::default().fg(theme.title).bg(theme.bg))
+        .block(
+            Block::bordered()
+                .border_style(
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .title(Span::styled(
+                    " 🔒 sudo · Enter launch · Esc cancel ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        );
+    f.render_widget(popup, rect);
+}
+
 fn centered(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vy = (100u16.saturating_sub(percent_y)) / 2;
     let vx = (100u16.saturating_sub(percent_x)) / 2;
@@ -245,28 +272,36 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
         HelpCluster {
             title: "VIRTUAL MACHINES",
             items: vec![
-                // ── launch (one verb per backend) ──
+                // ── launch: /sbx <type> <option> (one backend token per line) ──
                 kv(
-                    "/sbx launch docker [image] [install]",
-                    "Linux container — shared shell relayed to the room (default ubuntu:24.04 + auto dev toolchain; append install if Docker is missing)",
+                    "/sbx docker [image] [install]",
+                    "Linux container — shared shell relayed to the room (default parrotsec/core + auto dev toolchain; append install if Docker is missing)",
                 ),
                 kv(
-                    "/sbx launch multipass [image] [install]",
+                    "/sbx podman [image] [install]",
+                    "rootless/daemonless container — no sudo modal (default kalilinux/kali-rolling; append install if Podman is missing)",
+                ),
+                kv(
+                    "/sbx multipass [image] [install]",
                     "full Ubuntu VM — shared shell relayed to the room (same dev toolchain; append install if Multipass is missing)",
                 ),
                 kv(
-                    "/sbx launch vbox",
+                    "/sbx vbox",
                     "VirtualBox VM picker — local GUI (↑↓ move · Enter/Tab boot · Esc dismiss)",
                 ),
                 kv(
-                    "/sbx launch vbox new [name]",
+                    "/sbx vbox new [name]",
                     "build a FRESH Ubuntu VM from a cloud image (cloud-init installs the dev toolchain)",
                 ),
                 kv(
-                    "/sbx launch vbox [gui] <vm> [yes]",
+                    "/sbx vmlib [<id> [install]]",
+                    "VM library — catalog of installable VMs (Win11, macOS, Kali…); <id> install builds it LOCALLY on your machine (pointers only, no images bundled)",
+                ),
+                kv(
+                    "/sbx vbox [gui] <vm> [yes]",
                     "boot a VirtualBox VM's GUI on YOUR machine (non-host appends yes to install/import first)",
                 ),
-                kv("/sbx launch local", "a plain shell on your own machine — no VM"),
+                kv("/sbx local", "a plain shell on your own machine — no VM"),
                 kv("/sbx stop", "tear down the running sandbox (purges the VM/container)"),
                 // ── save (docker/multipass share a verb; vbox has its own) ──
                 kv(
@@ -291,7 +326,24 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "/sbx vms  ·  /sbx vmsnaps <vm>",
                     "list local VirtualBox VMs · a VM's snapshots",
                 ),
-                kv("/sbx gui <vm> [yes]", "alias of /sbx launch vbox gui <vm> [yes]"),
+                kv("/sbx gui <vm> [yes]", "alias of /sbx vbox gui <vm> [yes]"),
+                // ── trade saved VMs with peers (host-global registry) ──
+                kv(
+                    "/sbx browse",
+                    "your saved-VM registry — what each one is FOR and where the work stands (pruned snapshots drop out)",
+                ),
+                kv(
+                    "/sbx publish <label> [tag…]",
+                    "mark a saved VM shareable so peers can pull it (exports a portable .tar if needed)",
+                ),
+                kv(
+                    "/sbx catalog @<user>",
+                    "ask a peer which VMs they offer",
+                ),
+                kv(
+                    "/sbx pull @<user> <label>",
+                    "request a peer's published VM — /accept to receive + auto-import it",
+                ),
                 kv("/drive  ·  F2", "type into the shared shell (F2 releases; Esc reaches vim)"),
             ],
         },
@@ -329,13 +381,30 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "/grant <user|agent>",
                     "let a member OR an AI agent drive the shell",
                 ),
+                kv("/grant ai", "grant drive to every AI agent at once"),
                 kv("/revoke <user|agent>", "take back sandbox drive permission"),
                 kv("/sudo <user>", "delegate VM superuser (real sudo)"),
                 kv("/unsudo <user>", "revoke VM superuser"),
                 kv(
+                    "/kick <user>  (host only)",
+                    "force-remove a member AND rotate the room password so they can't rejoin (host = first in the room)",
+                ),
+                kv(
                     "/ai start <name> allow",
                     "shortcut: grant the agent drive at spawn",
                 ),
+            ],
+        },
+        HelpCluster {
+            title: "WEB VIEWERS (owner)",
+            items: vec![
+                kv("/web list", "web viewers currently requesting drive"),
+                kv(
+                    "/web allow <n>",
+                    "approve viewer #n to type (auto-grants the relay)",
+                ),
+                kv("/web deny <n>", "decline viewer #n's drive request"),
+                kv("/web revoke", "take web input back — return to view-only"),
             ],
         },
         HelpCluster {
@@ -361,18 +430,40 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
             ],
         },
         HelpCluster {
+            title: "MUSIC (session soundtrack)",
+            items: vec![
+                kv(
+                    "/music  ·  /music list",
+                    "list albums (bundled 'crypt'/'terminal' + your imports) and what's playing",
+                ),
+                kv("/music play <album>", "start an album — tracks auto-advance and loop"),
+                kv(
+                    "/music play  ·  random",
+                    "blank or 'random' shuffles to a random album",
+                ),
+                kv("/music stop  ·  next", "stop playback  ·  skip to the next track"),
+                kv(
+                    "/music import <path>",
+                    "add a file/folder of your own audio as a new album (… as <name>)",
+                ),
+            ],
+        },
+        HelpCluster {
             title: "LAYOUT (resize panes)",
             items: vec![
                 kv("F4", "fullscreen the terminal (cycle: terminal → chat → split)"),
                 kv(
                     "click a pane  ·  F5",
-                    "select a pane to resize (✎ marks it) — F5 cycles terminal → chat → roster",
+                    "select a pane to resize (✎ marks it) — F5 cycles chat → terminal → roster → input",
                 ),
                 kv(
-                    "↑ / ↓  (terminal/chat selected)",
-                    "grow / shrink that pane's height share",
+                    "↑ / ↓",
+                    "grow / shrink height — chat ↔ terminal with a sandbox; else chat/clergy borrow from the message bar",
                 ),
-                kv("← / →  (roster selected)", "narrow / widen the roster column"),
+                kv(
+                    "← / →",
+                    "grow / shrink the selected pane's width (left column ↔ roster)",
+                ),
                 kv("Esc / Enter", "finish editing the selected pane"),
                 kv("/layout reset", "restore the default split"),
                 kv(
@@ -407,6 +498,10 @@ fn help_clusters(theme: &Theme) -> Vec<HelpCluster> {
                     "reconnect to the house after a drop / AFK",
                 ),
                 kv("/pw", "show this room's password (local only)"),
+                kv(
+                    "/share",
+                    "invite block for this room (local only): password + every way in — Tor onion (if --tor) and each tailscale/lan address, with connect commands",
+                ),
                 kv("/clear", "wipe your chat scrollback (local only)"),
                 kv("Ctrl-C  ·  Ctrl-Q", "quit hack-house"),
             ],
@@ -616,7 +711,7 @@ fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme
     } else {
         "✖ closed · Ctrl-R to reconnect"
     };
-    let bar = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" {0} hack-house {0} ", theme.sigil),
             Style::default()
@@ -628,22 +723,53 @@ fn draw_top(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme
             format!("· house {}/{} ", app.users.len(), cap),
             Style::default().fg(theme.title),
         ),
-    ]);
-    f.render_widget(Paragraph::new(bar), area);
+    ];
+    // Now-playing indicator — shown only while background music is running.
+    if let Some(np) = &app.now_playing {
+        spans.push(Span::styled(
+            format!("· ♪ {np} "),
+            Style::default().fg(theme.accent),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
-    if l.system {
-        // System lines carry the canonical ⛧ as a placeholder for "the house
-        // sigil"; swap it for the active theme's sigil so e.g. crypt shows ✝,
-        // never a pentagram. User messages (l.system == false) are left as typed.
-        let text = l.text.replace('⛧', &theme.sigil);
-        return Line::from(Span::styled(
-            format!("  {} {}", theme.sigil, text),
-            Style::default()
-                .fg(theme.system)
-                .add_modifier(Modifier::ITALIC),
-        ));
+/// Render one chat record into one-or-more visual lines. A record may carry
+/// embedded newlines (e.g. an AI agent's multi-line answer or injected plan);
+/// ratatui treats a `Line` as a single visual row, so we split on `\n` ourselves
+/// and indent the continuations to align under the first line's text.
+fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Vec<Line<'a>> {
+    // "Action" lines — client system notices and AI agent output (which marks
+    // itself with a leading †) — read better as dim, italic, sigil-marked blocks
+    // than as ordinary chatter, so the eye can skip them or zero in on them.
+    let is_action = l.system || l.text.starts_with('†');
+    if is_action {
+        // Swap the canonical † placeholder for the active theme's sigil so each
+        // vestment renders its own glyph (e.g. crypt shows ✝).
+        let body = l
+            .text
+            .strip_prefix('†')
+            .unwrap_or(&l.text)
+            .trim_start()
+            .replace('†', &theme.sigil);
+        let style = Style::default()
+            .fg(theme.system)
+            .add_modifier(Modifier::ITALIC);
+        // Attribute an agent's action to it (system notices stay anonymous).
+        let head = if l.system || l.username.is_empty() {
+            format!("  {} ", theme.sigil)
+        } else {
+            format!("  {} {}: ", theme.sigil, l.username)
+        };
+        let indent = " ".repeat(head.chars().count());
+        return body
+            .split('\n')
+            .enumerate()
+            .map(|(i, seg)| {
+                let prefix = if i == 0 { head.clone() } else { indent.clone() };
+                Line::from(Span::styled(format!("{prefix}{seg}"), style))
+            })
+            .collect();
     }
     let name_color = if l.username == app.me {
         theme.me
@@ -653,7 +779,7 @@ fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
     // Author's current badge inline, so a message's authority is legible right
     // in the transcript — not only in the clergy panel.
     let badges = role_badges(app, &l.username, theme);
-    Line::from(vec![
+    let head: Vec<Span> = vec![
         Span::styled(format!("{} ", l.ts), Style::default().fg(theme.dim)),
         Span::styled(format!("{badges} "), Style::default().fg(theme.dim)),
         Span::styled(
@@ -661,14 +787,34 @@ fn fmt_line<'a>(l: &'a ChatLine, app: &App, theme: &Theme) -> Line<'a> {
             Style::default().fg(name_color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(": ", Style::default().fg(theme.dim)),
-        Span::styled(l.text.as_str(), Style::default().fg(theme.title)),
-    ])
+    ];
+    let mut segs = l.text.split('\n');
+    let first = segs.next().unwrap_or("");
+    let mut spans = head;
+    spans.push(Span::styled(first.to_string(), Style::default().fg(theme.title)));
+    let mut out = vec![Line::from(spans)];
+    // Continuation rows indent under the message body so a multi-line message
+    // reads as one coherent block under its author.
+    let indent = " ".repeat(
+        l.ts.chars().count() + 1 + badges.chars().count() + 1 + l.username.chars().count() + 2,
+    );
+    for seg in segs {
+        out.push(Line::from(Span::styled(
+            format!("{indent}{seg}"),
+            Style::default().fg(theme.title),
+        )));
+    }
+    out
 }
 
 fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
     let inner_h = area.height.saturating_sub(2) as usize; // rows inside the border
     let text_w = area.width.saturating_sub(2).max(1); // wrap width inside the border
-    let mut lines: Vec<Line> = app.lines.iter().map(|l| fmt_line(l, app, theme)).collect();
+    let mut lines: Vec<Line> = app
+        .lines
+        .iter()
+        .flat_map(|l| fmt_line(l, app, theme))
+        .collect();
 
     // Live preview bubbles for agents currently streaming a reply, rendered
     // below the committed history. Dim + italic so they read as in-progress;
@@ -720,7 +866,7 @@ fn draw_chat(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Them
     f.render_widget(chat, area);
 }
 
-/// Glyph for a single role. The host sigil is theme-dependent (✝ for crypt, ⛧
+/// Glyph for a single role. The host sigil is theme-dependent (✝ for crypt, †
 /// for the default), the rest are fixed.
 fn role_glyph(role: Role, theme: &Theme) -> &str {
     match role {
@@ -731,7 +877,7 @@ fn role_glyph(role: Role, theme: &Theme) -> &str {
     }
 }
 
-/// The stacked badge string for `name` — e.g. `⛧⚡◆` for a host who summoned a
+/// The stacked badge string for `name` — e.g. `†⚡◆` for a host who summoned a
 /// sandbox and can drive, or a lone `•` for a plain member. Single source of
 /// truth shared by the roster and the chat author prefix so both always agree
 /// with each other and with what the broker enforces.
@@ -743,7 +889,7 @@ fn role_badges(app: &App, name: &str, theme: &Theme) -> String {
 }
 
 fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
-    let items: Vec<ListItem> = app
+    let mut items: Vec<ListItem> = app
         .users
         .iter()
         .map(|u| {
@@ -757,6 +903,22 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
             )))
         })
         .collect();
+    // Web-relay browser viewers — a display-only group under the real members.
+    // These hold only view-only `#k` (no room socket), so they're styled apart
+    // from clergy; a `◆` marks the guest currently driving the shared shell.
+    if !app.web_guests.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!(" 🌐 web guests ({})", app.web_guests.len()),
+            Style::default().fg(theme.title),
+        ))));
+        for g in &app.web_guests {
+            let mark = if g.driving { "◆ " } else { "" };
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("   🌐 {mark}{}", g.handle),
+                Style::default().fg(theme.other),
+            ))));
+        }
+    }
     let (border_style, mark) = edit_decor(app, crate::app::Pane::Roster, theme, theme.border);
     let roster = List::new(items).block(
         Block::bordered()
@@ -782,29 +944,58 @@ fn ai_thinking_title(app: &App) -> String {
 }
 
 fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Theme) {
-    let input = Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme.accent)),
-        Span::styled(app.input.as_str(), Style::default().fg(theme.input)),
-    ]))
-    .block(
-        Block::bordered()
-            .border_style(Style::default().fg(if app.pending_offer.is_some() {
-                theme.accent
+    use crate::app::Pane;
+    // Char-wrap "> " + the message at the inner width so a long line flows into
+    // the (resizable) extra height. We wrap ourselves — rather than ratatui's
+    // word-wrap — so the cursor lands exactly where the text breaks.
+    let inner = area.width.saturating_sub(2).max(1) as usize;
+    let visible = area.height.saturating_sub(2).max(1) as usize;
+    let prompt = "> ";
+    let full: Vec<char> = prompt.chars().chain(app.input.chars()).collect();
+
+    let mut wrapped: Vec<Line> = Vec::new();
+    if full.is_empty() {
+        wrapped.push(Line::from(""));
+    } else {
+        for (li, chunk) in full.chunks(inner).enumerate() {
+            let s: String = chunk.iter().collect();
+            if li == 0 {
+                // Split the accented "> " prompt off the first visual line.
+                let split = prompt.len().min(s.len());
+                let (pfx, rest) = s.split_at(split);
+                wrapped.push(Line::from(vec![
+                    Span::styled(pfx.to_string(), Style::default().fg(theme.accent)),
+                    Span::styled(rest.to_string(), Style::default().fg(theme.input)),
+                ]));
             } else {
-                theme.border
-            }))
+                wrapped.push(Line::from(Span::styled(s, Style::default().fg(theme.input))));
+            }
+        }
+    }
+    // Keep the tail (where you're typing) in view when it overflows the box.
+    let skip = wrapped.len().saturating_sub(visible);
+    let shown: Vec<Line> = wrapped.into_iter().skip(skip).collect();
+
+    // Focused for resize? Accent border + ✎ marker, matching the body panes.
+    let (decor_style, decor_mark) = edit_decor(app, Pane::Input, theme, theme.border);
+    let border_style = if app.focused_pane == Some(Pane::Input) {
+        decor_style
+    } else if app.pending_offer.is_some() {
+        Style::default().fg(theme.accent)
+    } else {
+        Style::default().fg(theme.border)
+    };
+    let title_text = match &app.pending_offer {
+        Some(o) => format!(" {} incoming: {} — /accept or /reject ", theme.sigil, o.name),
+        None if app.driving => format!(" {} DRIVING the shell — Esc to release ", theme.sigil),
+        None if !app.ai_typing.is_empty() => ai_thinking_title(app),
+        None => format!("{decor_mark} message · enter send · /drive for shell · ctrl-q quit "),
+    };
+    let input = Paragraph::new(shown).block(
+        Block::bordered()
+            .border_style(border_style)
             .title(Span::styled(
-                match &app.pending_offer {
-                    Some(o) => format!(
-                        " {} incoming: {} — /accept or /reject ",
-                        theme.sigil, o.name
-                    ),
-                    None if app.driving => {
-                        format!(" {} DRIVING the shell — Esc to release ", theme.sigil)
-                    }
-                    None if !app.ai_typing.is_empty() => ai_thinking_title(app),
-                    None => " message · enter send · /drive for shell · ctrl-q quit ".to_string(),
-                },
+                title_text,
                 Style::default().fg(if app.ai_typing.is_empty() {
                     theme.title
                 } else {
@@ -814,10 +1005,16 @@ fn draw_input(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &The
     );
     f.render_widget(input, area);
 
-    // Cursor after the "> " prompt + current input.
-    let cx = area.x + 3 + app.input.chars().count() as u16;
-    let cy = area.y + 1;
-    if cx < area.x + area.width.saturating_sub(1) {
-        f.set_cursor_position(Position::new(cx, cy));
+    // Cursor sits after the last typed char; its wrapped line/col is exact since
+    // we wrapped at `inner` ourselves. Hidden if it would land past the box tail.
+    let end = full.len();
+    let cline = end / inner;
+    let ccol = end % inner;
+    if cline >= skip {
+        let cx = area.x + 1 + ccol as u16;
+        let cy = area.y + 1 + (cline - skip) as u16;
+        if cy < area.y + area.height.saturating_sub(1) {
+            f.set_cursor_position(Position::new(cx, cy));
+        }
     }
 }

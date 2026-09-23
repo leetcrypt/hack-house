@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import base64
+import secrets
 import socket
 from dataclasses import asdict
 
@@ -39,13 +40,88 @@ def generate_ws_token(user_id: str, secret: bytes) -> str:
 def _roster_frame(app: Sanic) -> str:
     """Authoritative presence snapshot — all clergy members converge on this."""
     users = app.ctx.session_store.get_all()
+    host_id = _current_host(app)
+    host_name = next((u.username for u in users if u.user_id == host_id), None)
     return json.dumps(
         {
             "type": "roster",
             "users": [{"user_id": u.user_id, "username": u.username} for u in users],
             "capacity": app.ctx.max_users,
+            # Host = kick authority, as a username so the client can tell if it's
+            # the host and label the roster (None until a member is present).
+            "host": host_name,
         }
     )
+
+
+def _current_host(app: Sanic) -> str | None:
+    """The room host = the oldest still-present connection (the "host badge"
+    member). Sticky while that member is present; auto-promotes to the next-oldest
+    when the host leaves. Only the host may `/kick`."""
+    present = list(app.ctx.connection_manager.active_connections.keys())
+    hid = getattr(app.ctx, "host_user_id", None)
+    if hid not in present:
+        hid = present[0] if present else None
+        app.ctx.host_user_id = hid
+    return hid
+
+
+_CONTROL_TYPES = ("kick",)
+
+
+def _parse_control(text: str) -> dict | None:
+    """Recognise a cleartext moderation control frame. Room content is E2E
+    encrypted (a Fernet token — base64, never starts with '{'), so a frame the
+    SERVER must act on rides in the clear as a small JSON object. Gate cheaply on
+    that shape, then confirm a known `type` — order-independent (JSON key order
+    isn't guaranteed by the sender)."""
+    if not (text.startswith("{") and len(text) < 1024 and '"type"' in text):
+        return None
+    try:
+        v = json.loads(text)
+    except Exception:
+        return None
+    if isinstance(v, dict) and v.get("type") in _CONTROL_TYPES:
+        return v
+    return None
+
+
+async def _handle_kick(app: Sanic, sender_id: str, sender_name: str, target: str) -> None:
+    """Host-only force-kick. Verify the sender is the room host, then ROTATE the
+    room password and re-key the room: because the E2E content key is derived from
+    the password, every member must reconnect. Remaining members are handed the new
+    password (direct sends) and reconnect seamlessly; the kicked member is not, so
+    only they can't come back. All sessions are freed so the reconnect wave finds
+    its names available."""
+    mgr = app.ctx.connection_manager
+    if sender_id != _current_host(app):
+        await mgr.send_to(sender_id, json.dumps(
+            {"type": "kick_denied", "reason": "only the room host can kick"}))
+        return
+    all_present = [u.user_id for u in app.ctx.session_store.get_all()]
+    targets = [u.user_id for u in app.ctx.session_store.get_all()
+               if u.username == target and u.user_id != sender_id]
+    if not targets:
+        await mgr.send_to(sender_id, json.dumps(
+            {"type": "kick_denied", "reason": f"no member named {target!r} (can't kick yourself)"}))
+        return
+    # Rotate the password (E2E key derives from it) + drop the old-key backlog.
+    new_password = secrets.token_urlsafe(9)
+    app.ctx.srp_manager.rotate(new_password)
+    app.ctx.message_store.clear()
+    kicked = json.dumps({"type": "kicked", "username": target, "by": sender_name})
+    rotated = json.dumps({"type": "password_rotated", "password": new_password})
+    remaining = [uid for uid in all_present if uid not in targets]
+    # Remaining members: deliver the kick notice + the NEW password, then close so
+    # they auto-reconnect (re-key) with it. Targets: notice only, then close — no
+    # new password, so their reconnect fails and they stay out.
+    for uid in remaining:
+        await mgr.deliver_and_close(uid, [kicked, rotated], reason="room re-keyed (kick)")
+        app.ctx.session_store.remove(uid)
+    for uid in targets:
+        await mgr.deliver_and_close(uid, [kicked], reason="kicked by host")
+        app.ctx.session_store.remove(uid)
+    app.ctx.host_user_id = None  # re-derived when the reconnect wave arrives
 
 
 async def srp_init(request: Request, app: Sanic) -> HTTPResponse:
@@ -155,6 +231,7 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
     # Enqueue this client's init snapshot as its first outbound frame, then
     # register it so broadcasts can target it — guaranteeing init arrives first.
     await manager.connect(user_id, ws, initial=state_frame(app))
+    _current_host(app)  # first joiner becomes the room host (kick authority)
 
     try:
         # Announce arrival to everyone already present, then a fresh roster.
@@ -181,6 +258,15 @@ async def chat_ws(request: Request, ws: Websocket, app: Sanic) -> None:
                 continue
 
             app.ctx.session_store.update_activity(user_id)
+
+            # Cleartext moderation control frames are handled server-side, never
+            # relayed as chat. Everything else is an opaque E2E-encrypted blob.
+            ctl = _parse_control(text)
+            if ctl is not None:
+                if ctl.get("type") == "kick":
+                    await _handle_kick(app, user_id, session.username,
+                                       str(ctl.get("target", "")))
+                continue
 
             message = Message(
                 text=text,
