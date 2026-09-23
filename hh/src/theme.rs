@@ -29,7 +29,7 @@ pub struct Theme {
     /// Width of the roster column.
     pub roster_width: u16,
     /// Glyph flanking the "hack-house" title (and used for occult accents).
-    /// Each theme picks its own sigil (crypt: ✝, church: ⛧, …).
+    /// Each theme picks its own sigil (crypt: ✝, church: †, …).
     pub sigil: String,
 }
 
@@ -179,7 +179,7 @@ fn slugify(name: &str) -> String {
 }
 
 /// Occult glyphs the randomizer can stamp as the title sigil.
-const SIGILS: [&str; 12] = ["✝", "⛧", "☥", "†", "‡", "✟", "♰", "☩", "⸸", "⯐", "✠", "☦"];
+const SIGILS: [&str; 12] = ["✝", "☧", "☥", "†", "‡", "✟", "♰", "☩", "⸸", "⯐", "✠", "☦"];
 
 /// Arcane name fragments — `<adj>-<noun>` makes a memorable vestment name.
 const NAME_ADJ: [&str; 16] = [

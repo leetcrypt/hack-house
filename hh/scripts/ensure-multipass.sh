@@ -14,20 +14,34 @@
 #   ./ensure-multipass.sh --yes     # install without prompting
 #   ./ensure-multipass.sh --check   # test only; exit 0 if present, 1 if missing
 #   ./ensure-multipass.sh --plan    # show the install plan; change nothing
+#   ./ensure-multipass.sh --stdin-pass  # read a sudo password from stdin (sudo -S)
 set -uo pipefail
 
 ASSUME_YES=0
 CHECK_ONLY=0
 PLAN_ONLY=0
+STDIN_PASS=0
 for arg in "$@"; do
     case "$arg" in
         -y|--yes)         ASSUME_YES=1 ;;
         --check)          CHECK_ONLY=1 ;;
         --plan|--dry-run) PLAN_ONLY=1 ;;
+        # A sudo password is waiting on stdin (the hack-house TUI feeds it). Use
+        # `sudo -S` so escalation reads that, never the controlling tty.
+        --stdin-pass)     STDIN_PASS=1 ;;
         -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "✖ unknown arg: $arg" >&2; exit 2 ;;
     esac
 done
+
+# How to escalate (mirrors ensure-docker.sh):
+#   * --stdin-pass: a password is on stdin → `sudo -S -p ''` (reads stdin, never
+#     the tty; a raw-mode TUI would corrupt a tty prompt). First sudo caches it.
+#   * --yes alone: `sudo -n` — fails fast if creds aren't cached, never hangs.
+#   * interactive shell: plain `sudo` (a real terminal can prompt normally).
+SUDO="sudo"
+[[ $ASSUME_YES -eq 1 ]] && SUDO="sudo -n"
+[[ $STDIN_PASS -eq 1 ]] && SUDO="sudo -S -p ''"
 
 installed() { command -v multipass >/dev/null 2>&1 && multipass version >/dev/null 2>&1; }
 mp_version() { multipass version 2>/dev/null | head -1; }
@@ -78,7 +92,7 @@ if [[ -z "$install_cmd" ]]; then
     echo "✖ don't know how to install Multipass here — get it from https://multipass.run/install" >&2
     exit 1
 fi
-[[ $need_sudo -eq 1 ]] && install_cmd="sudo $install_cmd"
+[[ $need_sudo -eq 1 ]] && install_cmd="$SUDO $install_cmd"
 [[ -n "$manual_note" ]] && echo "ⓘ $manual_note" >&2
 
 # --plan: show the real plan and change nothing.

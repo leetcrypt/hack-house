@@ -16,6 +16,8 @@ use std::sync::mpsc;
 const ENSURE_DOCKER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-docker.sh");
 /// Detect-first Multipass installer (ships in hh/scripts/).
 const ENSURE_MULTIPASS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-multipass.sh");
+/// Detect-first Podman installer (apt; rootless preflight). Ships in hh/scripts/.
+const ENSURE_PODMAN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-podman.sh");
 /// Detect-first VirtualBox installer (ships in hh/scripts/).
 const ENSURE_VBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ensure-vbox.sh");
 /// Baseline dev-toolchain installer run inside Docker sandboxes (hh/scripts/).
@@ -24,6 +26,11 @@ const SBX_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbo
 const SBX_TOOLS_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sandbox-tools.json");
 /// Creates a fresh, cloud-init-provisioned Ubuntu VirtualBox VM (hh/scripts/).
 const VBOX_NEW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-new.sh");
+/// Browse + locally-build VMs from the curated library (hh/scripts/).
+const VBOX_LIBRARY_SH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-library.sh");
+/// The library manifest: pointers (URLs/pages) to VMs, never the images. The
+/// loader cross-references `list_vms` to mark which are already built locally.
+const VBOX_LIBRARY_JSON: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/vbox-library.json");
 
 /// Is the `docker` binary installed? (`docker --version` succeeds.) This is a
 /// weaker check than `docker_daemon_up`: the CLI can be present while the daemon
@@ -49,16 +56,105 @@ pub fn docker_daemon_up() -> bool {
         .unwrap_or(false)
 }
 
+/// Is the `podman` binary installed? (`podman --version` succeeds.) Podman is
+/// daemonless, so unlike Docker there is no separate daemon-up check: if the CLI
+/// is present a rootless container can launch immediately (no daemon, no sudo).
+pub fn podman_installed() -> bool {
+    Command::new("podman")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Is this a Docker Desktop (Linux) install? Its engine runs in a per-user VM
+/// started by the *user* unit `docker-desktop.service` — there's no root
+/// `docker.service`, so starting the daemon needs **no sudo**. Detect it so the
+/// launch path doesn't pop a (useless, and on this box failing) sudo prompt.
+pub fn docker_desktop() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "cat", "docker-desktop.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Can we sudo *without* a password prompt right now? (`sudo -n true` succeeds
+/// when credentials are cached via a prior `sudo -v`, or NOPASSWD is configured.)
+/// The launch paths that need root check this first: a raw-mode TUI can't host
+/// sudo's interactive tty prompt, so we must never let sudo block on one.
+pub fn sudo_ready() -> bool {
+    Command::new("sudo")
+        .args(["-n", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run an `ensure-*.sh` installer `--yes` with the given extra args, optionally
+/// feeding a sudo password to the script's `sudo -S` via stdin. Shared by every
+/// backend installer (docker/podman/multipass/vbox) so sudo capture is uniform.
+///
+/// Sudo ladder (the scripts honour all three):
+///   * password present ⇒ `--stdin-pass` ⇒ the script uses `sudo -S -p ''`,
+///     reading the secret from stdin — never the controlling tty (a raw-mode TUI
+///     would corrupt a tty prompt). The first sudo caches the credential.
+///   * no password ⇒ stdin closed; the script's `--yes` selects `sudo -n`, which
+///     fails fast (clear error) if creds aren't cached rather than hanging on a
+///     tty prompt the TUI can't host.
+///
+/// Secret handling: the password (if any) only ever travels parent→child stdin;
+/// the local buffer is wiped immediately after. It is NEVER echoed, logged, or
+/// surfaced — sudo never prints the password, so the captured stderr (used for
+/// error messages) can't contain it.
+fn run_ensure(script: &str, extra: &[&str], password: Option<String>) -> Result<(bool, String)> {
+    let mut cmd = Command::new("bash");
+    cmd.arg(script).arg("--yes");
+    for a in extra {
+        cmd.arg(a);
+    }
+    if password.is_some() {
+        cmd.arg("--stdin-pass").stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("running {script}"))?;
+    if let Some(mut pw) = password {
+        if let Some(mut stdin) = child.stdin.take() {
+            // Feed the password to the first `sudo -S`; it caches the credential
+            // so the rest of the plan authenticates without re-reading stdin.
+            let _ = writeln!(stdin, "{pw}"); // stdin drops here → EOF
+        }
+        // Best-effort wipe of our copy of the secret.
+        unsafe {
+            for b in pw.as_bytes_mut() {
+                *b = 0;
+            }
+        }
+        pw.clear();
+    }
+    let out = child
+        .wait_with_output()
+        .with_context(|| format!("{script}"))?;
+    Ok((out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned()))
+}
+
 /// Start the Docker daemon via `ensure-docker.sh --yes`, waiting until it's
-/// ready. Returns the script's last error line on failure (e.g. needs sudo).
-fn start_docker_daemon() -> Result<()> {
-    let out = Command::new("bash")
-        .arg(ENSURE_DOCKER)
-        .arg("--yes")
-        .output()
-        .context("running ensure-docker.sh")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+/// ready. With `password`, escalation goes through `sudo -S` (read from stdin);
+/// without it the script uses `sudo -n` and fails fast if creds aren't cached.
+fn start_docker_daemon(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure(ENSURE_DOCKER, &[], password)?;
+    if !ok {
         let last = err
             .lines()
             .last()
@@ -71,17 +167,25 @@ fn start_docker_daemon() -> Result<()> {
 /// Install Docker via `ensure-docker.sh --install --yes` (Docker's official,
 /// GPG-verified repo), then leave the daemon started. Consent is the caller's
 /// job (they passed `install`); the script is idempotent if Docker is present.
-/// Returns the script's last error line on failure (e.g. needs sudo).
-pub fn ensure_docker_install() -> Result<()> {
-    let out = Command::new("bash")
-        .arg(ENSURE_DOCKER)
-        .arg("--install")
-        .arg("--yes")
-        .output()
-        .context("running ensure-docker.sh --install")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+/// `password` feeds `sudo -S` as above.
+pub fn ensure_docker_install(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure(ENSURE_DOCKER, &["--install"], password)?;
+    if !ok {
         let last = err.lines().last().unwrap_or("could not install Docker");
+        anyhow::bail!("{last}");
+    }
+    Ok(())
+}
+
+/// Install Podman via `ensure-podman.sh --yes` (apt + a rootless subuid/subgid
+/// preflight). Consent is the caller's job (they passed `install`); the script is
+/// idempotent if Podman is already present. Daemonless — nothing to start after.
+/// `password` feeds the script's `sudo -S` (apt needs root); without it the
+/// script's `sudo -n` fails fast rather than hanging. Returns the last error line.
+pub fn ensure_podman_install(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure(ENSURE_PODMAN, &[], password)?;
+    if !ok {
+        let last = err.lines().last().unwrap_or("could not install Podman");
         anyhow::bail!("{last}");
     }
     Ok(())
@@ -102,14 +206,9 @@ pub fn multipass_installed() -> bool {
 /// install (the only supported channel). Consent is the caller's job; the
 /// script is idempotent if Multipass is already present. Returns the script's
 /// last error line on failure (e.g. snapd missing, or needs sudo).
-pub fn ensure_multipass_install() -> Result<()> {
-    let out = Command::new("bash")
-        .arg(ENSURE_MULTIPASS)
-        .arg("--yes")
-        .output()
-        .context("running ensure-multipass.sh")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+pub fn ensure_multipass_install(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure(ENSURE_MULTIPASS, &[], password)?;
+    if !ok {
         let last = err.lines().last().unwrap_or("could not install Multipass");
         anyhow::bail!("{last}");
     }
@@ -144,15 +243,12 @@ pub fn vbox_version() -> Option<String> {
 
 /// Install VirtualBox via `ensure-vbox.sh --yes`. Consent is the caller's job
 /// (they passed `--install`); detection is the script's (idempotent if present).
-/// Returns the script's last error line on failure (e.g. needs sudo).
-pub fn ensure_vbox_install() -> Result<()> {
-    let out = Command::new("bash")
-        .arg(ENSURE_VBOX)
-        .arg("--yes")
-        .output()
-        .context("running ensure-vbox.sh")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+/// `password` feeds the script's `sudo -S` (apt needs root); without it the
+/// script's `sudo -n` fails fast rather than hanging on a tty prompt the TUI
+/// can't host. Returns the script's last error line on failure.
+pub fn ensure_vbox_install(password: Option<String>) -> Result<()> {
+    let (ok, err) = run_ensure(ENSURE_VBOX, &[], password)?;
+    if !ok {
         let last = err.lines().last().unwrap_or("could not install VirtualBox");
         anyhow::bail!("{last}");
     }
@@ -286,6 +382,121 @@ pub fn vbox_new(name: &str, user: &str) -> Result<String> {
         Some(p) => format!("{last} · {}", p.trim()),
         None => last.to_string(),
     })
+}
+
+/// Names of VMs that are currently running (`VBoxManage list runningvms`), so the
+/// `/sbx vms` listing can flag which of the registered VMs are live.
+pub fn running_vms() -> Vec<String> {
+    Command::new("VBoxManage")
+        .args(["list", "runningvms"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let start = l.find('"')? + 1;
+                    let end = l[start..].find('"')? + start;
+                    Some(l[start..end].to_string())
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---- VM library (curated pointers; built locally on demand) -----------------
+//
+// The repo ships scripts/vbox-library.json — POINTERS only (download URLs/pages),
+// never the multi-GB images. Choosing a VM builds it on the caller's own machine
+// via scripts/vbox-library.sh. Here we parse the manifest for listing/info; the
+// heavy build is shelled out to the script (which already handles download +
+// VBoxManage create/import + boot, with rollback).
+
+/// One curated VM as declared in the manifest. Only the fields we surface in the
+/// TUI are deserialized; the rest of the JSON (specs, firmware, etc.) is consumed
+/// by the build script.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct LibraryVm {
+    pub id: String,
+    pub name: String,
+    pub os: String,
+    pub size: String,
+    #[serde(default)]
+    pub page: String,
+    #[serde(default)]
+    pub notes: String,
+    /// Filled in by `vbox_library()` (not in the JSON): is a VM of this name
+    /// already registered in VirtualBox on this machine?
+    #[serde(skip)]
+    pub installed: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct LibraryManifest {
+    vms: Vec<LibraryVm>,
+}
+
+/// Parse the VM library manifest, marking each entry `installed` if a VM of that
+/// display name is already registered locally (`list_vms`). The catalog is the
+/// same for everyone; `installed` is per-machine, so this works identically for a
+/// host or any room member — VirtualBox VMs are always local to the caller.
+pub fn vbox_library() -> Result<Vec<LibraryVm>> {
+    let text = std::fs::read_to_string(VBOX_LIBRARY_JSON)
+        .with_context(|| format!("reading VM library manifest ({VBOX_LIBRARY_JSON})"))?;
+    let manifest: LibraryManifest =
+        serde_json::from_str(&text).context("parsing vbox-library.json")?;
+    let have = list_vms().unwrap_or_default();
+    Ok(manifest
+        .vms
+        .into_iter()
+        .map(|mut v| {
+            v.installed = have.iter().any(|n| n == &v.name);
+            v
+        })
+        .collect())
+}
+
+/// Look up a single library entry by its id (with `installed` resolved).
+pub fn library_vm(id: &str) -> Option<LibraryVm> {
+    vbox_library().ok()?.into_iter().find(|v| v.id == id)
+}
+
+/// Build a library VM locally by driving scripts/vbox-library.sh `--install`.
+/// Blocking and potentially slow (large download); run off the UI thread. No
+/// sudo is needed — VBoxManage create/import run as the user. `iso` supplies a
+/// locally-downloaded installer for entries with no auto-download (e.g. Windows).
+/// Returns the script's final status line(s).
+pub fn vbox_library_install(id: &str, iso: Option<String>) -> Result<String> {
+    let mut cmd = Command::new("bash");
+    cmd.arg(VBOX_LIBRARY_SH).args(["--install", id, "--yes"]);
+    if let Some(path) = iso.as_deref() {
+        cmd.args(["--iso", path]);
+    }
+    let out = cmd
+        .output()
+        .context("running vbox-library.sh (is bash available?)")?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        // The script narrates on stderr and ends with a ✖ reason / pointer.
+        let reason = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("build failed")
+            .trim();
+        anyhow::bail!("{reason}");
+    }
+    // Surface the final ✓/ⓘ status line.
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|l| {
+            let t = l.trim_start();
+            t.starts_with('✓') || t.starts_with('ⓘ')
+        })
+        .unwrap_or("done")
+        .trim();
+    Ok(last.to_string())
 }
 
 /// A running hypervisor that holds the CPU's VT-x/VMX root mode. While one is
@@ -426,12 +637,20 @@ pub fn stop_vtx_holder(h: &VtxHolder) -> Result<()> {
 }
 
 /// Which sandbox to summon. Multipass = strong isolation (default for real use),
-/// Docker = fast, Local = no isolation (dev/testing only).
+/// Podman = daemonless/rootless containers (no sudo), Docker = fast, Local = no
+/// isolation (dev/testing only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Local,
     Docker,
+    Podman,
     Multipass,
+    /// A physical device reached over SSH (e.g. the Pineapple Pager). No image,
+    /// no provisioning, no snapshots — `command_for` just opens `ssh -tt <alias>`
+    /// and the alias rides in the sandbox `name`. Reuses the whole PTY stream +
+    /// keystroke relay + driver-ACL unchanged; container-only steps are no-ops
+    /// (same shape as `Local`).
+    Device,
 }
 
 impl Backend {
@@ -439,7 +658,11 @@ impl Backend {
         match s {
             "local" => Some(Backend::Local),
             "docker" => Some(Backend::Docker),
+            "podman" => Some(Backend::Podman),
             "multipass" => Some(Backend::Multipass),
+            // A physical device over SSH. `device` takes an explicit alias
+            // positional; `pager` is sugar for the WiFi Pineapple Pager alias.
+            "device" | "pager" => Some(Backend::Device),
             _ => None,
         }
     }
@@ -447,25 +670,70 @@ impl Backend {
         match self {
             Backend::Local => "local-shell",
             Backend::Docker => "docker",
+            Backend::Podman => "podman",
             Backend::Multipass => "multipass",
+            Backend::Device => "device",
         }
     }
     /// Default image/release when the user doesn't specify one.
     pub fn default_image(self) -> &'static str {
         match self {
             Backend::Multipass => "24.04",
-            Backend::Docker => "ubuntu:24.04",
+            // Docker defaults to Parrot OS (Security). Debian/apt-based, so the
+            // apt-only sandbox-bootstrap.sh path works unchanged. `parrotsec/core`
+            // is the minimal base (bootstrap fills the toolchain); swap for
+            // `parrotsec/security` per-launch if you want the full pentest set.
+            Backend::Docker => "docker.io/parrotsec/core",
+            // Podman defaults to Kali (rolling). Still Debian/apt-based, so the
+            // apt-only sandbox-bootstrap.sh path works unchanged; base is minimal
+            // (no pentest metapackages pulled by default — keep first launch fast).
+            Backend::Podman => "docker.io/kalilinux/kali-rolling",
             Backend::Local => "",
+            Backend::Device => "",
         }
+    }
+    /// The exec family a co-located agent uses to run a command *inside* this
+    /// sandbox — `docker`/`podman exec`, `multipass exec`, or host `local`.
+    /// Advertised in the `_sbx:status` frame (distinct from `label`, whose Local
+    /// value is the cosmetic "local-shell") so the bridge can build the right
+    /// `<engine> exec` invocation for the backend that holds the sandbox.
+    pub fn engine(self) -> &'static str {
+        match self {
+            Backend::Local => "local",
+            Backend::Docker => "docker",
+            Backend::Podman => "podman",
+            Backend::Multipass => "multipass",
+            Backend::Device => "device",
+        }
+    }
+}
+
+/// The container-engine binary for an OCI backend. Docker and Podman share the
+/// same CLI grammar (`run/exec/commit/save/rm/images`), so the container code
+/// path is written once and parameterised by this. Non-container backends have
+/// no engine binary; calling this on them is a logic error (they never reach the
+/// container arms), so we default to "docker" rather than panic.
+fn engine_bin(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Podman => "podman",
+        _ => "docker",
     }
 }
 
 /// One-time setup before the PTY shell is spawned. Blocking — run off the UI
 /// thread (Multipass boots a real VM, ~20-30s). Idempotent: reuses an instance
 /// that already exists.
-pub fn prepare(backend: Backend, name: &str, image: &str, start_daemon: bool) -> Result<()> {
+pub fn prepare(
+    backend: Backend,
+    name: &str,
+    image: &str,
+    start_daemon: bool,
+    password: Option<String>,
+) -> Result<()> {
     match backend {
         Backend::Local => Ok(()),
+        // A device is already up (its own OS); nothing to prepare.
+        Backend::Device => Ok(()),
         Backend::Multipass => {
             let exists = Command::new("multipass")
                 .args(["info", name])
@@ -498,53 +766,251 @@ pub fn prepare(backend: Backend, name: &str, image: &str, start_daemon: bool) ->
             }
             Ok(())
         }
-        Backend::Docker => {
-            // The daemon must be up before any `docker` call. Rather than fail
-            // with a raw connection error, start it (the caller confirmed via
-            // `/sbx launch docker --start`).
-            if !docker_daemon_up() {
+        Backend::Docker | Backend::Podman => {
+            let engine = engine_bin(backend);
+            // Docker needs a running daemon before any call; rather than fail with
+            // a raw connection error, start it (the caller confirmed via
+            // `/sbx launch docker --start`). Podman is daemonless — skip the check
+            // and the sudo modal entirely; a rootless container launches as-is.
+            if backend == Backend::Docker && !docker_daemon_up() {
                 if start_daemon {
-                    start_docker_daemon().context("starting docker daemon")?;
+                    start_docker_daemon(password).context("starting docker daemon")?;
                 } else {
                     anyhow::bail!(
                         "docker daemon is not running — retry with `/sbx launch docker --start`"
                     );
                 }
             }
+            // Reclaim sandboxes abandoned by hack-house sessions that died
+            // without running `teardown` (SIGKILL/panic) before adding our own.
+            sweep_stale(backend);
             // Persistent container so we can exec in to provision users + shells.
-            let _ = Command::new("docker")
+            let _ = Command::new(engine)
                 .args(["rm", "-f", name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
             // Capture output so a failure can't paint over the TUI; the reason is
             // surfaced through the returned error (shown in the error popup).
-            let out = Command::new("docker")
-                .args([
-                    "run",
-                    "-d",
-                    "--name",
-                    name,
-                    "--hostname",
-                    name,
-                    "-w",
-                    "/root",
-                    image,
-                    "sleep",
-                    "infinity",
-                ])
-                .output()
-                .context("docker run (is docker installed?)")?;
-            if !out.status.success() {
-                let err = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!(
-                    "docker run failed: {}",
-                    err.lines().last().unwrap_or("").trim()
-                );
+            let mut run = Command::new(engine);
+            // `--init` puts a real init (catatonit) at PID 1 instead of the
+            // `sleep infinity` below. `sleep` only ever calls nanosleep() — it
+            // never wait()s — so every process orphaned inside the sandbox
+            // reparented to it and stayed an unreapable zombie for the life of
+            // the container. catatonit reaps them.
+            run.args(["run", "-d", "--init", "--name", name, "--hostname", name, "-w", "/root"]);
+            // Ownership labels: `teardown` handles every clean exit path, but a
+            // SIGKILL/panic can't run it. The labels let `sweep_stale` (below)
+            // reclaim containers whose owning hack-house is gone.
+            let owner = format!("{OWNER_PID_LABEL}={}", std::process::id());
+            run.args(["--label", &format!("{SANDBOX_LABEL}=1"), "--label", &owner]);
+            // The native harness runs the model host-side and only execs commands
+            // into the container, so the sandbox no longer needs to reach host
+            // Ollama. The old in-container Ollama gateway (Docker host-gateway /
+            // Podman slirp4netns host-loopback) is therefore gone — and with it the
+            // rootless-Podman loopback bug it used to work around.
+            // Isolation hardening — argv-identical to cmd_chat/operator/sandbox.py
+            // `_hardening_flags`. A safe DoS bound (`--pids-limit`, env-tunable) is
+            // ALWAYS on and never affects normal use. `HH_SBX_HARDEN=strict` adds
+            // the full escape-resistant posture (cap-drop=ALL, no-new-privileges,
+            // read-only, network=none) — that breaks apt/pip/git/su, so it is for
+            // EMPTY or locked-down/escape-sensitive rooms only. See the hh-redteam skill.
+            let pids = std::env::var("HH_SBX_PIDS").unwrap_or_else(|_| "4096".into());
+            run.args(["--pids-limit", &pids]);
+            let mem = std::env::var("HH_SBX_MEMORY").unwrap_or_default();
+            let mem = mem.trim();
+            if !mem.is_empty() {
+                run.args(["--memory", mem, "--memory-swap", mem]);
             }
+            let hardened = matches!(
+                std::env::var("HH_SBX_HARDEN").unwrap_or_default().trim().to_lowercase().as_str(),
+                "strict" | "escape" | "max"
+            );
+            if hardened {
+                run.args([
+                    "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+                    "--tmpfs", "/tmp", "--tmpfs", "/root:rw,exec", "--network=none",
+                ]);
+            }
+            // Egress control (HH_SBX_EGRESS) — same posture ladder as the Python operator
+            // (cmd_chat/operator/egress.py). Gateway modes shell to the single-source script
+            // scripts/hh-sbx-egress.py. Skipped when hardened (already --network=none).
+            let egress = std::env::var("HH_SBX_EGRESS").unwrap_or_default().trim().to_lowercase();
+            // Default `auto`: Tor exit if Tor is available on this host, else local — and
+            // if the Tor gateway can't come up, fall back to local. A launch is never
+            // refused for egress reasons (no false-negative connections). Stricter
+            // postures (guard/tor/none/…) stay available via HH_SBX_EGRESS.
+            let egress = if egress.is_empty() { "auto".to_string() } else { egress };
+            let auto = egress == "auto";
+            let mut mode = if auto {
+                if tor_available() { "tor".to_string() } else { "local".to_string() }
+            } else {
+                egress.clone()
+            };
+            let mut egress_gw_mode: Option<String> = None;
+            if !hardened {
+                match mode.as_str() {
+                    "none" => { run.args(["--network=none"]); }
+                    "open" => {}
+                    "guard" => {
+                        if !route_tunneled() {
+                            anyhow::bail!("HH_SBX_EGRESS=guard: sandbox egress is not tunneled \
+                                (VPN/Tor down) — refusing networked launch; HH_SBX_EGRESS=open to allow");
+                        }
+                    }
+                    "local" | "scope" | "tor" => match egress_gateway_up(engine, name, &mode) {
+                        Ok(netarg) => { run.arg(netarg); egress_gw_mode = Some(mode.clone()); }
+                        Err(e) => {
+                            if auto && mode == "tor" {
+                                // auto: Tor gateway unavailable — fall back to local.
+                                mode = "local".to_string();
+                                match egress_gateway_up(engine, name, &mode) {
+                                    Ok(netarg) => { run.arg(netarg); egress_gw_mode = Some(mode.clone()); }
+                                    Err(e2) => anyhow::bail!("egress gateway (local fallback) refused: {e2}"),
+                                }
+                            } else {
+                                anyhow::bail!("egress gateway ({mode}) refused: {e}");
+                            }
+                        }
+                    },
+                    other => anyhow::bail!("unknown HH_SBX_EGRESS='{other}'"),
+                }
+            }
+            run.args([image, "sleep", "infinity"]);
+            let out = run
+                .output()
+                .with_context(|| format!("{engine} run (is {engine} installed?)"))?;
+            if !out.status.success() {
+                if let Some(m) = &egress_gw_mode { egress_gateway_down(engine, name); let _ = m; }
+                let err = String::from_utf8_lossy(&out.stderr);
+                anyhow::bail!("{engine} run failed: {}", err.lines().last().unwrap_or("").trim());
+            }
+            if let Some(m) = egress_gw_mode { egress_postjoin(engine, name, &m); }
             Ok(())
         }
     }
+}
+
+/// Label marking a container as an hh sandbox we're allowed to reclaim.
+pub const SANDBOX_LABEL: &str = "hh.sandbox";
+/// Label carrying the PID of the hack-house process that created it.
+pub const OWNER_PID_LABEL: &str = "hh.owner-pid";
+
+/// The single-source sandbox-egress gateway CLI (shared with the Python operator).
+const HH_SBX_EGRESS_SCRIPT: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/hh-sbx-egress.py");
+
+/// Whether a Tor egress gateway can plausibly be brought up — used to resolve the
+/// `auto` default toward Tor. Cheap PATH probe (mirrors egress.py `tor_available`);
+/// the definitive test is bringing the gateway up, and `auto` falls back to `local`
+/// if that fails, so a false positive here costs one fallback, not a failed launch.
+fn tor_available() -> bool {
+    std::process::Command::new("sh")
+        .args(["-c", "command -v tor >/dev/null 2>&1"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Is the host's default route a VPN/Tor tunnel? Mirrors egress.py's VPN_IFACE_RE.
+fn route_tunneled() -> bool {
+    let out = match Command::new("ip").args(["route", "get", "1.1.1.1"]).output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let s = String::from_utf8_lossy(&out.stdout);
+    if let Some(idx) = s.find(" dev ") {
+        let dev = s[idx + 5..].split_whitespace().next().unwrap_or("");
+        return ["proton", "wg", "tun", "tap", "tailscale", "ppp", "nordlynx", "mullvad", "ipsec"]
+            .iter()
+            .any(|p| dev.starts_with(p));
+    }
+    false
+}
+
+/// Create the egress gateway via the shared script; return the `--network=container:...`
+/// flag to add to `podman run`, or an error (fail-closed — caller must refuse the launch).
+fn egress_gateway_up(engine: &str, name: &str, mode: &str) -> Result<String> {
+    let out = Command::new("python3")
+        .args([HH_SBX_EGRESS_SCRIPT, "up", name, "--egress", mode, "--engine", engine])
+        .output()
+        .with_context(|| "running hh-sbx-egress up")?;
+    let so = String::from_utf8_lossy(&out.stdout);
+    for line in so.lines() {
+        if let Some(flag) = line.strip_prefix("NETARG=") {
+            return Ok(flag.to_string());
+        }
+    }
+    let reason = so.lines().last().unwrap_or("").trim();
+    anyhow::bail!("{}", if reason.is_empty() { "gateway up failed" } else { reason });
+}
+
+/// Sandbox-side setup after it joined the gateway netns (tor: resolver). Best-effort.
+fn egress_postjoin(engine: &str, name: &str, mode: &str) {
+    let _ = Command::new("python3")
+        .args([HH_SBX_EGRESS_SCRIPT, "postjoin", name, "--egress", mode, "--engine", engine])
+        .output();
+}
+
+/// Remove the sandbox's egress gateway (best-effort; no-op if none).
+fn egress_gateway_down(engine: &str, name: &str) {
+    let _ = Command::new("python3")
+        .args([HH_SBX_EGRESS_SCRIPT, "down", name, "--engine", engine])
+        .output();
+}
+
+/// Reclaim sandbox containers whose owning hack-house process is gone.
+///
+/// `teardown` covers every *clean* exit (quit, SIGTERM, SIGHUP), but a SIGKILL,
+/// a panic, or a yanked terminal leaves the container running `sleep infinity`
+/// forever — and with it a pile of orphaned processes. Containers are stamped
+/// with the creator's PID at launch, so a container whose PID no longer exists
+/// in /proc is unambiguously abandoned. Called before each launch, so a crashed
+/// session is cleaned up by the next one. Best-effort and silent: never block a
+/// launch on cleanup. Returns how many were removed.
+pub fn sweep_stale(backend: Backend) -> usize {
+    let engine = match backend {
+        Backend::Docker | Backend::Podman => engine_bin(backend),
+        _ => return 0,
+    };
+    let out = match Command::new(engine)
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={SANDBOX_LABEL}=1"),
+            "--format",
+            &format!("{{{{.Names}}}} {{{{index .Labels \"{OWNER_PID_LABEL}\"}}}}"),
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return 0,
+    };
+    let mut swept = 0;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let (name, pid) = match line.trim().split_once(' ') {
+            Some((n, p)) if !n.is_empty() => (n, p.trim()),
+            // No PID label (or a stray blank line): not ours to judge — leave it.
+            _ => continue,
+        };
+        // An unparseable PID means we can't prove the owner is dead. Leave it.
+        let Ok(pid) = pid.parse::<u32>() else { continue };
+        if pid == std::process::id() || std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            continue; // owner still alive — hands off
+        }
+        if Command::new(engine)
+            .args(["rm", "-f", name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            swept += 1;
+        }
+    }
+    swept
 }
 
 /// Destroy ephemeral resources after stop. Multipass instance is purged;
@@ -571,14 +1037,19 @@ pub fn teardown(backend: Backend, name: &str) {
                 .stderr(Stdio::null())
                 .status();
         }
-        Backend::Docker => {
-            let _ = Command::new("docker")
+        Backend::Docker | Backend::Podman => {
+            let eng = engine_bin(backend);
+            let _ = Command::new(eng)
                 .args(["rm", "-f", name])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
+            egress_gateway_down(eng, name);  // remove the sandbox's egress gateway, if any
         }
         Backend::Local => {}
+        // The ssh session just closes; the device stays up. The ControlMaster
+        // persists briefly (ControlPersist) and reaps itself.
+        Backend::Device => {}
     }
 }
 
@@ -620,26 +1091,24 @@ fn snap_dir() -> Result<std::path::PathBuf> {
 /// Returns a short human description of what was written on success.
 pub fn save_state(backend: Backend, name: &str, label: &str, local: bool) -> Result<String> {
     match backend {
-        Backend::Docker => {
+        Backend::Docker | Backend::Podman => {
+            let engine = engine_bin(backend);
             let tag = format!("{SNAP_REPO}:{label}");
-            let out = Command::new("docker")
+            let out = Command::new(engine)
                 .args(["commit", name, &tag])
                 .output()
-                .context("docker commit (is docker installed?)")?;
+                .with_context(|| format!("{engine} commit (is {engine} installed?)"))?;
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
-                anyhow::bail!(
-                    "docker commit failed: {}",
-                    err.lines().last().unwrap_or("").trim()
-                );
+                anyhow::bail!("{engine} commit failed: {}", err.lines().last().unwrap_or("").trim());
             }
             if local {
                 let path = snap_dir()?.join(format!("hh-snap-{label}.tar"));
-                let out = Command::new("docker")
+                let out = Command::new(engine)
                     .args(["save", &tag, "-o"])
                     .arg(&path)
                     .output()
-                    .context("docker save")?;
+                    .with_context(|| format!("{engine} save"))?;
                 if !out.status.success() {
                     let err = String::from_utf8_lossy(&out.stderr);
                     anyhow::bail!(
@@ -685,6 +1154,102 @@ pub fn save_state(backend: Backend, name: &str, label: &str, local: bool) -> Res
         Backend::Local => {
             anyhow::bail!("the local shell has no VM state to save — launch a docker or multipass sandbox first")
         }
+        Backend::Device => {
+            anyhow::bail!("a device has no snapshot state — pull its loot with the device bridge (@<device> pull) instead")
+        }
+    }
+}
+
+/// Export an already-committed `hh-snap:<label>` image to a portable `.tar` under
+/// `hh-snapshots/` — the standalone file a peer can receive over `/send`. This is
+/// the `--local` half of `save_state` made reusable for `/sbx publish`, so an
+/// image saved *without* `--local` can still be made tradeable later. Idempotent:
+/// returns the existing file if it's already there. Blocking.
+pub fn export_image(backend: Backend, label: &str) -> Result<std::path::PathBuf> {
+    let engine = match backend {
+        Backend::Docker | Backend::Podman => engine_bin(backend),
+        _ => anyhow::bail!("only docker/podman snapshots export to a portable .tar"),
+    };
+    let path = snap_dir()?.join(format!("hh-snap-{label}.tar"));
+    if path.exists() {
+        return Ok(path);
+    }
+    let tag = format!("{SNAP_REPO}:{label}");
+    let out = Command::new(engine)
+        .args(["save", &tag, "-o"])
+        .arg(&path)
+        .output()
+        .with_context(|| format!("{engine} save"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "exporting {tag} failed: {}",
+            err.lines().last().unwrap_or("").trim()
+        );
+    }
+    Ok(path)
+}
+
+/// Pull the `(tag, label)` of a loaded snapshot out of `<engine> load` stdout.
+/// docker prints `Loaded image: hh-snap:<label>`; podman prints
+/// `Loaded image: localhost/hh-snap:<label>` (registry-qualified). We locate the
+/// `hh-snap:` marker anywhere in a line and normalise to the bare `hh-snap:<label>`
+/// tag — podman resolves the unqualified form back to `localhost/…` on use, and
+/// docker stores it bare, so the bare tag is the portable handle. Pure (no engine
+/// call) so the dual-engine output shapes stay under test.
+fn parse_loaded_tag(stdout: &str) -> Option<(String, String)> {
+    let marker = format!("{SNAP_REPO}:");
+    let tag = stdout
+        .lines()
+        .find_map(|l| l.find(&marker).map(|i| l[i..].trim().to_string()))?;
+    let label = tag.split_once(':').map(|(_, l)| l.to_string()).unwrap_or_default();
+    Some((tag, label))
+}
+
+/// Load a received `hh-snap-<label>.tar` image archive into the local engine —
+/// the receive-side inverse of `export_image`. Tries docker first, then podman
+/// (a docker `save` archive loads into either). Returns `(engine, image_tag,
+/// label)` parsed from the engine's `Loaded image:` line. Blocking.
+pub fn import_image_archive(path: &std::path::Path) -> Result<(String, String, String)> {
+    let mut last_err = String::new();
+    for engine in ["docker", "podman"] {
+        let out = match Command::new(engine).args(["load", "-i"]).arg(path).output() {
+            Ok(o) => o,
+            Err(_) => continue, // engine not installed — try the next
+        };
+        if !out.status.success() {
+            last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (tag, label) = parse_loaded_tag(&stdout)
+            .with_context(|| format!("{engine} load: no {SNAP_REPO}:… tag in output"))?;
+        return Ok((engine.to_string(), tag, label));
+    }
+    anyhow::bail!(
+        "couldn't load image archive (no docker/podman, or load failed: {})",
+        if last_err.is_empty() { "engine missing" } else { &last_err }
+    )
+}
+
+/// Run a throwaway container from `image` to read its `.hh-agent` manifest, so a
+/// just-imported snapshot can be registered with its purpose/status/todo without
+/// booting it into the room. `<engine> run --rm <image> cat …`; None if the image
+/// carries no manifest. Blocking.
+pub fn read_image_manifest(engine: &str, image: &str) -> Option<String> {
+    let out = Command::new(engine)
+        .args(["run", "--rm", image, "cat", "/root/.hh-agent/manifest.yaml"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 
@@ -816,11 +1381,12 @@ pub fn vm_snapshots(vm: &str) -> Result<Vec<String>> {
 /// `hh-snap`, or multipass snapshots of the instance). Blocking.
 pub fn list_snapshots(backend: Backend, name: &str) -> Result<Vec<String>> {
     match backend {
-        Backend::Docker => {
-            let out = Command::new("docker")
+        Backend::Docker | Backend::Podman => {
+            let engine = engine_bin(backend);
+            let out = Command::new(engine)
                 .args(["images", SNAP_REPO, "--format", "{{.Tag}}"])
                 .output()
-                .context("docker images")?;
+                .with_context(|| format!("{engine} images"))?;
             Ok(String::from_utf8_lossy(&out.stdout)
                 .lines()
                 .map(str::trim)
@@ -846,6 +1412,7 @@ pub fn list_snapshots(backend: Backend, name: &str) -> Result<Vec<String>> {
                 .collect())
         }
         Backend::Local => Ok(Vec::new()),
+        Backend::Device => Ok(Vec::new()),
     }
 }
 
@@ -855,15 +1422,16 @@ pub fn list_snapshots(backend: Backend, name: &str) -> Result<Vec<String>> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SnapKind {
     Docker,
+    Podman,
     Multipass,
     None,
 }
 
 /// Resolve a snapshot label to the backend that holds it. Probes multipass first
-/// (its snapshots are instance-scoped and rarer), then docker's `hh-snap` repo.
-/// Blocking — run off the UI thread. A backend whose CLI is absent simply
-/// reports no match rather than erroring, so a missing multipass doesn't block a
-/// docker load and vice-versa.
+/// (its snapshots are instance-scoped and rarer), then the OCI engines' `hh-snap`
+/// repo (docker, then podman). Blocking — run off the UI thread. A backend whose
+/// CLI is absent simply reports no match rather than erroring, so a missing
+/// multipass doesn't block a docker load and vice-versa.
 pub fn locate_snapshot(name: &str, label: &str) -> SnapKind {
     if list_snapshots(Backend::Multipass, name)
         .map(|s| s.iter().any(|l| l == label))
@@ -877,6 +1445,13 @@ pub fn locate_snapshot(name: &str, label: &str) -> SnapKind {
     {
         return SnapKind::Docker;
     }
+    if podman_installed()
+        && list_snapshots(Backend::Podman, name)
+            .map(|s| s.iter().any(|l| l == label))
+            .unwrap_or(false)
+    {
+        return SnapKind::Podman;
+    }
     SnapKind::None
 }
 
@@ -889,13 +1464,13 @@ fn command_for(backend: Backend, name: &str, run_user: &str) -> CommandBuilder {
             c.arg("-i");
             c
         }
-        Backend::Docker => {
+        Backend::Docker | Backend::Podman => {
             let user = if run_user.is_empty() {
                 "root"
             } else {
                 run_user
             };
-            let mut c = CommandBuilder::new("docker");
+            let mut c = CommandBuilder::new(engine_bin(backend));
             c.args(["exec", "-it", "-u", user, name, "bash", "-il"]);
             c
         }
@@ -907,6 +1482,26 @@ fn command_for(backend: Backend, name: &str, run_user: &str) -> CommandBuilder {
                 // Login shell as the provisioned owner account (a real sudoer).
                 c.args(["exec", name, "--", "sudo", "-u", run_user, "-i"]);
             }
+            c
+        }
+        Backend::Device => {
+            // `name` IS the ssh alias (the Copy enum can't carry it). Multiplex
+            // over the same ControlMaster the Python ssh_conn opens, so a device
+            // already dialled by the bridge is reused; `-tt` forces a remote PTY
+            // even without a local tty, so the PTY loop drives it like any shell.
+            let ctl = format!("{}/.ssh/cm-hh-{}.sock",
+                std::env::var("HOME").unwrap_or_else(|_| "/root".into()), name);
+            let mut c = CommandBuilder::new("ssh");
+            c.args([
+                "-tt",
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ControlMaster=auto",
+                "-o", &format!("ControlPath={ctl}"),
+                "-o", "ControlPersist=300",
+                "-o", "ConnectTimeout=12",
+                name,
+            ]);
             c
         }
     }
@@ -933,10 +1528,10 @@ fn mp(name: &str, args: &[&str]) {
         .stderr(Stdio::null())
         .status();
 }
-fn dk(name: &str, args: &[&str]) {
+fn dk(engine: &str, name: &str, args: &[&str]) {
     let mut a = vec!["exec", name];
     a.extend_from_slice(args);
-    let _ = Command::new("docker")
+    let _ = Command::new(engine)
         .args(a)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -976,15 +1571,17 @@ fn sandbox_pkgs() -> String {
 /// Run the sandbox bootstrap inside the container, piping the script to `bash -s`
 /// on stdin (keeps it out of argv) with the resolved package list in the env.
 /// Blocking — provision() is already off the UI thread.
-fn dk_bootstrap(name: &str) {
+fn dk_bootstrap(engine: &str, name: &str) {
     let script = std::fs::read_to_string(SBX_BOOTSTRAP).unwrap_or_else(|_| {
         // Degraded fallback if the script file is missing: still refresh the
         // index and install whatever the env carries (at minimum vim+curl).
         "apt-get update -qq && apt-get install -y --no-install-recommends $HH_SBX_PKGS".into()
     });
-    let env = format!("HH_SBX_PKGS={}", sandbox_pkgs());
-    let child = Command::new("docker")
-        .args(["exec", "-i", "-e", &env, name, "bash", "-s"])
+    let pkgs_env = format!("HH_SBX_PKGS={}", sandbox_pkgs());
+    let child = Command::new(engine)
+        .args([
+            "exec", "-i", "-e", &pkgs_env, name, "bash", "-s",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1043,17 +1640,18 @@ pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) 
             mp_bootstrap(name); // same baseline dev toolchain as the docker sandbox
             run
         }
-        Backend::Docker => {
+        Backend::Docker | Backend::Podman => {
+            let engine = engine_bin(backend);
             // Install the baseline dev toolchain (editable list in
             // scripts/sandbox-tools.json; vim+curl guaranteed) so a fresh
             // sandbox comes up usable instead of bare. The script also refreshes
             // the apt index (base images ship without /var/lib/apt/lists) and is
             // idempotent + sentinel-guarded, so re-provisions stay fast.
-            dk_bootstrap(name);
+            dk_bootstrap(engine, name);
             for m in members {
                 let u = unix_name(m);
                 if !u.is_empty() {
-                    dk(name, &["useradd", "-m", "-s", "/bin/bash", &u]);
+                    dk(engine, name, &["useradd", "-m", "-s", "/bin/bash", &u]);
                 }
             }
             // Base images usually lack the sudo package; the shared shell runs as
@@ -1061,6 +1659,9 @@ pub fn provision(backend: Backend, name: &str, owner: &str, members: &[String]) 
             "root".to_string()
         }
         Backend::Local => String::new(),
+        // No unix accounts to provision on a remote device — its shell logs in
+        // as whatever the ssh alias configures. The empty run-user is correct.
+        Backend::Device => String::new(),
     }
 }
 
@@ -1085,8 +1686,9 @@ pub fn set_sudo(backend: Backend, name: &str, user: &str, enable: bool) {
 pub fn run_user_for(backend: Backend, owner: &str) -> String {
     match backend {
         Backend::Multipass => unix_name(owner),
-        Backend::Docker => "root".to_string(),
+        Backend::Docker | Backend::Podman => "root".to_string(),
         Backend::Local => String::new(),
+        Backend::Device => String::new(),
     }
 }
 
@@ -1108,9 +1710,9 @@ pub fn push(
             "local sandbox shares the host filesystem — {} is already reachable",
             local.display()
         ),
-        Backend::Docker => {
+        Backend::Docker | Backend::Podman => {
             // Shell runs as root with $HOME=/root (see `prepare`'s `-w /root`).
-            let mut c = Command::new("docker");
+            let mut c = Command::new(engine_bin(backend));
             c.args(["exec", "-i", name, "tar", "-C", "/root", "-xf", "-"]);
             extract_tar(c, &tar)?;
             Ok(format!("/root/{base}"))
@@ -1127,6 +1729,9 @@ pub fn push(
             mp(name, &["sudo", "chown", "-R", &owns, &target]);
             Ok(target)
         }
+        Backend::Device => anyhow::bail!(
+            "file push over /sbx isn't supported for a device — use the device bridge (@<device> push)"
+        ),
     }
 }
 
@@ -1246,6 +1851,22 @@ impl Sandbox {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn parse_loaded_tag_handles_docker_and_podman() {
+        // docker: bare tag.
+        assert_eq!(
+            parse_loaded_tag("Loaded image: hh-snap:kali-recon\n"),
+            Some(("hh-snap:kali-recon".to_string(), "kali-recon".to_string()))
+        );
+        // podman: registry-qualified — must strip `localhost/` to the bare tag.
+        assert_eq!(
+            parse_loaded_tag("Loaded image: localhost/hh-snap:kali-recon\n"),
+            Some(("hh-snap:kali-recon".to_string(), "kali-recon".to_string()))
+        );
+        // no snapshot tag in the output → None (caller surfaces a clear error).
+        assert_eq!(parse_loaded_tag("Loaded image: alpine:latest\n"), None);
+    }
 
     /// Proves the PTY pipeline: spawn a real shell, send a command, read its
     /// output back off the channel. (Local backend — no container needed.)

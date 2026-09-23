@@ -23,12 +23,16 @@ ASSUME_YES=0
 CHECK_ONLY=0
 DO_INSTALL=0
 PLAN_ONLY=0
+STDIN_PASS=0
 for arg in "$@"; do
     case "$arg" in
         -y|--yes)         ASSUME_YES=1 ;;
         --check)          CHECK_ONLY=1 ;;
         --install)        DO_INSTALL=1 ;;
         --plan|--dry-run) PLAN_ONLY=1; DO_INSTALL=1 ;;
+        # A sudo password is waiting on stdin (the hack-house TUI feeds it). Use
+        # `sudo -S` so escalation reads that, never the controlling tty.
+        --stdin-pass)     STDIN_PASS=1 ;;
         -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "✖ unknown arg: $arg" >&2; exit 2 ;;
     esac
@@ -36,6 +40,18 @@ done
 
 daemon_up()  { docker info >/dev/null 2>&1; }
 have_docker() { command -v docker >/dev/null 2>&1; }
+
+# How to escalate. Three cases:
+#   * --stdin-pass: a password is waiting on stdin (the hack-house TUI prompted
+#     for it). Use `sudo -S -p ''` so sudo reads it from stdin with no prompt —
+#     never the controlling tty (a raw-mode TUI would corrupt a tty prompt). The
+#     first sudo caches the credential; the rest authenticate from cache.
+#   * --yes alone: non-interactive `sudo -n` — fails fast if creds aren't cached
+#     rather than hanging on a tty prompt the TUI can't host.
+#   * interactive shell: plain `sudo` (a real terminal can prompt normally).
+SUDO="sudo"
+[[ $ASSUME_YES -eq 1 ]] && SUDO="sudo -n"
+[[ $STDIN_PASS -eq 1 ]] && SUDO="sudo -S -p ''"
 
 # ── Work out how to install Docker on this platform ──────────────────────────
 # Emits the ordered list of commands (one per line) to PLAN_LINES; empty if we
@@ -54,28 +70,28 @@ build_install_plan() {
         *debian*|*ubuntu*)
             local repo="ubuntu"; [[ "$id" == "debian" ]] && repo="debian"
             PLAN_LINES=$(cat <<EOF
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/$repo/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$repo \$(. /etc/os-release && echo \${VERSION_CODENAME}) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+$SUDO apt-get update
+$SUDO apt-get install -y ca-certificates curl
+$SUDO install -m 0755 -d /etc/apt/keyrings
+$SUDO curl -fsSL https://download.docker.com/linux/$repo/gpg -o /etc/apt/keyrings/docker.asc
+$SUDO chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$repo \$(. /etc/os-release && echo \${VERSION_CODENAME}) stable" | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+$SUDO apt-get update
+$SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 EOF
 )
             ;;
         *fedora*|*rhel*|*centos*)
             local repo="fedora"; case " $id $id_like " in *rhel*|*centos*) repo="centos";; esac
             PLAN_LINES=$(cat <<EOF
-sudo dnf -y install dnf-plugins-core
-sudo dnf config-manager --add-repo https://download.docker.com/linux/$repo/docker-ce.repo
-sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+$SUDO dnf -y install dnf-plugins-core
+$SUDO dnf config-manager --add-repo https://download.docker.com/linux/$repo/docker-ce.repo
+$SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 EOF
 )
             ;;
         *arch*)
-            PLAN_LINES="sudo pacman -S --noconfirm docker"
+            PLAN_LINES="$SUDO pacman -S --noconfirm docker"
             ;;
     esac
 }
@@ -137,7 +153,15 @@ start_cmd=""
 need_sudo=0
 case "$(uname -s)" in
     Linux)
-        if command -v systemctl >/dev/null 2>&1; then
+        # Docker Desktop on Linux runs the engine inside a per-user VM, started
+        # by the *user* unit `docker-desktop.service` — there is no root
+        # `docker.service`, and no sudo is needed. Detect it first so we don't
+        # `sudo systemctl start docker` and fail with "Unit docker.service could
+        # not be found" (which is exactly what the classic-engine path does here).
+        if command -v systemctl >/dev/null 2>&1 \
+            && systemctl --user cat docker-desktop.service >/dev/null 2>&1; then
+            start_cmd="systemctl --user start docker-desktop"; need_sudo=0
+        elif command -v systemctl >/dev/null 2>&1; then
             start_cmd="systemctl start docker"; need_sudo=1
         elif command -v service >/dev/null 2>&1; then
             start_cmd="service docker start"; need_sudo=1
@@ -153,7 +177,7 @@ if [[ -z "$start_cmd" ]]; then
     echo "✖ don't know how to start the docker daemon here — start it manually" >&2
     exit 1
 fi
-[[ $need_sudo -eq 1 ]] && start_cmd="sudo $start_cmd"
+[[ $need_sudo -eq 1 ]] && start_cmd="$SUDO $start_cmd"
 
 # Confirmation (skipped with --yes).
 if [[ $ASSUME_YES -ne 1 ]]; then
@@ -166,7 +190,7 @@ if [[ $ASSUME_YES -ne 1 ]]; then
 fi
 
 echo "starting docker daemon: $start_cmd" >&2
-eval "$start_cmd" || { echo "✖ failed to start docker daemon (sudo password needed? run it in a terminal)" >&2; exit 1; }
+eval "$start_cmd" || { echo "✖ failed to start docker daemon — needs sudo. Run 'sudo -v' in a terminal first (caches your password), then retry" >&2; exit 1; }
 
 # Wait for it to accept connections (Desktop / a fresh VM can take a while).
 for _ in $(seq 1 60); do

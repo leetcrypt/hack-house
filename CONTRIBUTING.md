@@ -20,8 +20,8 @@ We welcome contributions of all types, including:
 
 ## 📦 Getting Started
 
-1. **Fork the repository** on the Gitea instance (`gitea.example.com`).
+1. **Fork the repository** on GitHub (`github.com/leetcrypt/hack-house`).
 2. **Clone your fork** locally:
    ```bash
-   git clone https://gitea.example.com/leetcrypt/hack-house.git
+   git clone https://github.com/leetcrypt/hack-house.git
    cd hack-house

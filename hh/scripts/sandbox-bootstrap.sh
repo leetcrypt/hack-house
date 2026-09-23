@@ -50,5 +50,9 @@ if ! apt-get install -y --no-install-recommends $PKGS; then
     done
 fi
 
+# No in-sandbox agentic harness is installed here: the native `!task` harness
+# runs the model host-side and only execs commands into this sandbox, so nothing
+# extra needs to live in the container.
+
 mkdir -p "$(dirname "$SENTINEL")"
 date -u +%FT%TZ > "$SENTINEL"       # mark done; skip on the next provision pass

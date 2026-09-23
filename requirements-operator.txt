@@ -1,0 +1,21 @@
+# Operator-only dependencies — for running a hack-house operator/user from a
+# phone (Termux, aarch64 Android) or any minimal host. See docs/termux-operator.md.
+#
+# This is deliberately a SUBSET of requirements.txt: the operator never runs the
+# Sanic server, so sanic/sanic-ext/pydantic and the test deps are omitted. The
+# cryptography floor is relaxed from the server's >=46 to >=41 so Termux's
+# packaged build (`pkg install python-cryptography`) satisfies it — the operator
+# only uses cryptography.fernet.Fernet, stable for years. Do NOT edit the
+# server's requirements.txt pin to match this.
+#
+#   pip install -r requirements-operator.txt
+#
+# `srp` is a C extension with no reliable aarch64 wheel; if it fails to build,
+# the client transparently falls back to cmd_chat/client/_srp_pure (pure Python),
+# so this line is best-effort — the operator still works without it.
+
+requests>=2.32.0
+rich>=14.0.0
+websockets>=15.0.0
+cryptography>=41
+srp==1.0.22

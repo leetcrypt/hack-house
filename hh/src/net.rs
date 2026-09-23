@@ -1,7 +1,7 @@
 //! SRP authentication (blocking, one-shot) + async websocket transport and the
 //! reader task that decrypts/parses server frames into `Net` events.
 
-use crate::app::{ChatLine, Net, User};
+use crate::app::{CatalogItem, ChatLine, Net, User, WebGuest};
 use crate::crypto;
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -194,6 +194,15 @@ fn decode_msg(room: &fernet::Fernet, m: &Value, live: bool) -> Decoded {
                     Decoded::Skip
                 };
             }
+            if t.starts_with("{\"_web\":") {
+                return if live {
+                    parse_web(&t, sender)
+                        .map(Decoded::Sbx)
+                        .unwrap_or(Decoded::Skip)
+                } else {
+                    Decoded::Skip
+                };
+            }
             (t, false)
         }
         Err(_) => ("[unreadable — wrong room password?]".to_string(), true),
@@ -238,7 +247,42 @@ fn parse_sbx(text: &str, sender: &str) -> Option<Net> {
             by: sender.to_string(),
             vm: v["vm"].as_str().unwrap_or("a VM").to_string(),
         }),
+        // VM-trading (Phase B). `by` is the server-authenticated sender; `to`
+        // names the intended recipient (the handler acts only if it's itself).
+        "catreq" => Some(Net::SbxCatReq {
+            by: sender.to_string(),
+            to: v["to"].as_str().unwrap_or("").to_string(),
+        }),
+        "catalog" => Some(Net::SbxCatalog {
+            by: sender.to_string(),
+            to: v["to"].as_str().unwrap_or("").to_string(),
+            items: v["items"]
+                .as_array()
+                .map(|a| a.iter().map(parse_catalog_item).collect())
+                .unwrap_or_default(),
+        }),
+        "pullreq" => Some(Net::SbxPullReq {
+            by: sender.to_string(),
+            to: v["to"].as_str().unwrap_or("").to_string(),
+            label: v["label"].as_str()?.to_string(),
+        }),
         _ => None,
+    }
+}
+
+/// Parse one `_sbx:catalog` item object into a `CatalogItem`. Tolerant: missing
+/// fields default to empty so a malformed row degrades rather than dropping the
+/// whole catalog.
+fn parse_catalog_item(v: &Value) -> CatalogItem {
+    CatalogItem {
+        label: v["label"].as_str().unwrap_or("").to_string(),
+        purpose: v["purpose"].as_str().unwrap_or("").to_string(),
+        status: v["status"].as_str().unwrap_or("").to_string(),
+        tags: v["tags"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        size_bytes: v["size"].as_u64(),
     }
 }
 
@@ -283,6 +327,32 @@ fn parse_perm(text: &str) -> Option<Net> {
     })
 }
 
+/// Parse a decrypted `{"_web":"presence",...}` frame from the web-relay publisher
+/// into a roster of display-only browser viewers. `sender` is the server-stamped
+/// publisher username (trusted) — used to clear the group when it leaves — not
+/// the frame's own `publisher` claim.
+fn parse_web(text: &str, sender: &str) -> Option<Net> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    if v["_web"].as_str()? != "presence" {
+        return None;
+    }
+    let guests = v["viewers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| {
+            Some(WebGuest {
+                handle: g["handle"].as_str()?.to_string(),
+                driving: g["driving"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect();
+    Some(Net::WebPresence {
+        publisher: sender.to_string(),
+        guests,
+    })
+}
+
 /// Read websocket frames forever, forwarding decoded `Net` events to the UI.
 pub async fn reader(
     mut read: impl StreamExt<Item = Result<WsMsg, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -313,6 +383,20 @@ pub async fn reader(
                 tx.send(Net::Init {
                     lines,
                     users: parse_users(&v["users"]),
+                    onion: v["onion"].as_str().unwrap_or("").to_string(),
+                    reach: v["reach"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|r| {
+                                    Some((
+                                        r["label"].as_str()?.to_string(),
+                                        r["addr"].as_str()?.to_string(),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             }
             "message" => match decode_msg(&room, &v["data"], true) {
@@ -323,11 +407,22 @@ pub async fn reader(
             "roster" => tx.send(Net::Roster {
                 users: parse_users(&v["users"]),
                 capacity: v["capacity"].as_u64().unwrap_or(0) as usize,
+                host: v["host"].as_str().map(str::to_string),
             }),
             "user_joined" => tx.send(Net::Joined(
                 v["username"].as_str().unwrap_or("?").to_string(),
             )),
             "user_left" => tx.send(Net::Left(v["user_id"].as_str().unwrap_or("").to_string())),
+            "kicked" => tx.send(Net::Kicked {
+                username: v["username"].as_str().unwrap_or("?").to_string(),
+                by: v["by"].as_str().unwrap_or("host").to_string(),
+            }),
+            "password_rotated" => tx.send(Net::PasswordRotated {
+                password: v["password"].as_str().unwrap_or("").to_string(),
+            }),
+            "kick_denied" => tx.send(Net::KickDenied {
+                reason: v["reason"].as_str().unwrap_or("denied").to_string(),
+            }),
             _ => Ok(()),
         };
         if sent.is_err() {
@@ -407,5 +502,85 @@ mod tests {
             let v = json!([{ "user_id": id, "username": name }, "garbage", 42, null]);
             let _ = parse_users(&v);
         }
+    }
+
+    // ── Phase B VM-trading frames ──────────────────────────────────────────
+    #[test]
+    fn parse_sbx_catreq_uses_authenticated_sender() {
+        // The frame can claim any `to`, but `by` is the server-stamped sender.
+        let frame = json!({"_sbx":"catreq","to":"bob"}).to_string();
+        let Some(Net::SbxCatReq { by, to }) = parse_sbx(&frame, "alice") else {
+            panic!("expected SbxCatReq");
+        };
+        assert_eq!(by, "alice");
+        assert_eq!(to, "bob");
+    }
+
+    #[test]
+    fn parse_sbx_catalog_parses_items() {
+        let frame = json!({
+            "_sbx":"catalog","to":"alice",
+            "items":[
+                {"label":"kali-recon","purpose":"recon box","status":"in_progress",
+                 "tags":["recon","kali"],"size": 1024},
+                {"label":"bare"} // missing fields must default, not drop the row
+            ]
+        }).to_string();
+        let Some(Net::SbxCatalog { by, to, items }) = parse_sbx(&frame, "bob") else {
+            panic!("expected SbxCatalog");
+        };
+        assert_eq!(by, "bob");
+        assert_eq!(to, "alice");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "kali-recon");
+        assert_eq!(items[0].tags, vec!["recon".to_string(), "kali".to_string()]);
+        assert_eq!(items[0].size_bytes, Some(1024));
+        assert_eq!(items[1].label, "bare");
+        assert!(items[1].purpose.is_empty());
+        assert_eq!(items[1].size_bytes, None);
+    }
+
+    #[test]
+    fn parse_sbx_pullreq_requires_label() {
+        let ok = json!({"_sbx":"pullreq","to":"bob","label":"kali-recon"}).to_string();
+        assert!(matches!(parse_sbx(&ok, "alice"), Some(Net::SbxPullReq { .. })));
+        // No label → reject the frame rather than pull a nameless VM.
+        let bad = json!({"_sbx":"pullreq","to":"bob"}).to_string();
+        assert!(parse_sbx(&bad, "alice").is_none());
+    }
+
+    // A well-formed `_web:presence` frame parses into a display-only guest roster.
+    // The publisher name comes from the server-stamped `sender`, NOT the frame's
+    // own `publisher` claim — so a spoofed publisher field can't misattribute it.
+    #[test]
+    fn parse_web_presence_happy_path() {
+        let frame = json!({
+            "_web": "presence",
+            "count": 2,
+            "publisher": "spoofed-name",
+            "viewers": [
+                { "id": "abc", "alias": "1", "handle": "web-a1b2", "driving": true },
+                { "id": "def", "alias": "2", "handle": "web-c3d4", "driving": false },
+            ],
+        })
+        .to_string();
+        match parse_web(&frame, "web-publisher") {
+            Some(Net::WebPresence { publisher, guests }) => {
+                assert_eq!(publisher, "web-publisher"); // sender, not the claim
+                assert_eq!(guests.len(), 2);
+                assert_eq!(guests[0].handle, "web-a1b2");
+                assert!(guests[0].driving);
+                assert_eq!(guests[1].handle, "web-c3d4");
+                assert!(!guests[1].driving);
+            }
+            other => panic!("expected WebPresence, got {:?}", other.is_some()),
+        }
+    }
+
+    // A non-presence `_web` frame is rejected (None), not mis-parsed.
+    #[test]
+    fn parse_web_rejects_non_presence() {
+        let frame = json!({ "_web": "something-else" }).to_string();
+        assert!(parse_web(&frame, "web-publisher").is_none());
     }
 }

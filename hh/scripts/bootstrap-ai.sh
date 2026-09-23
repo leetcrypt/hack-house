@@ -8,6 +8,10 @@
 #
 # The baseline is untouched: ./bootstrap.sh alone never installs or enables AI.
 #
+# The /ai agent's sandbox `!task` harness runs host-side (native tool-calling /
+# one-shot injector) and needs no extra binary, so this script installs nothing
+# beyond Ollama + the model.
+#
 # usage:
 #   ./bootstrap-ai.sh              # baseline setup + Ollama + default model
 #   ./bootstrap-ai.sh --release    # ...and build the client in release mode
@@ -32,10 +36,10 @@ ASSUME_YES=0
 AI_ONLY=0
 for arg in "$@"; do
     case "$arg" in
-        --release) RELEASE_ARGS+=(--release) ;;
-        --check)   CHECK_ONLY=1 ;;
-        --yes|-y)  ASSUME_YES=1 ;;
-        --ai-only) AI_ONLY=1 ;;
+        --release)  RELEASE_ARGS+=(--release) ;;
+        --check)    CHECK_ONLY=1 ;;
+        --yes|-y)   ASSUME_YES=1 ;;
+        --ai-only)  AI_ONLY=1 ;;
         -h|--help|-help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "✖ unknown arg: $arg (try --release / --check / --yes / --ai-only / --help)" >&2; exit 2 ;;
     esac

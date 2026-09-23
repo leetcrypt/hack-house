@@ -132,7 +132,7 @@ LAN_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -
 JOIN_IP="${TS_IP:-${LAN_IP:-$HOST}}"
 
 echo "═══════════════════════════════════════════════"
-echo "  ⛧ hack-house room — $PROTO://$HOST:$PORT"
+echo "  † hack-house room — $PROTO://$HOST:$PORT"
 echo "═══════════════════════════════════════════════"
 [[ -n "$TS_IP"  ]] && echo "  tailscale : $TS_IP  (recommended — encrypted)"
 [[ -n "$LAN_IP" ]] && echo "  lan       : $LAN_IP"
