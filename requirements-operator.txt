@@ -19,3 +19,8 @@ rich>=14.0.0
 websockets>=15.0.0
 cryptography>=41
 srp==1.0.22
+
+# Only for the Flipper Zero device bridge's `/sbx flipper` serial relay
+# (cmd_chat/device/serial_relay.py, USB-tethered desktop host). Not needed on a
+# phone operator — nothing to plug a Flipper into there.
+pyserial>=3.5

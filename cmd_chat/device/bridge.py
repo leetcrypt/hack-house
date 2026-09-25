@@ -23,10 +23,11 @@ import websockets
 
 from cmd_chat.client.client import MAX_WS_FRAME, Client
 
+from .adapters.flipper import FlipperAdapter
 from .adapters.pager import PagerAdapter
 from .adapters.ssh_conn import SshConn
 
-ADAPTERS = {"pager": PagerAdapter}
+ADAPTERS = {"pager": PagerAdapter, "flipper": FlipperAdapter}
 
 MAX_OUT_LINES = 60          # cap a single command's chat reply
 ARM_TTL = 120.0            # seconds an armed device stays armed before auto-disarm

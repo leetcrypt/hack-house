@@ -1,8 +1,17 @@
 # Device bridge — expose a physical device into a room as an interactive member
 
-**Status:** design (2026-09-17). **Decisions locked:** first device = WiFi Pineapple
-Pager; first interaction model = *persona member* (curated verbs); home =
-`cmd_chat/device/` in hack-house main. Raw-drive + Flipper come later.
+**Status:** P1 (pager) + P2 (flipper) shipped (2026-09-24). **Decisions locked:** first
+device = WiFi Pineapple Pager; interaction model = *persona member* (curated verbs) +
+raw-drive `/sbx <persona>`; home = `cmd_chat/device/` in hack-house main.
+
+**Flipper Zero (P2) is implemented** — `adapters/flipper.py` (full multi-tool: reads +
+owner-only + ARMED RF/HID) over local USB serial (`adapters/serial_conn.py` shelling to
+`flipper-0/bin/flipper-cli`), and `/sbx flipper` via a dependency-free pyserial↔PTY relay
+(`serial_relay.py`, no picocom/minicom needed). Registered in `bridge.py` ADAPTERS;
+launches via `hh-go device flipper` / `hh-device flipper …`. USB-tethered ONLY — no
+network fallback (contrast the pager's USB→WiFi→LAN auto-discovery), so "unplugged" =
+genuinely offline and the presence gate reports it. `pyserial>=3.5` added to the operator
+venv + `requirements-operator.txt`.
 
 ## Concept
 
@@ -109,7 +118,8 @@ encryption. Added for hardware:
 - **P0** foundations — `cmd_chat/device/` scaffold from `emit_sbx.py`; `DeviceAdapter` base;
   presence probe; `.hh-device` manifest; `pyserial` into the venv (for P2).
 - **P1** pager persona (this doc) — join, curated verbs over `ssh pager`, output→chat+loot.
-- **P2** flipper serial adapter + `radio-legal` arm gate.
+- **P2** flipper serial adapter + arm gate for RF/HID (subghz/nfc/rfid/ir TX + BadUSB `hid`).
+  ✅ shipped 2026-09-24 (`adapters/flipper.py` + `adapters/serial_conn.py` + `serial_relay.py`).
 - **P3** interactive `hh_shim` — payload dialogs/pickers surface in the room.
 - **P4** raw-drive model — device shell as an `_sbx:data` stream driven via the keystroke
   relay, gated by driver-ACL + arm (device-as-`/sbx`).

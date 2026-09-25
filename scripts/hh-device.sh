@@ -24,7 +24,8 @@ REPO="${HH_REPO:-$HOME/coding/hack-house/main}"
 DEVICE="${1:-}"; HOST="${2:-}"; PORT="${3:-}"; PW="${4:-}"
 if [[ -z "$DEVICE" || -z "$HOST" || -z "$PORT" || -z "$PW" ]]; then
   echo "usage: hh-device <device> <room-host> <room-port> <room-password> [--owner <you>]"
-  echo "       device is one of: pager"
+  echo "       device is one of: pager, flipper"
+  echo "       (flipper: USB-serial, tethered-only; HH_DEVICE_ALIAS=/dev/ttyACM0 pins the node)"
   exit 2
 fi
 shift 4 || true
