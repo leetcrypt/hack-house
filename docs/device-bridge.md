@@ -217,8 +217,40 @@ a fallback. Overrides: `HH_ROOM_PORT` + `HH_ROOM_PASSWORD` (target a specific ro
 `HH_DEVICE_OWNER` (your room name; default `$USER`), `HH_DEVICE_ALIAS` (ssh alias). For a
 room on another host / explicit coords, use `scripts/hh-device.sh <device> <host> <port> <pw>`.
 
+## Wireless Flipper — future transport options (P3, deferred 2026-09-24)
+
+The shipped Flipper adapter drives the device's **text serial CLI** over USB
+(`/dev/ttyACM0`); it is tethered-only. To reach the Flipper WITHOUT a cable to
+`trillsec` while keeping the same room UX, the transport is what changes — the verb
+surface + `/sbx flipper` stay identical for options 2 & 3. Three paths, ranked:
+
+1. **Remote tethered proxy over Tailscale/SSH — RECOMMENDED (full CLI, ~no new HW).**
+   Wire the Flipper to any always-on host near it (Raspberry Pi, mini-PC, or a **phone in
+   Termux via USB-OTG**) and drive `flipper-cli` on that host over SSH — the pager's exact
+   pattern. Reuse `adapters/ssh_conn.py` (`SshConn`): a hybrid Flipper adapter shells verbs
+   via `SshConn.exec` instead of local `stream_exec`, and `/sbx flipper` opens `SshConn.open_pty`
+   (`ssh -tt … 'flipper-cli shell/serial'`) instead of the local serial relay. "Wireless" from
+   the room's POV; unlimited range. Effort: ~1 hr, no new hardware if a Pi/phone is available.
+2. **ESP32 WiFi UART bridge on the GPIO (full CLI, extra HW).** Flash an ESP32 (the official
+   WiFi Dev Board or any ESP32) with a UART↔TCP bridge (esp-link / serial-over-TCP firmware);
+   the Flipper CLI then appears as a TCP socket. Adapter change is minimal: `SerialConn` opens a
+   TCP socket to `esp32-ip:port` instead of the local tty — every verb + the relay work unchanged.
+   Cost: an ESP32 (~$8–30) + one flash. Caveat: that board is also the Marauder/WiFi board — may
+   contend if you want both.
+3. **Native Bluetooth LE (no HW, PARTIAL coverage, big rewrite).** The Flipper's built-in BLE
+   (STM32WB55) speaks the **protobuf RPC** API (Storage / App-launch / Gui input+screenshot /
+   System) — NOT the text CLI. You'd get file push/pull/list and "launch a saved SubGHz/NFC/
+   BadUSB via the app loader" + GUI drive, but NOT the raw CLI verbs 1:1. Needs a whole new RPC
+   transport (pyflipper / flipperzero-protobuf) and re-expressing verbs as RPC calls — a different
+   adapter, not a config swap. ~10 m range, one controller at a time.
+
+**Design implication:** before adding any of these, refactor `SerialConn` into a small transport
+interface (`local-serial | ssh-serial | tcp-serial`) so options 1–2 slot in without forking the
+adapter. Option 3 is a separate `FlipperRpcAdapter`.
+
 ## Open items
 - `.hh-device` manifest field names (reuse `.hh-agent`'s `purpose/setup/usage/state` vs a
   dedicated schema) — decide at P0.
 - Whether P1's verb menu is hardcoded seed vs read from the c2 project's command reference.
 - Persona naming + whether the bridge user is visible (yes for persona model) vs hidden.
+- Wireless Flipper transport — pick option 1/2/3 above (see the P3 section).
