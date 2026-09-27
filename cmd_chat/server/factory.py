@@ -34,9 +34,11 @@ def create_app(password: str = "", name: str = "cmd-chat-server",
     app.ctx.ws_secret = os.urandom(32)
     app.ctx.admin_token = secrets.token_hex(16)
     app.ctx.rate_limiter = RateLimiter(max_requests=10, window_seconds=60)
-    # Clergy capacity. 4 by default; raise via CMD_CHAT_MAX_USERS — infra-for-more,
-    # the cap is data not architecture (broadcast fan-out is O(N)).
-    app.ctx.max_users = int(os.environ.get("CMD_CHAT_MAX_USERS", "4"))
+    # Clergy capacity. 8 by default — room for a few humans plus a couple of
+    # hosted AI instances (each instance takes a seat). Raise via
+    # CMD_CHAT_MAX_USERS — infra-for-more, the cap is data not architecture
+    # (broadcast fan-out is O(N)).
+    app.ctx.max_users = int(os.environ.get("CMD_CHAT_MAX_USERS", "8"))
     app.ctx.cleanup_task = None
     # Room host = the oldest still-present connection (the "host badge" member),
     # the only member allowed to `/kick`. Tracked here, auto-promoted to the

@@ -65,36 +65,45 @@ trust a corporation with their conversations: pairing, teaching, demos, hacking.
 
 ## Quick start
 
+One line — copy, paste, enter:
+
 ```bash
-git clone https://github.com/leetcrypt/hack-house.git
-cd hack-house
+git clone https://github.com/leetcrypt/hack-house.git && cd hack-house && bash hh/scripts/bootstrap.sh
 ```
 
-### 1. One-shot setup (`hh/scripts/bootstrap.sh`)
-
-Checks prerequisites, creates the Python venv, installs the server's
-dependencies, and builds the Rust client:
+That clones the repo, checks prerequisites (Python 3 + Rust/Cargo), creates the
+Python venv, installs the server, and builds the Rust client. No prompts. When
+it finishes, start a local session in tmux:
 
 ```bash
-hh/scripts/bootstrap.sh              # venv + deps + debug build
-hh/scripts/bootstrap.sh --release    # release build
-hh/scripts/bootstrap.sh --check      # report tooling only, change nothing
+cd hh && ./scripts/lets-hack.sh
 ```
 
-> `bootstrap.sh` does **not** touch direnv — the autostart in step 4 is a
-> separate, opt-in convenience.
+That is the whole baseline — an encrypted room with a shared sandbox. Everything
+below is optional.
 
-**Optional AI layer (`hh/scripts/bootstrap-ai.sh`).** Want the local `/ai` agent? This runs
-the baseline setup first, then installs Ollama (if missing) and pulls a default
-model — nothing here changes the AI-free baseline above:
+### Add the local AI agent (optional)
+
+The in-room `/ai` agent runs a **local** model via Ollama (a multi-GB download),
+so it is opt-in — nothing above needs it:
 
 ```bash
-hh/scripts/bootstrap-ai.sh                      # baseline + Ollama + qwen2.5:3b
-hh/scripts/bootstrap-ai.sh --check              # report only, change nothing
+hh/scripts/bootstrap.sh --ai                    # baseline + Ollama + a default model
+hh/scripts/bootstrap-ai.sh                      # or add it later (baseline already done)
 HH_AI_MODEL=llama3 hh/scripts/bootstrap-ai.sh   # pull a different model
 ```
 
-### 2. Try it in tmux (`scripts/lets-hack.sh`)
+Cloud or custom models (Anthropic, OpenAI, Groq, vLLM, or your own) need no
+Ollama — see [`docs/providers.md`](docs/providers.md).
+
+### Other bootstrap options
+
+```bash
+hh/scripts/bootstrap.sh --release    # build the client in release mode (faster)
+hh/scripts/bootstrap.sh --check      # report tooling only, change nothing
+```
+
+### Try it in tmux (`scripts/lets-hack.sh`)
 
 The fastest way to see it working: builds the client, boots a fresh `--no-tls`
 server on `127.0.0.1:4173`, and opens a pane per user.
@@ -108,7 +117,7 @@ cd hh
 ./scripts/lets-hack.sh --kill           # tear it all down
 ```
 
-### 3. Manual setup
+### Manual setup
 
 **Server** (Python):
 
@@ -133,7 +142,7 @@ cargo build --release
 | `--insecure` | Skip TLS cert verification (self-signed certs) |
 | `--theme <path>` | Load a vestments TOML (see `hh/themes/`) |
 
-### 4. Autostart with direnv (optional, separate)
+### Autostart with direnv (optional, separate)
 
 A convenience for daily use, independent of `bootstrap.sh`. Run the one-time
 setup once:
@@ -419,7 +428,7 @@ supports `-h` / `--help`** for full usage.
 
 | Script | What it does |
 |---|---|
-| `bootstrap.sh` | One-shot first-run setup: checks prereqs, creates the Python venv, installs server deps, builds the Rust client (plus the AI layer unless `--no-ai`). |
+| `bootstrap.sh` | One-shot first-run setup: checks prereqs, creates the Python venv, installs server deps, builds the Rust client. Baseline is non-interactive; add the AI layer with `--ai`. |
 | `bootstrap-ai.sh` | Optional AI layer: runs the baseline, then installs Ollama and pulls a default local model for the `/ai` agent. |
 
 **Run a session**
