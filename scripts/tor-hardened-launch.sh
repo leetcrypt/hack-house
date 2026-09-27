@@ -3,7 +3,7 @@
 # the hack-house Tor P2P relay (docs/spec-tor-p2p-relay.md §4.3/§4.4).
 #
 # Default backend: bwrap (bubblewrap) — no daemon, no image, already on
-# trillsec/laptop. Alternative: rootless podman (--engine podman), for parity
+# your host. Alternative: rootless podman (--engine podman), for parity
 # with the existing /sbx podman convention.
 #
 # What this buys you over `tor -f torrc` run bare:

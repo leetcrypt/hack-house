@@ -255,6 +255,7 @@ class HarnessResult:
     tokens: int = 0
     reason: str = ""          # why the loop ended
     tool_calls: int = 0
+    malformed_calls: int = 0  # call-shaped emissions that never became a valid action (SOA R2)
 
 
 @dataclass
@@ -380,6 +381,7 @@ class OperatorHarness:
 
         res = HarnessResult()
         nudges = 0
+        did_action = False        # has any tool actually executed? (gates DONE honesty)
         while res.turns < self.max_turns + self.max_nudges:
             res.turns += 1
             try:
@@ -394,15 +396,27 @@ class OperatorHarness:
 
             res.tokens += int((usage or {}).get("prompt_eval_count", 0) or 0)
             res.tokens += int((usage or {}).get("eval_count", 0) or 0)
+            res.malformed_calls += int((usage or {}).get("malformed_calls", 0) or 0)
 
             if not calls:
-                if _DONE_RE.match(text or ""):
+                done_claimed = bool(_DONE_RE.match(text or ""))
+                # Honesty gate: an INSTANT DONE — turn 1, before any tool ran — is the
+                # early-quit failure mode (observed as 1/5 of the compose baseline:
+                # turns=1, tool_calls=0). Challenge it with exactly one nudge. A DONE
+                # that arrives later, or after the model has acted, is trusted — so a
+                # genuine read-only/chat objective (reason then sign off) still finishes.
+                if done_claimed and (did_action or res.turns > 1 or nudges >= self.max_nudges):
                     res.final = re.sub(_DONE_RE, "", text, count=1).strip()
                     res.reason = "done"
                     return res
                 if nudges >= self.max_nudges:
-                    res.final = (text or "").strip() or "[stopped — model stalled]"
-                    res.reason = "stalled"
+                    if not did_action:
+                        res.final = ("[stopped — model claimed done / stalled but never "
+                                     "ran a tool; task likely not performed]")
+                        res.reason = "stalled-no-action"
+                    else:
+                        res.final = (text or "").strip() or "[stopped — model stalled]"
+                        res.reason = "stalled"
                     return res
                 nudges += 1
                 messages.append({"role": "assistant", "content": text or ""})
@@ -413,11 +427,16 @@ class OperatorHarness:
                 except Exception:  # noqa: BLE001
                     pass
                 nudge_obs = _format_events(fresh, self.me)
+                if done_claimed and not did_action:
+                    ask = ("You replied DONE but have not run ANY tool yet — do not claim "
+                           "completion before acting. Call the next tool now to actually do "
+                           "the work, and only reply 'DONE: <summary>' once it is done.")
+                else:
+                    ask = ("If the objective is met, reply with a single 'DONE: <summary>' "
+                           "line. Otherwise call the next tool to make progress.")
                 messages.append({
                     "role": "user",
-                    "content": (("Room update:\n" + nudge_obs + "\n\n") if nudge_obs else "")
-                    + "If the objective is met, reply with a single 'DONE: <summary>' "
-                      "line. Otherwise call the next tool to make progress."})
+                    "content": (("Room update:\n" + nudge_obs + "\n\n") if nudge_obs else "") + ask})
                 continue
 
             if res.tokens >= self.token_ceiling:
@@ -434,6 +453,7 @@ class OperatorHarness:
                 name, cargs = c.get("name", ""), c.get("arguments") or {}
                 result = self._run_tool(name, cargs)
                 res.tool_calls += 1
+                did_action = True
                 messages.append({"role": "tool", "content": _clip(result)})
             # After acting, fold any new room events into the next observation.
             try:

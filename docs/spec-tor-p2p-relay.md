@@ -25,7 +25,7 @@
 | D | Cost / infra posture | **$0.** No relay, no VPS, no domain, no homeserver of any kind. `tor` is free/FOSS (`dnf install tor`), runs locally. Optional hardening: run it in a rootless podman container, mirroring the existing `/sbx podman` sandbox pattern — still free, still local. |
 | E | Prerequisite | **Both parties already have hack-house installed and already share a room.** This is not a discovery mechanism — it makes one *specific session* private/anonymous/NAT-free between people who already found each other via hack-house. |
 | F | Where the code lives | **Python sidecar**, `cmd_chat/tor/`, mirroring the `cmd_chat/agent/` headless-member precedent. **No Rust/TUI protocol changes** — `/tor` is a thin command that shells to the sidecar, same shape as `/ai`. |
-| G | Host process sandboxing | **`bwrap` (bubblewrap) by default** for the `tor` process itself — zero new dependency (already on `trillsec`/`laptop`, ships with Fedora for flatpak), no daemon, no image to pull. A rootless-podman variant is offered as an alternative for operators who'd rather match the existing `/sbx podman` convention; both are opt-in launch wrappers around the same unmodified `tor` binary, not a fork of it. |
+| G | Host process sandboxing | **`bwrap` (bubblewrap) by default** for the `tor` process itself — zero new dependency (already present on most Linux hosts, ships with Fedora for flatpak), no daemon, no image to pull. A rootless-podman variant is offered as an alternative for operators who'd rather match the existing `/sbx podman` convention; both are opt-in launch wrappers around the same unmodified `tor` binary, not a fork of it. |
 | H | Bind-address guardrail | `cmd_chat.py serve --tor` **refuses a non-loopback bind address by default** (`--tor-allow-public-bind` to override). Prevents the single worst footgun in this feature: thinking you're only reachable via the onion address while a plain public/LAN listener is *also* open. Mirrors web-relay's "loud warning, explicit override" posture rather than a silent auto-correct. |
 
 **Why B, spelled out:** the alternative rendezvous options considered were (1) a
@@ -290,7 +290,7 @@ already makes. Not re-litigated in every section; noted once, here.
    configured control password. Recommend cookie-only; refuse to start if cookie
    auth isn't available rather than falling back to a stored secret.
 3. **Bundled vs. system `tor`.** v1 assumes a system-installed `tor` binary
-   (already true on `trillsec`/`laptop`). Bundling a static Tor binary is a later
+   (already true on most Linux hosts). Bundling a static Tor binary is a later
    portability item, not required for the primary desktop/laptop use case.
 4. **SOCKS library choice.** `PySocks` (pure Python, matches the project's
    pure-Python SRP fallback precedent for Termux) vs. shelling out to system

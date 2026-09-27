@@ -25,12 +25,15 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import os
 import time
 
 GW_IMAGE = "localhost/hh-egress-gw"
 GW_LABEL = "hh.egress-gw"
 TOR_NET = "hh-egress-net"
-DEFAULT_ALLOW = ["100.110.98.21"]  # tailnet Ollama stays reachable in local/scope
+# Hosts the sandbox may still reach in local/scope egress (e.g. your host
+# Ollama). Set $HH_EGRESS_ALLOW="ip1,ip2"; empty by default.
+DEFAULT_ALLOW = [x for x in os.environ.get("HH_EGRESS_ALLOW", "").split(",") if x]
 INTERNAL_CIDRS = ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12",
                   "100.64.0.0/10", "169.254.0.0/16"]
 TOR_BOOTSTRAP_TIMEOUT = 75.0

@@ -896,9 +896,32 @@ fn draw_roster(f: &mut Frame, area: ratatui::layout::Rect, app: &App, theme: &Th
             let me = u.username == app.me;
             // Stacked badges: <sigil> host · ⚡ sudoer · ◆ driver · • member.
             let badges = role_badges(app, &u.username, theme);
+            // AI instances get a robot marker; if the instance's `_ai:instance`
+            // frame named an owner, annotate ownership + a lock when private.
+            let (ai_mark, suffix) = if app.ai_agents.contains(&u.username) {
+                let sfx = match app.instances.get(&u.username) {
+                    Some(i) => {
+                        let mut marks = String::new();
+                        if i.query == "private" {
+                            marks.push_str(" 🔒"); // allowlist-only
+                        }
+                        if i.ask {
+                            marks.push_str(" ⧗"); // prompts held for owner approval
+                        }
+                        match &i.owner {
+                            Some(o) => format!(" ⟢{o}{marks}"),
+                            None => marks,
+                        }
+                    }
+                    None => String::new(),
+                };
+                ("🤖 ", sfx)
+            } else {
+                ("", String::new())
+            };
             let color = if me { theme.roster_me } else { theme.other };
             ListItem::new(Line::from(Span::styled(
-                format!(" {badges} {}", u.username),
+                format!(" {badges} {ai_mark}{}{suffix}", u.username),
                 Style::default().fg(color),
             )))
         })

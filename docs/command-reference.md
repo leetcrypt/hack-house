@@ -70,13 +70,28 @@ Any image is overridable positionally: `/sbx podman parrotsec/security`,
 
 | Command | What to expect |
 |---|---|
-| `/ai start [model\|profile]` | Spawn an agent (ollama tag or `models.toml` profile). |
-| `/ai start <model> allow` | Spawn + auto-grant the agent sandbox drive. |
+| `/ai start [model\|profile]` | Spawn an agent (ollama tag or `models.toml` profile). You become its **owner**. |
+| `/ai start <model> allow` | Spawn + request agent sandbox drive (granted by the room host, not self). |
 | `/ai stop` | Dismiss the agent you started. |
 | `/ai <question>` | Ask an agent in the room (`/ai <name> <q>` if many). |
 | `/ai <name> !<task>` | Have a **granted** agent run a task in the sandbox (Goose harness). |
 | `/ai list` | List AI agents present + their provider/model. |
 | `/ai models` | Show models the active agent's backend can serve. |
+
+### Owning an instance (spec: multi-tenant model hosting)
+
+Anyone holding sandbox **drive** may host a model. The member who spins it up
+**owns** it and controls who may query it — the room host still controls the
+**shared sandbox**. Sole-form controls (`/ai <verb> …`) target the instance you
+host; the named form (`/ai <name> <verb> …`) targets one by name.
+
+| Command | Who | What to expect |
+|---|---|---|
+| `/ai public` · `/ai private` | instance owner | Query default: `public` = anyone (minus rejects); `private` = allowlist only. |
+| `/ai allow <user>` · `/ai reject <user>` | owner/manager | Add/deny a member on your instance's query list. |
+| `/ai grant <user>` · `/ai revoke <user>` | **owner** | Delegate (or withdraw) management of your instance to another member. |
+| `/ai ask-mode on\|off` | owner/manager | Hold each non-owner prompt for your approval before the model sees it. |
+| `/ai approve <n>` · `/ai deny <n>` | owner/manager | Rule on a held prompt by its pending id. |
 
 ---
 
@@ -169,6 +184,10 @@ the container and bridges it to your browser via noVNC.
 | ⚡ sudoer | VM superuser in the sandbox. |
 | ◆ driver | May drive the shell. |
 | • member | Present — no extra powers. |
+| 🤖 ai | A hosted AI instance (not a human member). |
+| ⟢ owner | The member who owns/hosts that AI instance. |
+| 🔒 private | The instance answers its allowlist only. |
+| ⧗ ask-mode | The owner is holding prompts to that instance for approval. |
 
 ---
 

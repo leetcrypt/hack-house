@@ -23,10 +23,10 @@ import websockets
 
 from cmd_chat.client.client import MAX_WS_FRAME, Client
 
-from .adapters.pager import PagerAdapter
+from .adapters.flipper import FlipperAdapter
 from .adapters.ssh_conn import SshConn
 
-ADAPTERS = {"pager": PagerAdapter}
+ADAPTERS = {"flipper": FlipperAdapter}
 
 MAX_OUT_LINES = 60          # cap a single command's chat reply
 ARM_TTL = 120.0            # seconds an armed device stays armed before auto-disarm
@@ -441,10 +441,10 @@ def main() -> None:
         description="Bridge a physical device into a hack-house room as a persona member")
     ap.add_argument("server", help="room host")
     ap.add_argument("port", type=int, help="room port")
-    ap.add_argument("--persona", default="pager", help="room display name for the device")
-    ap.add_argument("--device", default="pager", choices=sorted(ADAPTERS),
+    ap.add_argument("--persona", default="flipper", help="room display name for the device")
+    ap.add_argument("--device", default="flipper", choices=sorted(ADAPTERS),
                     help="which device adapter to load")
-    ap.add_argument("--alias", default="pager", help="ssh alias / transport handle")
+    ap.add_argument("--alias", default="flipper", help="ssh alias / transport handle")
     ap.add_argument("--owner", default=None,
                     help="trusted operator username (else learned from the room ACL)")
     ap.add_argument("--password", "-p", default=None, help="room password")

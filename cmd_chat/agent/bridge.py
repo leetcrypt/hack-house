@@ -278,7 +278,9 @@ class AgentBridge(Client):
                  token_budget: int = 2000, embedder=None, rag_top_k: int = 4,
                  rag_min_score: float = 0.35, code_provider: Provider | None = None,
                  harness: str = "native", max_turns: int = 5,
-                 native_token_budget: int = NATIVE_TOKEN_BUDGET):
+                 native_token_budget: int = NATIVE_TOKEN_BUDGET,
+                 owner: str | None = None, query_acl: str = "public",
+                 allow: list[str] | None = None, ask_mode: bool = False):
         super().__init__(server, port, username=name, password=password,
                          insecure=insecure, no_tls=no_tls)
         self.name = name
@@ -307,6 +309,21 @@ class AgentBridge(Client):
         self.granted = False           # may we type into the shared PTY?
         self.can_sudo = False          # does our VM account have sudo?
         self._pending: list[str] | None = None  # destructive plan awaiting /confirm
+        # --- multi-tenant ownership + query ACL (spec-multi-tenant-model-hosting) ---
+        # The MEMBER who spun us up owns this instance and controls who may query
+        # it — decentralized from the room host, whose authority stays over the
+        # SHARED sandbox (see `_perm:acl` above / spec §2). `owner is None` means
+        # legacy/unowned: no query gating, back-compatible with the old PoC.
+        self.owner = owner
+        # Query mode: "public" = anyone may address us (minus the denylist);
+        # "private" = only owner + managers + the allowlist. Default public.
+        self.query_mode = query_acl if query_acl in ("public", "private") else "public"
+        self.allowed: set[str] = set(allow or [])   # standing allowlist (query)
+        self.denied: set[str] = set()               # standing denylist (query)
+        self.managers: set[str] = set()             # owner-delegated co-managers
+        self.ask_mode = bool(ask_mode)              # hold each non-owner prompt
+        self._prompts: list[dict] = []              # pending prompts awaiting approval
+        self._prompt_seq = 0                        # monotonic id for pending prompts
         # `!task` harness: "native" (bounded host-side Ollama tool-calling loop —
         # `_run_native`, docs/spec-native-harness.md) or "simple" (one-shot
         # keystroke injector — `_run_simple`). native self-degrades to simple when
@@ -450,6 +467,154 @@ class AgentBridge(Client):
         if first in others:
             return None
         return rest  # sole-agent form: `/ai <question>`
+
+    # --- multi-tenant query ACL + delegation (spec-multi-tenant-model-hosting §2) ---
+    # Reserved management verbs. An owner/manager drives them with the *named*
+    # form `/ai <thisname> <verb> …` so each instance matches only its own name
+    # (the sole-agent sugar is expanded client-side). `confirm` / `!task` are
+    # handled elsewhere and are not management verbs.
+    MGMT_VERBS = ("allow", "reject", "grant", "revoke", "public", "private",
+                  "ask-mode", "approve", "deny")
+
+    def _is_manager(self, who: str) -> bool:
+        """Owner or an owner-delegated manager of THIS instance."""
+        return who == self.owner or who in self.managers
+
+    def _may_query(self, who: str) -> bool:
+        """May `who` address this instance at all? Unowned (legacy) instances
+        answer everyone. Denylist always wins. Public → anyone not denied;
+        private → owner/managers/allowlist only. (spec §2 — query control lives
+        in the owner's runtime; the shared sandbox stays host-gated.)"""
+        if self.owner is None:
+            return True
+        if who in self.denied:
+            return False
+        if self._is_manager(who) or who in self.allowed:
+            return True
+        return self.query_mode == "public"
+
+    def _instance_frame(self) -> str:
+        """The `_ai:instance` control frame — a uniform registry record so
+        clients render owner + query state without scraping the announce line."""
+        return json.dumps({
+            "_ai": "instance", "name": self.name, "owner": self.owner,
+            "kind": "agent", "brain": f"{self.provider.name}/{self.provider.model}",
+            "query": self.query_mode, "ask": self.ask_mode,
+            "managers": sorted(self.managers),
+        })
+
+    def _parse_management(self, text: str) -> tuple[str, str] | None:
+        """Recognize an explicit ``/ai <thisname> <verb> [args]`` management line.
+        Returns ``(verb, args)`` or ``None``. Owner-gating happens in the handler,
+        not here — a non-owner typing a verb simply gets a refusal."""
+        t = text.strip()
+        if not t.startswith("/ai "):
+            return None
+        name, _, tail = t[4:].strip().partition(" ")
+        if name != self.name:
+            return None
+        verb, _, args = tail.strip().partition(" ")
+        return (verb, args.strip()) if verb in self.MGMT_VERBS else None
+
+    def _drop_prompts_from(self, who: str) -> None:
+        self._prompts = [p for p in self._prompts if p["sender"] != who]
+
+    async def _broadcast_instance(self, ws) -> None:
+        await ws.send(self.room_fernet.encrypt(self._instance_frame().encode()).decode())
+
+    async def _handle_management(self, ws, verb: str, args: str, sender: str) -> None:
+        """Apply an owner/manager control verb to this instance, then re-announce
+        the instance record. approve/deny resolve a held prompt; the rest mutate
+        the query ACL / delegation. grant/revoke are owner-only."""
+        if not self._is_manager(sender):
+            await self._send_chat(ws, f"{sender}: only {self.name}'s owner may manage it")
+            return
+        target = args.split()[0] if args else ""
+        if verb in ("approve", "deny"):
+            await self._resolve_prompt(ws, verb, target, sender)
+            return
+        if verb == "allow" and target:
+            self.allowed.add(target); self.denied.discard(target)
+            await self._send_chat(ws, f"{target} may now query {self.name}")
+        elif verb == "reject" and target:
+            self.denied.add(target); self.allowed.discard(target)
+            self._drop_prompts_from(target)
+            await self._send_chat(ws, f"{target} may no longer query {self.name}")
+        elif verb == "grant" and target:
+            if sender != self.owner:
+                await self._send_chat(ws, f"{sender}: only the owner may delegate {self.name}")
+                return
+            self.managers.add(target)
+            await self._send_chat(ws, f"{target} may now manage {self.name}")
+        elif verb == "revoke" and target:
+            if sender != self.owner:
+                await self._send_chat(ws, f"{sender}: only the owner may revoke on {self.name}")
+                return
+            self.managers.discard(target)
+            await self._send_chat(ws, f"{target} no longer manages {self.name}")
+        elif verb == "public":
+            self.query_mode = "public"
+            await self._send_chat(ws, f"{self.name} is now public — anyone may query")
+        elif verb == "private":
+            self.query_mode = "private"
+            await self._send_chat(ws, f"{self.name} is now private — allowlist only")
+        elif verb == "ask-mode":
+            self.ask_mode = target.lower() in ("on", "true", "1", "yes")
+            await self._send_chat(ws, f"{self.name} ask-mode "
+                                      f"{'on — prompts held for approval' if self.ask_mode else 'off'}")
+        else:
+            await self._send_chat(ws, f"usage: /ai {self.name} <allow|reject|grant|revoke|"
+                                      f"public|private|ask-mode on/off|approve N|deny N> …")
+            return
+        await self._broadcast_instance(ws)
+
+    async def _resolve_prompt(self, ws, verb: str, target: str, sender: str) -> None:
+        """approve/deny a held prompt by id (see `_gate_query`)."""
+        try:
+            pid = int(target)
+        except (TypeError, ValueError):
+            await self._send_chat(ws, f"usage: /ai {self.name} {verb} <id> "
+                                      f"({len(self._prompts)} pending)")
+            return
+        item = next((p for p in self._prompts if p["id"] == pid), None)
+        if item is None:
+            await self._send_chat(ws, f"no pending prompt #{pid} for {self.name}")
+            return
+        self._prompts.remove(item)
+        if verb == "deny":
+            await self._send_chat(ws, f"owner declined {item['sender']}'s prompt to {self.name}")
+            return
+        self.info(f"{sender} approved #{pid} ({item['sender']} → {self.name})")
+        await self._dispatch_question(ws, item["question"], item["sender"])
+
+    async def _gate_query(self, ws, sender: str, question: str) -> bool:
+        """Return True if `sender`'s prompt may reach the model now. Deny (private/
+        denylisted) or hold (ask-mode) otherwise, telling the room what happened."""
+        if not self._may_query(sender):
+            await self._send_chat(ws, f"{sender}: {self.name}'s owner restricts who may query it")
+            return False
+        if self.ask_mode and not self._is_manager(sender):
+            self._prompt_seq += 1
+            pid = self._prompt_seq
+            self._prompts.append({"id": pid, "sender": sender, "question": question})
+            preview = question if len(question) <= 80 else question[:77] + "…"
+            await self._send_chat(ws, f"⧗ pending #{pid} {sender} → {self.name}: \"{preview}\" — "
+                                      f"owner: /ai {self.name} approve {pid} | deny {pid}")
+            return False
+        return True
+
+    async def _dispatch_question(self, ws, question: str, sender: str) -> None:
+        """Route an *authorized* prompt to the sandbox (`!task`), the destructive-
+        plan confirm gate, or a normal model answer. No ACL check here — callers
+        gate first (live path via `_gate_query`, approval path via the owner)."""
+        if question.startswith("!"):
+            self.info(f"{sender} → /ai !sbx: {question[1:].strip()}")
+            await self._run_in_sandbox(ws, question[1:].strip(), sender)
+        elif question.strip().lower() == "confirm":
+            await self._confirm_pending(ws, sender)
+        else:
+            self.info(f"{sender} → /ai: {question}")
+            await self._answer(ws, question, sender)
 
     async def _send_typing(self, ws, on: bool) -> None:
         """Tell the room our reply is (not) being generated, so clients can show
@@ -1526,12 +1691,17 @@ class AgentBridge(Client):
             ping_interval=self._PING_INTERVAL, ping_timeout=self._PING_TIMEOUT,
         ) as ws:
             self.running = True
+            owner_note = f", owned by {self.owner}" if self.owner else ""
+            query_note = "" if self.query_mode == "public" else " · query: private (allowlist)"
             announce = (
                 f"{self.name} (ai) {'back online' if reconnect else 'online'} — "
-                f"{self.provider.name}/{self.provider.model}. "
+                f"{self.provider.name}/{self.provider.model}{owner_note}{query_note}. "
                 f"Ask me with /ai <question>; /ai {self.name} !<task> to act in the sandbox."
             )
             await ws.send(self.room_fernet.encrypt(announce.encode()).decode())
+            # Uniform instance record for the roster/registry (spec §5). Harmless
+            # to clients that don't yet parse `_ai:instance`.
+            await self._broadcast_instance(ws)
             self.success("agent online")
             embed_task = (
                 asyncio.create_task(self._embed_worker())
@@ -1582,6 +1752,12 @@ class AgentBridge(Client):
         if text.startswith('{"_'):
             self._handle_control(text)  # track ACL grants; ignore other ctrl frames
             return
+        # Owner/manager control of THIS instance (`/ai <name> allow|private|…`)
+        # is checked before addressing so a verb is never mistaken for a question.
+        mgmt = self._parse_management(text)
+        if mgmt is not None:
+            await self._handle_management(ws, mgmt[0], mgmt[1], sender)
+            return
         question = self._addressed_question(text)
         if question is None:
             # keep a short rolling transcript for context on future asks,
@@ -1590,11 +1766,13 @@ class AgentBridge(Client):
             self.transcript.append(captured)
             self.transcript = self.transcript[-(self.context_window * 2):]
             self._remember(captured)
-        elif question.startswith("!"):
-            self.info(f"{sender} → /ai !sbx: {question[1:].strip()}")
-            await self._run_in_sandbox(ws, question[1:].strip(), sender)
-        elif question.strip().lower() == "confirm":
+            return
+        # `confirm` resolves a destructive-plan gate the sender already opened —
+        # not a fresh query, so it bypasses the query ACL.
+        if question.strip().lower() == "confirm":
             await self._confirm_pending(ws, sender)
-        else:
-            self.info(f"{sender} → /ai: {question}")
-            await self._answer(ws, question, sender)
+            return
+        # Query ACL + per-prompt approval: only authorized prompts reach the model.
+        if not await self._gate_query(ws, sender, question):
+            return
+        await self._dispatch_question(ws, question, sender)

@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from . import recipes
 from .bridge import AgentBridge
 from cmd_chat.ai.profiles import load_profiles, provider_from_profile
 from cmd_chat.ai.providers import OllamaEmbedder, make_provider, preflight
@@ -153,7 +154,43 @@ def main() -> None:
                     help="run a reachability/model preflight, then exit (0 ok, 1 fail)")
     ap.add_argument("--insecure", action="store_true", help="skip TLS cert verification")
     ap.add_argument("--no-tls", action="store_true", help="plain ws/http (local/Tailscale)")
+    # Multi-tenant ownership + query ACL (spec-multi-tenant-model-hosting).
+    ap.add_argument("--owner",
+                    help="room member who owns this instance and controls who may "
+                         "query it (default: unowned = anyone may query)")
+    ap.add_argument("--query-acl", choices=("public", "private"), default="public",
+                    help="public = anyone may query (default); private = owner + "
+                         "managers + --allow list only")
+    ap.add_argument("--allow", default="",
+                    help="comma-separated members allowed to query (standing allowlist)")
+    ap.add_argument("--ask-mode", action="store_true",
+                    help="hold each non-owner prompt for owner approval "
+                         "(/ai <name> approve N | deny N)")
+    # Instance recipes (spec §5): a saved launch definition (model + scope, no
+    # creds) for one-command relaunch across sessions.
+    ap.add_argument("--recipe",
+                    help="load a saved instance recipe by name as defaults "
+                         "(explicit flags still override it)")
+    ap.add_argument("--save-recipe",
+                    help="save this launch as a reusable recipe under NAME, "
+                         "then join as normal")
+    ap.add_argument("--list-recipes", action="store_true",
+                    help="print saved instance recipe names, then exit")
     args = ap.parse_args()
+
+    if args.list_recipes:
+        for n in recipes.list_recipes():
+            print(n)
+        return
+
+    # A recipe supplies defaults; anything the user also typed on the CLI wins
+    # because it re-parses with the user's argv appended after the recipe's.
+    if args.recipe:
+        rec = recipes.load(args.recipe)
+        if rec is None:
+            ap.error(f"no saved recipe '{args.recipe}' "
+                     f"(have: {', '.join(recipes.list_recipes()) or 'none'})")
+        args = ap.parse_args(rec.to_argv() + sys.argv[1:])
 
     provider = _build_provider(args, ap)
     _apply_ollama_tuning(provider, args)
@@ -199,6 +236,23 @@ def main() -> None:
     # Default the room handle to the model tag (model name + parameter size,
     # e.g. "qwen2.5:3b") so the roster shows what's actually answering.
     name = args.name or provider.model
+
+    # Persist this launch as a reusable recipe (no creds — a profile names its
+    # api_key_env; runtime host/port/password are never stored). Then join.
+    if args.save_recipe:
+        recipes.save(recipes.Recipe(
+            name=args.save_recipe,
+            provider=None if args.profile else args.provider,
+            model=None if args.profile else args.model,
+            profile=args.profile,
+            harness=args.harness,
+            query_acl=args.query_acl,
+            allow=[u.strip() for u in args.allow.split(",") if u.strip()],
+            ask_mode=args.ask_mode,
+            owner=args.owner,
+        ))
+        print(f"saved instance recipe '{args.save_recipe}'", file=sys.stderr)
+
     bridge = AgentBridge(
         args.server, args.port, name=name, provider=provider,
         password=args.password, insecure=args.insecure, no_tls=args.no_tls,
@@ -206,6 +260,10 @@ def main() -> None:
         token_budget=args.token_budget, embedder=embedder, rag_top_k=args.rag_top_k,
         code_provider=code_provider, harness=args.harness or "native",
         max_turns=args.max_turns,
+        owner=args.owner,
+        query_acl=args.query_acl,
+        allow=[u.strip() for u in args.allow.split(",") if u.strip()],
+        ask_mode=args.ask_mode,
     )
     try:
         bridge.run()

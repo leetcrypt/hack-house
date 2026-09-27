@@ -172,15 +172,25 @@ class OllamaProvider:
                  if isinstance(data.get(k), int)}
         text = (msg.get("content") or "").strip()
         calls: list[dict] = []
+        # malformed_calls (SOA R2): count call-shaped emissions we could NOT turn into
+        # a valid structured action — the metric that separates a DECODING problem
+        # (worth grammar-constraining) from a model-CAPABILITY ceiling (a parser can't
+        # fix). Two shapes: a structured `tool_calls` entry with no usable name, and a
+        # text turn that leaked a call wrapper but recovered nothing below.
+        malformed = 0
         for tc in msg.get("tool_calls") or []:
             fn = tc.get("function") or {}
+            name = fn.get("name")
+            if not (isinstance(name, str) and name):
+                malformed += 1
+                continue
             args = fn.get("arguments")
             if isinstance(args, str):
                 try:
                     args = json.loads(args)
                 except ValueError:
                     args = {}
-            calls.append({"name": fn.get("name", ""), "arguments": self._clean_args(args or {})})
+            calls.append({"name": name, "arguments": self._clean_args(args or {})})
         # Small/quantized models (notably qwen2.5 on CPU) intermittently emit a valid
         # tool call as literal text in `content` instead of the structured `tool_calls`
         # field — qwen's `<tool_call>{…}</tool_call>`, but also bare/fenced JSON and
@@ -196,6 +206,13 @@ class OllamaProvider:
             recovered_text, recovered = self._extract_text_tool_calls(text, valid)
             if recovered:
                 text, calls = recovered_text, recovered
+            elif self._WRAP_TAGS.search(text):
+                # A call wrapper (`<tool_call>`, `<tools>`, …) leaked into prose but
+                # nothing valid came out — an unrecovered malformed call, the clearest
+                # decoding-failure signal.
+                malformed += 1
+        if malformed:
+            usage = {**usage, "malformed_calls": malformed}
         return text, calls, usage
 
     # Wrapper tags a weak model wraps a leaked call (or its prose) in; stripped

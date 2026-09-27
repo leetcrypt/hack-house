@@ -70,6 +70,21 @@ pub struct WebGuest {
     pub driving: bool,
 }
 
+/// A hosted AI instance's registry record, learned from its `_ai:instance`
+/// control frame (spec-multi-tenant-model-hosting §5). Uniform across attach
+/// modes so the roster can show who owns a model and whether it is public,
+/// without scraping the announce line. `owner == None` = unowned/legacy.
+#[derive(Clone, Default)]
+pub struct InstanceInfo {
+    pub owner: Option<String>,
+    /// Backing model, e.g. "ollama/qwen2.5:3b" — kept in the registry record for
+    /// `/ai list` and future roster detail; not shown in the compact roster row.
+    #[allow(dead_code)]
+    pub brain: String,
+    pub query: String, // "public" | "private"
+    pub ask: bool,     // owner is holding each non-owner prompt for approval
+}
+
 /// An in-progress incoming transfer we accepted. Chunks stream straight to a
 /// disk-backed `Sink` (created lazily on the first chunk) so a multi-GB payload
 /// never sits in RAM.
@@ -157,6 +172,15 @@ pub enum Net {
         name: String,
         text: String,
         done: bool,
+    },
+    /// A hosted AI instance's registry record (owner + query state), broadcast
+    /// by the instance on join and whenever its owner changes its ACL.
+    AiInstance {
+        name: String,
+        owner: Option<String>,
+        brain: String,
+        query: String,
+        ask: bool,
     },
     /// A local system notice produced off-thread (e.g. async Ollama probe).
     Sys(String),
@@ -351,6 +375,10 @@ pub struct App {
     /// Live, in-progress reply text per streaming agent, shown as a transient
     /// preview bubble until the final message lands. Keyed by agent name.
     pub ai_stream: std::collections::HashMap<String, String>,
+    /// Hosted-instance registry, keyed by instance name — owner + query state
+    /// from each instance's `_ai:instance` frame. Drives the roster's owner/
+    /// visibility annotation; pruned when the member leaves.
+    pub instances: std::collections::HashMap<String, InstanceInfo>,
     /// Monotonic tick counter used to animate the AI spinner.
     pub spin: usize,
     /// When set, agents we summon are auto-granted sandbox drive on each launch
@@ -420,6 +448,7 @@ impl App {
             ai_typing: std::collections::HashSet::new(),
             ai_agents: std::collections::HashSet::new(),
             ai_stream: std::collections::HashMap::new(),
+            instances: std::collections::HashMap::new(),
             spin: 0,
             agent_sbx_allow: false,
             agent_name: None,
@@ -569,6 +598,7 @@ impl App {
                 self.ai_typing.remove(&username);
                 self.ai_agents.remove(&username);
                 self.ai_stream.remove(&username);
+                self.instances.remove(&username);
                 self.sys(format!("✝ {username} was kicked by {by}"));
             }
             Net::PasswordRotated { password } => {
@@ -583,6 +613,7 @@ impl App {
                     self.ai_typing.remove(&name); // a departed agent isn't thinking
                     self.ai_agents.remove(&name); // …nor an AI member any more
                     self.ai_stream.remove(&name); // …nor streaming a reply
+                    self.instances.remove(&name); // …nor a hosted instance
                     // The web publisher left → its browser viewers are gone too.
                     if self.web_publisher.as_deref() == Some(name.as_str()) {
                         self.web_publisher = None;
@@ -598,6 +629,24 @@ impl App {
                 } else {
                     self.ai_typing.remove(&name);
                 }
+            }
+            Net::AiInstance {
+                name,
+                owner,
+                brain,
+                query,
+                ask,
+            } => {
+                self.ai_agents.insert(name.clone()); // an `_ai` frame ⇒ AI member
+                self.instances.insert(
+                    name,
+                    InstanceInfo {
+                        owner,
+                        brain,
+                        query,
+                        ask,
+                    },
+                );
             }
             Net::AiStream { name, text, done } => {
                 self.ai_agents.insert(name.clone()); // an `_ai` frame ⇒ AI member
@@ -2240,6 +2289,23 @@ fn handle_command(
             app.sys("†   note     loopback only — reachable from this host. To share, host on \
                      your tailnet/LAN (bind 0.0.0.0) or with --tor (onion).");
         }
+        // Browser (web relay). The share URL carries the end-to-end key in its
+        // #fragment, so it never travels the relay — it lives in a local 0600
+        // file the publisher wrote. We can therefore only show it when the web
+        // relay runs on THIS machine (the normal self-hosted shape). This is a
+        // bearer credential: anyone with the link reads the terminal + chat.
+        let shares = local_web_shares();
+        if shares.is_empty() {
+            app.sys("†   [web]    no browser relay on this host — start one to get a link:");
+            app.sys("†            python -m cmd_chat.web  (or `/web share` if a publisher is tapping)");
+        } else {
+            for (slug, url) in shares {
+                app.sys(format!("†   [web]    {url}"));
+                app.sys(format!(
+                    "†            browser link for room ‘{slug}’ — bearer credential, share out-of-band"
+                ));
+            }
+        }
     } else if let Some(rest) = line.strip_prefix("/kick") {
         // Host-only force-kick: the server disconnects the member AND rotates the
         // room password so they can't rejoin with the shared secret. The server is
@@ -3422,7 +3488,7 @@ fn handle_command(
             // profile keeps its label; a direct Ollama model uses its tag
             // (e.g. "qwen2.5:3b" — model name + parameter size).
             let name = profile.unwrap_or(model);
-            match spawn_agent(params, &app.password, name, profile, model, harness) {
+            match spawn_agent(params, &app.password, name, profile, model, harness, &app.me) {
                 Ok(child) => {
                     *agent = Some(child);
                     app.agent_name = Some(name.to_string());
@@ -3485,6 +3551,29 @@ fn handle_command(
                 };
                 let _ = tx.send(Net::Sys(msg));
             });
+        }
+    } else if let Some(rest) = line.strip_prefix("/ai ").map(str::trim).filter(|r| {
+        // Sole-form owner controls: `/ai <verb> …` where <verb> is a management
+        // verb. The named form `/ai <name> <verb> …` (first token = an instance
+        // name, not a verb) falls through untouched and reaches the agent as-is.
+        const MGMT: [&str; 9] = [
+            "allow", "reject", "grant", "revoke", "public", "private", "ask-mode",
+            "approve", "deny",
+        ];
+        MGMT.contains(&r.split_whitespace().next().unwrap_or(""))
+    }) {
+        // Expand to the named form against the instance THIS client hosts so each
+        // instance matches only its own name (spec §2.1). Requires you to have
+        // /ai start-ed one here; otherwise address it explicitly by name.
+        match app.agent_name.clone() {
+            Some(n) if app.connected => {
+                let full = format!("/ai {n} {rest}");
+                let _ = out_tx.send(WsMsg::Text(room.encrypt(full.as_bytes())));
+            }
+            Some(_) => app.sys("not connected — can't send that yet"),
+            None => app.sys(
+                "no instance you host here — address one by name: /ai <name> <verb> …",
+            ),
         }
     } else if line.starts_with('/') {
         // Leading slash but no command branch matched. Either a known command
@@ -4018,6 +4107,71 @@ fn find_repo_root() -> Option<std::path::PathBuf> {
 /// encrypted client (same SRP + room password). Returns the child handle so
 /// `/ai stop` (and client quit) can kill it. The agent's stdout/stderr go to a
 /// log file in the temp dir so its prints never corrupt the TUI.
+/// The per-user runtime dir the web publisher writes its 0600 share-URL files
+/// to. Mirrors `cmd_chat/web/publisher.py::_share_dir`: prefer `$XDG_RUNTIME_DIR`
+/// (tmpfs, 0700), else `$XDG_STATE_HOME`, else `~/.local/state`.
+fn web_share_dir() -> Option<std::path::PathBuf> {
+    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+        if !rt.is_empty() {
+            return Some(std::path::PathBuf::from(rt).join("hack-house"));
+        }
+    }
+    if let Ok(state) = std::env::var("XDG_STATE_HOME") {
+        if !state.is_empty() {
+            return Some(std::path::PathBuf::from(state).join("hack-house"));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(|h| std::path::PathBuf::from(h).join(".local/state/hack-house"))
+}
+
+/// Read any web-relay browser share URLs the publisher wrote on THIS machine.
+/// Returns `(slug, share_url)` pairs. The URL carries the end-to-end key in its
+/// `#fragment`, so it lives only in a local 0600 file and never on the relay —
+/// which is exactly why `/share` can only surface it when the publisher runs on
+/// the same host as this TUI. Never network; reads local files only.
+fn local_web_shares() -> Vec<(String, String)> {
+    match web_share_dir() {
+        Some(dir) => read_web_shares_from(&dir),
+        None => Vec::new(),
+    }
+}
+
+/// The dir-scanning core of `local_web_shares`, split out so it is testable
+/// without touching process environment. Parses `SHARE_URL=` from each
+/// `share-<slug>.url` file in `dir`.
+fn read_web_shares_from(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for ent in entries.flatten() {
+        let fname = ent.file_name();
+        let name = fname.to_string_lossy();
+        let Some(slug) = name
+            .strip_prefix("share-")
+            .and_then(|s| s.strip_suffix(".url"))
+        else {
+            continue;
+        };
+        if let Ok(body) = std::fs::read_to_string(ent.path()) {
+            if let Some(url) = body
+                .lines()
+                .find_map(|l| l.strip_prefix("SHARE_URL="))
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+            {
+                out.push((slug.to_string(), url.to_string()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent(
     params: &net::ConnParams,
     password: &str,
@@ -4025,6 +4179,7 @@ fn spawn_agent(
     profile: Option<&str>,
     model: &str,
     harness: Option<&str>,
+    owner: &str,
 ) -> std::result::Result<std::process::Child, String> {
     use std::process::{Command, Stdio};
     let root = find_repo_root().ok_or_else(|| {
@@ -4072,6 +4227,12 @@ fn spawn_agent(
     if let Some(h) = harness {
         cmd.arg("--harness").arg(h);
     }
+    // Stamp the summoner as the instance owner so the agent enforces its query
+    // ACL against the right identity (spec-multi-tenant-model-hosting §1). The
+    // owner controls who may query it; sandbox drive stays room-host-gated.
+    if !owner.is_empty() {
+        cmd.arg("--owner").arg(owner);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
@@ -4090,8 +4251,35 @@ fn spawn_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_ready, App, Net, Role, User, VboxPicker};
+    use super::{drain_ready, read_web_shares_from, App, Net, Role, User, VboxPicker};
     use tokio::sync::mpsc::unbounded_channel;
+
+    // /share surfaces the web-relay browser URL only from the publisher's local
+    // 0600 file (the URL carries the E2E key, so it never traverses the relay).
+    #[test]
+    fn web_shares_read_share_url_from_local_files() {
+        let dir = std::env::temp_dir().join(format!("hh-shares-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("share-crypt-lab.url"),
+            "# bearer\nSHARE_URL=https://relay.example/r/crypt-lab#k=SECRETKEY\nHOST_URL=x\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("not-a-share.txt"), "SHARE_URL=ignored\n").unwrap();
+        let got = read_web_shares_from(&dir);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "crypt-lab");
+        assert_eq!(got[0].1, "https://relay.example/r/crypt-lab#k=SECRETKEY");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_shares_empty_when_dir_absent() {
+        let dir = std::env::temp_dir().join("hh-shares-does-not-exist-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(read_web_shares_from(&dir).is_empty());
+    }
 
     /// The picker highlights the first VM and wraps a clamped selection; this is
     /// the pure state the key handler drives with ↑/↓.

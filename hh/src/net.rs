@@ -302,6 +302,13 @@ fn parse_ai(text: &str) -> Option<Net> {
             text: v["text"].as_str().unwrap_or("").to_string(),
             done: v["done"].as_bool().unwrap_or(false),
         }),
+        "instance" => Some(Net::AiInstance {
+            name: name(),
+            owner: v["owner"].as_str().map(str::to_string),
+            brain: v["brain"].as_str().unwrap_or("").to_string(),
+            query: v["query"].as_str().unwrap_or("public").to_string(),
+            ask: v["ask"].as_bool().unwrap_or(false),
+        }),
         _ => None,
     }
 }
@@ -439,6 +446,41 @@ mod tests {
 
     fn test_room() -> fernet::Fernet {
         fernet::Fernet::new(&fernet::Fernet::generate_key()).expect("valid key")
+    }
+
+    // An `_ai:instance` frame (spec-multi-tenant-model-hosting) parses into the
+    // registry record the roster renders — owner, query mode, ask-mode.
+    #[test]
+    fn parse_ai_instance_maps_owner_and_query() {
+        let frame = json!({
+            "_ai": "instance", "name": "oracle", "owner": "alice",
+            "brain": "ollama/qwen2.5:3b", "query": "private", "ask": true
+        })
+        .to_string();
+        match parse_ai(&frame) {
+            Some(Net::AiInstance { name, owner, brain, query, ask }) => {
+                assert_eq!(name, "oracle");
+                assert_eq!(owner.as_deref(), Some("alice"));
+                assert_eq!(brain, "ollama/qwen2.5:3b");
+                assert_eq!(query, "private");
+                assert!(ask);
+            }
+            _ => panic!("expected AiInstance"),
+        }
+    }
+
+    // An unowned instance frame (no owner key) yields owner=None, query default.
+    #[test]
+    fn parse_ai_instance_unowned_defaults() {
+        let frame = json!({"_ai": "instance", "name": "oracle"}).to_string();
+        match parse_ai(&frame) {
+            Some(Net::AiInstance { owner, query, ask, .. }) => {
+                assert!(owner.is_none());
+                assert_eq!(query, "public");
+                assert!(!ask);
+            }
+            _ => panic!("expected AiInstance"),
+        }
     }
 
     // A decode_msg call must never panic on a malformed timestamp. This is the

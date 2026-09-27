@@ -124,6 +124,16 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(native loop over the bridge verbs)")
     op.add_argument("--objective", required=True,
                     help="what this operator should achieve in the room")
+    op.add_argument("--brain", choices=["native", "smol"], default="smol",
+                    help="operator brain: 'smol' = code-as-action smolagents CodeAgent, "
+                         "shells out to scripts/hh-smol-operator.py under a python3 that has "
+                         "smolagents (default — dominant on compositional/code-writing "
+                         "tasks across every local model tested, see docs/harness-integration); "
+                         "'native' = in-process JSON tool-loop — a safe fallback, roughly tied "
+                         "on simple single-step tasks, no smolagents/system-python3 dependency.")
+    op.add_argument("--smol-python", default=None,
+                    help="python interpreter with smolagents+litellm for --brain smol "
+                         "(default: $HH_SMOL_PYTHON or /usr/bin/python3)")
     op.add_argument("--profile", default=None,
                     help="named models.toml profile (e.g. local, groq-llama)")
     op.add_argument("--provider", default=None,
@@ -463,6 +473,58 @@ def _build_operate_provider(args):
     return provider
 
 
+def _run_operate_smol(args, sess) -> int:
+    """`operate --brain smol`: run the code-as-action smolagents CodeAgent brain by
+    shelling out to scripts/hh-smol-operator.py under a python that has smolagents
+    (the hh venv does not). It drives the SAME bridge socket verbs — no new
+    side-effect surface. The driver's rich trace inherits our stdout/stderr; its
+    machine result comes back via a temp --json-out file so we print the same
+    summary shape as the native brain."""
+    import os
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    if not args.model:
+        print("operate --brain smol needs --model NAME (e.g. qwen2.5-coder:7b)",
+              file=sys.stderr)
+        return 2
+    driver = Path(__file__).resolve().parents[2] / "scripts" / "hh-smol-operator.py"
+    if not driver.exists():
+        print(f"smol driver not found at {driver}", file=sys.stderr)
+        return 2
+    py = args.smol_python or os.environ.get("HH_SMOL_PYTHON") or "/usr/bin/python3"
+    with tempfile.NamedTemporaryFile("r", suffix=".json", delete=False) as tf:
+        out_path = tf.name
+    cmd = [py, str(driver), "--sock-path", str(sess.sock_path),
+           "--objective", args.objective, "--model", args.model,
+           "--json-out", out_path]
+    env = dict(os.environ)
+    if args.host:
+        env["OLLAMA_HOST"] = args.host
+    if args.max_turns is not None:
+        env["SMOLAGENT_MAX_STEPS"] = str(args.max_turns)
+    rc = subprocess.run(cmd, env=env).returncode
+    try:
+        with open(out_path, encoding="utf-8") as f:
+            result = json.load(f)
+    except (OSError, ValueError):
+        result = {"final": "[smol brain produced no result JSON]", "reason": "error",
+                  "turns": 0, "tokens": 0, "tool_calls": 0, "malformed_calls": 0}
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+    print(json.dumps(result, indent=2))
+    if args.leave_on_done and result.get("reason") == "done":
+        try:
+            request(sess.sock_path, {"op": "down"}, read_timeout=5)
+        except BridgeUnreachable:
+            pass
+    return 0 if result.get("reason") in ("done", "token-ceiling", "turn-cap") else (rc or 1)
+
+
 def _run_operate(args) -> int:
     from .bootstrap import Budget
     from .harness import OperatorHarness
@@ -482,6 +544,9 @@ def _run_operate(args) -> int:
         print("bridge is up but not connected to the room yet", file=sys.stderr)
         return 2
 
+    if args.brain == "smol":
+        return _run_operate_smol(args, sess)
+
     provider = _build_operate_provider(args)
     budget = Budget(depth=args.depth, fanout=args.fanout, cost_usd=args.cost)
     kw = {}
@@ -496,7 +561,8 @@ def _run_operate(args) -> int:
     result = harness.run()
     print(json.dumps({"final": result.final, "reason": result.reason,
                       "turns": result.turns, "tokens": result.tokens,
-                      "tool_calls": result.tool_calls}, indent=2))
+                      "tool_calls": result.tool_calls,
+                      "malformed_calls": result.malformed_calls}, indent=2))
     if args.leave_on_done and result.reason == "done":
         try:
             request(sess.sock_path, {"op": "down"}, read_timeout=5)

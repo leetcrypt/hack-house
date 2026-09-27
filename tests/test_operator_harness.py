@@ -216,4 +216,45 @@ def test_stall_exhausts_nudges_and_stops():
     provider = FakeProvider(script=["thinking"] * 10)
     bridge = FakeBridge()
     res = _harness(provider, bridge, max_nudges=2).run()
-    assert res.reason == "stalled"
+    # Pure talk that never runs a tool exhausts nudges and stops with the precise
+    # "never acted" diagnosis (the honesty gate distinguishes this from a model that
+    # acted then stalled, which stays plain "stalled").
+    assert res.reason == "stalled-no-action"
+
+
+def test_instant_done_no_action_is_challenged():
+    # Tier 1 honesty gate: a DONE on turn 1 with no tool call yet is NOT trusted —
+    # it is challenged with one nudge; the model's next DONE (turn 2) is accepted.
+    provider = FakeProvider(script=["DONE: done immediately"])
+    bridge = FakeBridge()
+    res = _harness(provider, bridge, max_nudges=2).run()
+    assert res.reason == "done"
+    assert res.turns == 2          # challenged on turn 1, accepted on turn 2
+    assert res.tool_calls == 0
+    # the challenge nudge was actually sent into the conversation
+    assert any("have not run ANY tool yet" in (m.get("content") or "")
+               for _, msgs, _ in provider.calls_seen for m in msgs)
+
+
+def test_done_after_action_is_trusted_on_turn_one_path():
+    # A DONE is trusted as soon as the model has acted (no spurious challenge).
+    provider = FakeProvider(script=[
+        [{"name": "exec", "arguments": {"command": "whoami"}}],
+        "DONE: ran it",
+    ])
+    bridge = FakeBridge()
+    res = _harness(provider, bridge).run()
+    assert res.reason == "done"
+    assert res.turns == 2
+    assert res.tool_calls == 1
+
+
+def test_malformed_calls_accumulates_from_usage():
+    # Tier 1 telemetry: the provider's per-turn malformed_calls count is summed onto
+    # the result (SOA R2 — separates a decoding problem from a capability ceiling).
+    provider = FakeProvider(
+        script=[[{"name": "say", "arguments": {"text": "hi"}}], "DONE: ok"],
+        usage={"prompt_eval_count": 10, "eval_count": 5, "malformed_calls": 1})
+    bridge = FakeBridge()
+    res = _harness(provider, bridge).run()
+    assert res.malformed_calls == 2   # one per model turn

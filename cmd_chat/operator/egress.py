@@ -33,7 +33,12 @@ import urllib.request
 VPN_IFACE_RE = re.compile(
     r"^(proton\d*|wg\d*|tun\d*|tap\d*|tailscale\d*|nordlynx|mullvad.*|ipsec\d*|ppp\d*)$", re.I)
 
-TAILNET_OLLAMA = ("100.110.98.21", 11434)
+# Host Ollama endpoint the sandbox may reach in local/scope egress. Point at
+# your own host via $HH_OLLAMA_ADDR="host:port" (e.g. your tailnet IP); the
+# 127.0.0.1 default carves out nothing useful from inside a container.
+_ollama_addr = os.environ.get("HH_OLLAMA_ADDR", "127.0.0.1:11434")
+_oh, _, _op = _ollama_addr.partition(":")
+TAILNET_OLLAMA = (_oh, int(_op) if _op else 11434)
 
 
 MODES = ("auto", "guard", "open", "none", "local", "scope", "tor")

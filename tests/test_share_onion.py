@@ -32,13 +32,13 @@ def test_reach_empty_for_loopback_bind():
 
 def test_reach_classifies_tailscale_lan_public():
     assert reach_addresses("100.64.0.1") == [{"label": "tailscale", "addr": "100.64.0.1"}]
-    assert reach_addresses("100.110.98.21") == [{"label": "tailscale", "addr": "100.110.98.21"}]
+    assert reach_addresses("100.64.0.1") == [{"label": "tailscale", "addr": "100.64.0.1"}]
     assert reach_addresses("192.168.1.5") == [{"label": "lan", "addr": "192.168.1.5"}]
     assert reach_addresses("10.0.0.9") == [{"label": "lan", "addr": "10.0.0.9"}]
     assert reach_addresses("8.8.8.8") == [{"label": "host", "addr": "8.8.8.8"}]
 
 
 def test_init_frame_carries_reach_for_specific_bind():
-    app = create_app(password="x", name="t-reach", bind_host="100.110.98.21")
+    app = create_app(password="x", name="t-reach", bind_host="100.64.0.1")
     frame = json.loads(state_frame(app))
-    assert {"label": "tailscale", "addr": "100.110.98.21"} in frame["reach"]
+    assert {"label": "tailscale", "addr": "100.64.0.1"} in frame["reach"]
