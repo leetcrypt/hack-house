@@ -73,14 +73,35 @@ git clone https://github.com/leetcrypt/hack-house.git && cd hack-house && bash h
 
 That clones the repo, checks prerequisites (Python 3 + Rust/Cargo), creates the
 Python venv, installs the server, and builds the Rust client. No prompts. When
-it finishes, start a local session in tmux:
+it finishes, start a local room and take your own seat:
 
 ```bash
-cd hh && ./scripts/lets-hack.sh
+hh/scripts/hh-go.sh up          # host a room + open your client (all in tmux)
 ```
 
 That is the whole baseline — an encrypted room with a shared sandbox. Everything
 below is optional.
+
+**Prefer to choose as you go?** Run the interactive installer instead of the
+one-liner — it walks you through the build type, the AI layer (none / local
+model / bring-your-own), and putting `hh-go` on your PATH:
+
+```bash
+git clone https://github.com/leetcrypt/hack-house.git && cd hack-house && bash hh/scripts/install.sh
+```
+
+**`hh-go` — one command for everything.** After setup (the installer offers to
+symlink it onto your PATH), `hh-go` routes the common tasks:
+
+```bash
+hh-go up                     # host a local room + your own seat
+hh-go host tailnet|lan|tor   # host the server only (prints the join command)
+hh-go join <host> <port>     # connect to someone else's room
+hh-go ai [model|profile]     # summon an AI model you own into your room
+hh-go device flipper         # bridge a physical device into the room
+hh-go share                  # start browser sharing (then /share in the TUI)
+hh-go status | down          # what's running / tear it down
+```
 
 ### Add the local AI agent (optional)
 
@@ -255,21 +276,41 @@ offers to stop it so the VM can boot.
 
 ### The physical device bridge
 
-`/sbx pager` bridges a **real device** into the room the same way the web
-publisher bridges a browser: a headless member (`cmd_chat/device/`) joins,
-shells into the device over SSH, and exposes its I/O as the room's shared
-terminal — reusing the exact `_sbx`/ACL control plane, so *drive* grants and the
-watch-by-default view behave identically to a container. `/sbx pager` is sugar
-for the `pager` SSH alias; `/sbx device <alias>` bridges any other configured
-device. First supported device is the **WiFi Pineapple Pager** (reachable over
-USB `172.16.52.1` / WiFi `172.16.42.1`); a member drives it with the same
-`/drive` (`F2`) it uses for any sandbox. Run the bridge by hand for a device on
-another host:
+A **physical device** can join a room as a member the same way the web publisher
+bridges a browser: a headless client (`cmd_chat/device/`) joins, talks to the
+device over its transport, and exposes it through the room's shared terminal —
+reusing the exact `_sbx`/ACL control plane, so *drive* grants and the
+watch-by-default view behave identically to a container. Members drive it with
+the same `/drive` (`F2`) they use for any sandbox.
+
+Launch it from the shell (or `hh-go device <name>`):
 
 ```bash
+hh-go device flipper
+# equivalently, by hand against any room/host:
 .venv/bin/python -m cmd_chat.device <server_ip> <port> \
-    --device pager --alias pager --password <room-pw> --no-tls
+    --device flipper --alias flipper --password <room-pw> --no-tls
 ```
+
+**Supported devices (adapters in `cmd_chat/device/adapters/`):**
+
+- **Flipper Zero** (`--device flipper`) — over USB serial (`/dev/ttyACM*`). Plug
+  it in, unlock it, and the bridge exposes the Flipper CLI (device info, GPIO,
+  SubGHz, NFC/RFID, the filesystem under `/ext`) as room-driven commands. No
+  network access to the device required.
+- **Generic serial / SSH** — the bridge speaks two transports, `serial_conn`
+  (USB) and `ssh_conn` (network), so any device you can reach over a USB serial
+  console or SSH can be fronted.
+
+**Bring your own device.** Adapters are small: subclass the base adapter in
+`cmd_chat/device/adapters/`, declare your device's verbs, and register it in
+`ADAPTERS` (see `flipper.py` as the template). A device that already exposes an
+SSH login needs no code — bridge it with `--device ssh --alias <your-ssh-host>`.
+
+> A WiFi Pineapple / Pager (Hak5) works via the same SSH-transport pattern
+> (reachable over USB `172.16.x` / WiFi); its offensive-payload adapter is not
+> bundled in the public build — write a thin adapter against `ssh_conn` for the
+> verbs you need, following `flipper.py`.
 
 ### Driving the shell
 
@@ -312,18 +353,82 @@ works too (it's packed into a `.tar` before sending). Files are chunked (64 KB),
 encrypted with the room key, relayed as opaque ciphertext, and **SHA-256
 verified** on arrival before landing in `./downloads/`. Max size is 50 MB.
 
+### Share the room to a browser
+
+Let someone watch (and, if you grant it, drive) the shared terminal from a
+**browser** — no hack-house install on their side. Two steps:
+
+```bash
+hh-go share          # starts the web relay + a publisher that joins your room
+```
+
+Then, **inside the TUI, type `/share`** — it prints the browser URL to copy to
+your guest:
+
+```
+/share
+  …
+  [web]  http://<relay>/r/<slug>#k=<key>    ← the browser link
+```
+
+The link is a **bearer credential** — anyone with it can read the terminal and
+chat, so hand it out out-of-band. The `#…` fragment is an end-to-end key that
+**never reaches the relay**, which is why `/share` reads it from a local file the
+publisher wrote and only shows it on the publisher's own machine (not across the
+network). Browser guests appear in the roster as `🌐` and can be given drive with
+`/web allow <n>`.
+
+- **Same machine / LAN / Tailnet:** the above is all you need — hand out the
+  printed link (bind the relay on your tailnet for remote guests).
+- **A phone with only a browser, anonymously:** front the relay with **Tor** so
+  the guest needs just Orbot or Tor Browser — see [Browser access for mobile](#browser-access-for-mobile-optional)
+  under Tor hosting.
+
 ### The AI agent (local-first)
 
 Summon an AI participant with `/ai start` — it joins the room as a normal
 encrypted client (same SRP + room key as everyone else) and answers when you
-address it with `/ai <question>`. `/ai stop` dismisses it (it's also cleaned up
-when you quit). Pick a model at summon time with `/ai start <model>`.
+address it with `/ai <question>`. `/ai stop` dismisses it. Pick a model at summon
+time with `/ai start <model>`, or from the shell with `hh-go ai <model>`.
 
-**Summoning is privileged.** `/ai start` runs the agent against the *caller's
-own* Ollama and seats it in the room, so it's limited to the **owner or a
-granted driver** — anyone else is told to ask the host for `/grant`. Discovery
-stays open to everyone: `/ai list` and `/ai models` show each caller *their own*
-local models, so members can advertise what they'd bring before being granted.
+**You own what you summon (multi-tenant).** Any member with sandbox *drive* can
+host a model, and the member who summoned it **owns that instance** — not the
+room host. As the owner you decide who may query *your* model, right from the
+TUI (sole-form `/ai <verb>` targets the instance you host; `/ai <name> <verb>`
+names one):
+
+| Command | Effect |
+|---|---|
+| `/ai public` · `/ai private` | anyone may query (minus rejects) · allowlist only |
+| `/ai allow <user>` · `/ai reject <user>` | add / deny a member on your instance |
+| `/ai grant <user>` · `/ai revoke <user>` | delegate (or withdraw) management of your instance |
+| `/ai ask-mode on\|off` | hold each non-owner prompt for your approval |
+| `/ai approve <n>` · `/ai deny <n>` | rule on a held prompt |
+
+The roster marks instances `🤖 <name> ⟢<owner>`, with `🔒` when private and `⧗`
+when prompts are held. **Query control is yours; shared-sandbox drive stays the
+room host's** — an instance can only touch the shared shell after the host
+`/grant`s it. `/ai list` and `/ai models` are open to everyone for discovery.
+
+**Local-first, or bring your own.** The default is a **local** model via Ollama —
+private, no key, nothing leaves your host. To use *any other* model instead
+(Anthropic, OpenAI, Groq, Together, a local vLLM, or your own class), register it
+once in `models.toml` and summon it by name — no Ollama needed:
+
+```bash
+# one entry in models.toml (safe to commit — it names an env var, not the key):
+#   [my-model]
+#   provider    = "openai"                       # the universal adapter
+#   base_url    = "https://api.groq.com/openai/v1"
+#   model       = "llama-3.3-70b-versatile"
+#   api_key_env = "GROQ_API_KEY"
+export GROQ_API_KEY=...            # the key lives in YOUR env, never the room
+# then, in the TUI:  /ai start my-model     (or:  hh-go ai my-model)
+```
+
+Local and bring-your-own instances coexist in one room, each owned and scoped by
+whoever summoned it. Full recipe — providers, explicit flags, discovery, and a
+`module:Class` hook for a model you wrote — in the [provider guide](docs/providers.md).
 
 - **Runs on *your* machine.** The default provider is [Ollama](https://ollama.com)
   — a local model (default `qwen2.5:3b`), no API key, nothing leaves your host.
@@ -430,6 +535,8 @@ supports `-h` / `--help`** for full usage.
 |---|---|
 | `bootstrap.sh` | One-shot first-run setup: checks prereqs, creates the Python venv, installs server deps, builds the Rust client. Baseline is non-interactive; add the AI layer with `--ai`. |
 | `bootstrap-ai.sh` | Optional AI layer: runs the baseline, then installs Ollama and pulls a default local model for the `/ai` agent. |
+| `install.sh` | Interactive setup wizard — walks build type, the AI layer (none / local / bring-your-own), and putting `hh-go` on your PATH. Calls `bootstrap.sh`. |
+| `hh-go.sh` | The launcher/router: `hh-go up\|host\|join\|ai\|device\|share\|status\|down\|install`. Routes to the scripts + modules below; the installer can symlink it as `hh-go`. |
 
 **Run a session**
 
@@ -499,10 +606,9 @@ Notes that trip people up:
 - **Inbound reach ≠ sandbox egress.** The mode above controls how guests reach
   *the room*; it never routes the summoned sandbox's **outbound** traffic — that's
   `HH_SBX_EGRESS` ([Sandbox egress](#the-shared-sandbox)), an orthogonal knob.
-- **One-command deploy.** `hh-go` (a personal wrapper, not part of this repo)
-  chains the Tor/relay/public modes above — stack, QR "scan-me" pane, PIN-gated
-  public front door, `hh-go onion browser` — in the correct order; the raw
-  commands in each section below are what it automates.
+- **One-command deploy.** `hh-go` (`hh/scripts/hh-go.sh`) chains the modes above:
+  `hh-go host tailnet|lan|tor`, `hh-go share` for browser access, `hh-go up` for
+  a local room + seat. The raw commands in each section are what it automates.
 
 ## Securing your connection
 
@@ -636,10 +742,10 @@ onions are independent (killing the room's tor daemon takes both down at
 once, since they share it), and nothing about the terminal path above changes.
 
 Both onions live on the **same** tor daemon/ControlPort — no second `tor`
-process needed. `hh-go onion browser` (a personal deployment script, not part
-of this repo) automates exactly this sequence if you're on a box that already
-has it, including a QR code for the share link and a guard against silently
-reusing a stale process on the relay's port.
+process needed. `hh-go share` (`hh/scripts/hh-go.sh`) automates the relay +
+publisher pair for you (the non-Tor case — hand out the link on LAN/tailnet, or
+add the onion front above for a browser-only anonymous guest); then `/share` in
+the TUI prints the URL to copy.
 
 ## How it works
 
